@@ -149,6 +149,16 @@ option(
   OFF
 )
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
+# UCX-based exchange. The library lives under experimental/ucx-exchange and
+# is normally pulled in alongside cuDF (the IBM ibm-research-preview branch
+# adds add_subdirectory there gated on VELOX_ENABLE_CUDF). Upstream main has
+# no such add_subdirectory, so this option re-enables the build path
+# independently of cuDF — needed for the CPU UCX-row POC.
+option(
+  VELOX_ENABLE_UCX_EXCHANGE
+  "Build the experimental UCX exchange library. Requires UCX dev libs."
+  OFF
+)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
@@ -511,7 +521,23 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
         PROPERTIES INTERFACE_LINK_LIBRARIES "${override_curl_lib}"
       )
     endif()
+    add_compile_definitions(VELOX_ENABLE_CUDF)
   endif()
+endif()
+
+# Standalone ucxx fetch for the CPU UCX-row POC. The cudf path above
+# already pulls ucxx in transitively, so we only run this when
+# VELOX_ENABLE_UCX_EXCHANGE is on but cudf is off.
+if(VELOX_ENABLE_UCX_EXCHANGE AND NOT VELOX_ENABLE_CUDF)
+  velox_set_source(ucxx)
+  velox_resolve_dependency(ucxx)
+endif()
+
+# Expose VELOX_ENABLE_UCX_EXCHANGE as a C++ preprocessor macro so the
+# `#ifdef VELOX_ENABLE_UCX_EXCHANGE` guards in Task.cpp,
+# Communicator.cpp, etc. compile in their UCX hooks.
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  add_compile_definitions(VELOX_ENABLE_UCX_EXCHANGE)
 endif()
 
 # Set after the test of the CUDA compiler. Otherwise, the test fails with

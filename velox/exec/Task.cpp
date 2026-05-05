@@ -39,6 +39,9 @@
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+#include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
+#endif
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -1197,6 +1200,23 @@ void Task::initializePartitionOutput() {
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+    // Mirror the OutputBufferManager initialization for the CPU-row UCX
+    // queue manager so UcxCpuRowPartitionedOutput has a queue to enqueue
+    // into. The IBM ibm-research-preview branch does the same for the
+    // cudf path (gated on cudf.exchange); for the CPU POC we always
+    // initialize when the library is compiled in — the queue is just a
+    // map entry, harmless if our DriverAdapter never fires.
+    {
+      auto cpuQueueMgr = facebook::velox::ucx_exchange::
+          UcxCpuRowOutputQueueManager::getInstanceRef();
+      cpuQueueMgr->initializeTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
+#endif
   }
 }
 
@@ -2201,7 +2221,16 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
   }
-  return bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  auto result =
+      bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  {
+    auto cpuQueueMgr = facebook::velox::ucx_exchange::
+        UcxCpuRowOutputQueueManager::getInstanceRef();
+    cpuQueueMgr->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  }
+#endif
+  return result;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2704,6 +2733,23 @@ void Task::maybeRemoveFromOutputBufferManager() {
       }
       bufferManager->removeTask(taskId_);
     }
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+    {
+      auto cpuQueueMgr = facebook::velox::ucx_exchange::
+          UcxCpuRowOutputQueueManager::getInstanceRef();
+      // Don't overwrite stats from the standard bufferManager; only
+      // capture if not already set.
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats = cpuQueueMgr->stats(taskId_);
+        if (!taskStats_.outputBufferStats.has_value() &&
+            optStats.has_value()) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      cpuQueueMgr->removeTask(taskId_);
+    }
+#endif
   }
 }
 

@@ -14,15 +14,19 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/Acceptor.h"
+#include "velox/common/base/Exceptions.h"
+#include "velox/experimental/ucx-exchange/EndpointRef.h"
+#ifdef VELOX_ENABLE_CUDF
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
-#include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+#endif
 
 namespace facebook::velox::ucx_exchange {
 
+#ifdef VELOX_ENABLE_CUDF
 /*static*/
 void Acceptor::cStyleAMCallback(
     std::shared_ptr<ucxx::Request> request,
@@ -120,10 +124,14 @@ void Acceptor::cStyleAMCallback(
       },
       response);
 }
+#endif // VELOX_ENABLE_CUDF
 
-// Add endpoint reference to ucp_cp -> epRef map.
+// Add endpoint reference to ucp_cp -> epRef map. The map is also read
+// by Communicator::findEndpointRefByHandle, used by both cudf and
+// CPU-row paths, so this method has to be available in both builds.
 void Acceptor::registerEndpointRef(std::shared_ptr<EndpointRef> endpointRef) {
   auto epHandle = endpointRef->endpoint_->getHandle();
+  std::lock_guard<std::mutex> lock(mutex_);
   auto res = handleToEndpointRef_.insert(std::pair{epHandle, endpointRef});
   VELOX_CHECK(res.second, "Endpoint handle already exists!");
 }

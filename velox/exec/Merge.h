@@ -398,6 +398,7 @@ class MergeExchange : public Merge {
  private:
   VectorSerde* const serde_;
   const std::unique_ptr<VectorSerde::Options> serdeOptions_;
+  const core::ExchangeNode::TransportType transportType_;
   bool noMoreSplits_ = false;
   // Task Ids from all the splits we took to process so far.
   std::vector<std::string> remoteSourceTaskIds_;

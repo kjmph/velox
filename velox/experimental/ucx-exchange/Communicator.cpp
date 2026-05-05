@@ -14,24 +14,100 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#ifdef VELOX_ENABLE_CUDF
 #include <cuda_runtime.h>
+#endif
+#include <gflags/gflags.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <exception>
 #include <iostream>
+#include <random>
 #include "velox/common/base/Exceptions.h"
-#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowAcceptor.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeModules.h"
+#ifdef VELOX_ENABLE_CUDF
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
+#endif
 
 #include <glog/logging.h>
 
+// gflag for whether the UCX exchange is active. GPU builds define this in
+// cudf/exec/ToCudf.cpp; CPU-only builds need a definition in this library.
+DEFINE_bool(velox_ucx_exchange, true, "Enable UCX exchange");
+
+namespace {
+
+int readIntEnv(const char* name, int defaultValue, int minValue, int maxValue) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') {
+    return defaultValue;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(env, &end, 10);
+  if (end == env || *end != '\0' || errno != 0) {
+    LOG(WARNING) << "Ignoring invalid " << name << "=" << env;
+    return defaultValue;
+  }
+  return static_cast<int>(
+      std::clamp<long>(parsed, static_cast<long>(minValue), maxValue));
+}
+
+// Number of progress threads (primary + auxiliaries). Configurable via
+// VELOX_UCX_NUM_PROGRESS_THREADS; default 1. The CPU-row exchange posts
+// UCX completions back into per-element state-event queues, so multiple
+// progress threads can advance UCX without concurrently mutating the
+// same source/server state machine.
+int progressThreadCount() {
+  return readIntEnv("VELOX_UCX_NUM_PROGRESS_THREADS", 1, 1, 64);
+}
+} // namespace
+
+#ifdef VELOX_ENABLE_CUDF
 using namespace facebook::velox::cudf_velox;
+#endif
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+// Config knobs that the cudf path reads from CudfConfig. CPU-only
+// builds use these defaults so the foundational Communicator code can
+// run without a CudfConfig dependency. The CPU log level can be
+// overridden via the VELOX_UCX_LOG_LEVEL env var (set to e.g. 2 for
+// state-machine traces).
+struct UcxConfigView {
+#ifdef VELOX_ENABLE_CUDF
+  static int exchangeLogLevel() {
+    return cudf_velox::CudfConfig::getInstance().exchangeLogLevel;
+  }
+  static bool ucxxBlockingPolling() {
+    return cudf_velox::CudfConfig::getInstance().ucxxBlockingPolling;
+  }
+  static bool ucxxErrorHandling() {
+    return cudf_velox::CudfConfig::getInstance().ucxxErrorHandling;
+  }
+#else
+  static int exchangeLogLevel() {
+    return readIntEnv("VELOX_UCX_LOG_LEVEL", 0, 0, 10);
+  }
+  static bool ucxxBlockingPolling() {
+    return false;
+  }
+  static bool ucxxErrorHandling() {
+    return true;
+  }
+#endif
+};
+} // namespace
 
 // static
 std::once_flag Communicator::onceFlag;
@@ -57,7 +133,7 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     std::uniform_int_distribution<uint64_t> dist;
     instancePtr_->workerId_ = dist(gen);
     LOG(INFO) << "Communicator workerId=" << instancePtr_->workerId_;
-    auto logLevel = CudfConfig::getInstance().exchangeLogLevel;
+    auto logLevel = UcxConfigView::exchangeLogLevel();
     LOG(INFO) << "ucx-exchange VLOG level set to " << logLevel;
     if (logLevel > 0) {
       // Set VLOG level for all ucx-exchange source files.
@@ -107,21 +183,24 @@ Communicator::~Communicator() {
 /// All operations of the communicator will be carried out in the thread
 /// that calls run.
 void Communicator::run() {
-  VLOG(3) << "Using error handling mode: "
-          << CudfConfig::getInstance().ucxxErrorHandling << std::endl;
+  VLOG(3) << "Using error handling mode: " << UcxConfigView::ucxxErrorHandling()
+          << std::endl;
   VLOG(3) << "Using blocking progress mode: "
-          << CudfConfig::getInstance().ucxxBlockingPolling << std::endl;
+          << UcxConfigView::ucxxBlockingPolling() << std::endl;
 
   running_.store(true);
-  // Force CUDA context creation.
+#ifdef VELOX_ENABLE_CUDF
+  // Force CUDA context creation. CPU-only builds skip this entirely:
+  // there is no GPU to initialize.
   auto cudaStatus = cudaFree(0);
   VELOX_CHECK(
       cudaStatus == cudaSuccess,
       "Failed to initialize CUDA context: {}",
       cudaGetErrorString(cudaStatus));
+#endif
 
   // create the UCXX context, worker, listener-context etc.
-  if (CudfConfig::getInstance().ucxxBlockingPolling) {
+  if (UcxConfigView::ucxxBlockingPolling()) {
     context_ = ucxx::createContext({}, ucxx::Context::defaultFeatureFlags);
   } else {
     context_ = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_AM);
@@ -129,7 +208,7 @@ void Communicator::run() {
 
   worker_ = context_->createWorker();
 
-  if (CudfConfig::getInstance().ucxxBlockingPolling) {
+  if (UcxConfigView::ucxxBlockingPolling()) {
     // Communicator is using blocking progress mode.
     worker_->initBlockingProgressMode();
   }
@@ -137,15 +216,48 @@ void Communicator::run() {
   listener_ = worker_->createListener(
       port_, Communicator::cStyleListenerCallback, this);
 
+#ifdef VELOX_ENABLE_CUDF
   // Setup the active message callback that handles the
-  // initial handshake and creates the senders.
+  // initial handshake and creates the senders for the cudf path.
+  // CPU-only builds skip this: Acceptor.cpp / UcxExchangeServer.cpp
+  // aren't compiled in.
   ucxx::AmReceiverCallbackInfo info(kAmCallbackOwner, kAmCallbackId);
   worker_->registerAmReceiverCallback(info, &Acceptor::cStyleAMCallback);
+#endif
+
+  // Parallel callback for the CPU-row exchange path. The CPU acceptor
+  // creates a UcxCpuRowExchangeServer in response to its own handshakes.
+  ucxx::AmReceiverCallbackInfo cpuInfo(kAmCallbackOwner, kAmCpuCallbackId);
+  worker_->registerAmReceiverCallback(
+      cpuInfo, &UcxCpuRowAcceptor::cStyleAMCallback);
+
+  // Spawn auxiliary progress threads. The thread that called run() is
+  // primary and owns CommElement::process() / state-machine dispatch. Aux
+  // threads only progress UCX so callbacks fire promptly; callback handlers
+  // enqueue state events back to the primary-owned work queue.
+  const int numProgressThreads = progressThreadCount();
+  LOG(INFO) << "Communicator spawning " << (numProgressThreads - 1)
+            << " auxiliary progress threads (total=" << numProgressThreads
+            << ")";
+  auxThreads_.reserve(std::max(0, numProgressThreads - 1));
+  for (int i = 1; i < numProgressThreads; ++i) {
+    auxThreads_.emplace_back([this, i]() {
+      while (running_.load(std::memory_order_acquire)) {
+        try {
+          worker_->progress();
+          std::this_thread::yield();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Aux progress thread " << i << " caught: " << e.what();
+        }
+      }
+      VLOG(3) << "Aux progress thread " << i << " exiting";
+    });
+  }
 
   promise_.setValue();
 
   VLOG(3) << "Communicator running.";
-  const bool blockingMode = CudfConfig::getInstance().ucxxBlockingPolling;
+  const bool blockingMode = UcxConfigView::ucxxBlockingPolling();
   while (running_) {
     try {
       // Periodic heartbeat for diagnostic logging.
@@ -153,6 +265,7 @@ void Communicator::run() {
       if (now - lastHeartbeat_ >= std::chrono::seconds(5)) {
         std::lock_guard<std::mutex> lock(elemMutex_);
 
+#ifdef VELOX_ENABLE_CUDF
         // GPU memory usage via CUDA runtime.
         size_t gpuFree = 0, gpuTotal = 0;
         auto memStatus = cudaMemGetInfo(&gpuFree, &gpuTotal);
@@ -164,7 +277,9 @@ void Communicator::run() {
         size_t gpuFreeMB = gpuFree / (1024 * 1024);
         size_t gpuTotalMB = gpuTotal / (1024 * 1024);
 
-        // Count ExSrv vs ExSrc elements.
+        // Count ExSrv vs ExSrc elements (cudf path only; the CPU path
+        // uses different CommElement subclasses and we don't have a
+        // typed dynamic_cast hook here for them yet).
         int numServers = 0, numSources = 0;
         for (const auto& elem : elements_) {
           if (dynamic_cast<UcxExchangeServer*>(elem.get())) {
@@ -173,6 +288,7 @@ void Communicator::run() {
             ++numSources;
           }
         }
+#endif
 
         size_t numEndpoints;
         {
@@ -181,15 +297,21 @@ void Communicator::run() {
         }
         VLOG(2) << "[COMM-HEARTBEAT] workQueue=" << workQueue_.size()
                 << " elements=" << elements_.size()
+#ifdef VELOX_ENABLE_CUDF
                 << " (servers=" << numServers << " sources=" << numSources
                 << ")"
+#endif
                 << " endpoints=" << numEndpoints
                 << " deferredCleanup=" << deferredEndpointCleanup_.size()
                 << " deferredRequests=" << deferredRequests_.size()
-                << " workItemsProcessed=" << workItemsProcessed_
+                << " workItemsProcessed="
+                << workItemsProcessed_.exchange(0, std::memory_order_relaxed)
+#ifdef VELOX_ENABLE_CUDF
                 << " GPU=" << gpuUsedMB << "/" << gpuTotalMB << "MB"
-                << " (free=" << gpuFreeMB << "MB)";
-        workItemsProcessed_ = 0;
+                << " (free=" << gpuFreeMB << "MB)"
+#endif
+            ;
+        // workItemsProcessed_ was already reset by exchange() above.
         lastHeartbeat_ = now;
       }
 
@@ -206,28 +328,25 @@ void Communicator::run() {
         removeEndpointRef(ep);
       }
 
-      // Process the work queue. Make sure that communication is progressed
-      // after each call to a comms element, otherwise we will deadlock.
-      while (auto comms = workQueue_.pop()) {
-        comms->process();
-        ++workItemsProcessed_;
-        // Progress after each work item to allow UCXX to advance
-        // its internal state (complete sends/receives, fire callbacks).
-        // Use non-blocking progress here to avoid blocking between
-        // work items -- we want to drain the queue promptly.
-        worker_->progress();
-      }
+      // Drain the work queue and progress UCX, sharing the same loop
+      // body the auxiliary threads run.
+      drainWorkAndProgress();
 
       // Clean up deferred requests that UCX has fully processed.
       // These are cancelled requests whose GPU buffers needed to stay
       // alive until UCX finished any in-flight operations on them.
-      if (!deferredRequests_.empty()) {
-        deferredRequests_.erase(
-            std::remove_if(
-                deferredRequests_.begin(),
-                deferredRequests_.end(),
-                [](const auto& req) { return req->isCompleted(); }),
-            deferredRequests_.end());
+      // Only the primary thread touches this list (aux threads only
+      // append to it via deferRequestCleanup, under the mutex).
+      {
+        std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+        if (!deferredRequests_.empty()) {
+          deferredRequests_.erase(
+              std::remove_if(
+                  deferredRequests_.begin(),
+                  deferredRequests_.end(),
+                  [](const auto& req) { return req->isCompleted(); }),
+              deferredRequests_.end());
+        }
       }
 
       // All queues are drained. Now wait for UCXX network events.
@@ -245,6 +364,17 @@ void Communicator::run() {
     }
   }
   VLOG(3) << "Communicator stopping.";
+
+  // Join auxiliary progress threads. They exit when running_ flips
+  // to false (set by stop()) and get a moment to finish their
+  // current iteration. Joining here (not in stop()) keeps the cleanup
+  // on the original primary thread.
+  for (auto& t : auxThreads_) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  auxThreads_.clear();
 }
 
 /// @brief Stops the communicator, called from an outside thread.
@@ -269,7 +399,7 @@ void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
 }
 
 void Communicator::signalWorker() {
-  if (worker_ && CudfConfig::getInstance().ucxxBlockingPolling) {
+  if (worker_ && UcxConfigView::ucxxBlockingPolling()) {
     worker_->signal();
   }
 }
@@ -294,26 +424,47 @@ void Communicator::unregister(std::shared_ptr<CommElement> comms) {
 std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     std::shared_ptr<CommElement> comms,
     HostPort hostPort) {
-  std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
-  auto it = endpoints_.find(hostPort);
-  if (it != endpoints_.end()) {
-    std::shared_ptr<EndpointRef> ep = it->second;
-    ep->addCommElem(comms);
-    return ep;
-  }
-  // endpoint doesn't exist. Need to connect. Enable error handling.
-  auto ep = worker_->createEndpointFromHostname(
-      hostPort.hostname,
-      hostPort.port,
-      CudfConfig::getInstance().ucxxErrorHandling);
-  std::shared_ptr<EndpointRef> epRef = nullptr;
-  if (ep != nullptr) {
-    epRef = std::make_shared<EndpointRef>(ep);
-    epRef->addCommElem(comms);
-    if (CudfConfig::getInstance().ucxxErrorHandling) {
-      ep->setCloseCallback(EndpointRef::onClose, epRef);
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    auto it = endpoints_.find(hostPort);
+    if (it != endpoints_.end()) {
+      std::shared_ptr<EndpointRef> ep = it->second;
+      ep->addCommElem(comms);
+      return ep;
     }
-    endpoints_.insert(std::pair{hostPort, epRef});
+  }
+
+  // Endpoint doesn't exist; connect and register it. With error handling
+  // enabled, UCXX reports connection failures through request callbacks
+  // instead of leaving exchange sources waiting indefinitely.
+  const bool errorHandling = UcxConfigView::ucxxErrorHandling();
+  std::shared_ptr<ucxx::Endpoint> ep;
+  try {
+    ep = worker_->createEndpointFromHostname(
+        hostPort.hostname, hostPort.port, errorHandling);
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to create UCX endpoint to " << hostPort.hostname
+                 << ":" << hostPort.port << ": " << e.what();
+    return nullptr;
+  }
+  if (ep == nullptr) {
+    return nullptr;
+  }
+
+  auto epRef = std::make_shared<EndpointRef>(ep);
+  epRef->addCommElem(comms);
+
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    auto [it, inserted] = endpoints_.insert(std::pair{hostPort, epRef});
+    if (!inserted) {
+      std::shared_ptr<EndpointRef> existing = it->second;
+      existing->addCommElem(comms);
+      return existing;
+    }
+  }
+  if (errorHandling) {
+    ep->setCloseCallback(EndpointRef::onClose, epRef);
   }
   return epRef;
 }
@@ -325,7 +476,7 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
 
   // Close the endpoint if it's still alive.
   // NOTE: This calls closeBlocking() which progresses the worker internally,
-  // which can fire listenerCallback() re-entrantly — hence the recursive mutex.
+  // which can fire listenerCallback() re-entrantly, hence the recursive mutex.
   // This method must NOT be called from within a UCX callback.
   // Use deferEndpointCleanup() from callbacks instead.
   if (ep->endpoint_ && ep->endpoint_->isAlive()) {
@@ -353,12 +504,45 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
 
 void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
   if (request) {
+    std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
     deferredRequests_.push_back(std::move(request));
+  }
+}
+
+void Communicator::drainWorkAndProgress() {
+  // Primary-thread work dispatch. Aux threads progress UCX only; they do
+  // not run CommElement::process(). Keep the try-lock path because close()
+  // can still race from driver / endpoint-cleanup paths.
+  std::vector<std::shared_ptr<CommElement>> deferred;
+  bool anyProcessed = false;
+  while (auto comms = workQueue_.pop()) {
+    std::unique_lock<std::recursive_mutex> lock(
+        comms->processMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      deferred.push_back(std::move(comms));
+      continue;
+    }
+    comms->process();
+    workItemsProcessed_.fetch_add(1, std::memory_order_relaxed);
+    anyProcessed = true;
+  }
+  for (auto& c : deferred) {
+    workQueue_.push(std::move(c));
+  }
+  // Always progress UCX. Without this, callbacks never fire and the
+  // lock-holder may not complete.
+  worker_->progress();
+  // If the only thing we did this round was push deferred items back,
+  // yield rather than spin; the lock-holder's progress (or another
+  // thread's progress) needs CPU time to make forward motion.
+  if (!anyProcessed && !deferred.empty()) {
+    std::this_thread::yield();
   }
 }
 
 std::shared_ptr<EndpointRef> Communicator::findEndpointRefByHandle(
     ucp_ep_h handle) {
+  std::lock_guard<std::mutex> lock(acceptor_.mutex_);
   auto it = acceptor_.handleToEndpointRef_.find(handle);
   if (it != acceptor_.handleToEndpointRef_.end()) {
     return it->second;
@@ -403,15 +587,15 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   // endpoints, one per direction. For compatibility reasons, both incoming and
   // outgoing endpoints are represented using the EndpointRef.
   auto endpoint = listener_->createEndpointFromConnRequest(
-      conn_request, CudfConfig::getInstance().ucxxErrorHandling);
+      conn_request, UcxConfigView::ucxxErrorHandling());
   // Pass the peer's actual IP to EndpointRef for reliable intra-node detection.
   auto epRef = std::make_shared<EndpointRef>(endpoint, std::string(ip_str));
-  if (CudfConfig::getInstance().ucxxErrorHandling) {
+  if (UcxConfigView::ucxxErrorHandling()) {
     endpoint->setCloseCallback(EndpointRef::onClose, epRef);
   }
   // Add this endpoint reference to the list of endpoints.
   // NOTE: This runs inside a UCX listener callback (during worker progress),
-  // so we must not throw — throwing from a UCX callback is undefined behavior.
+  // so we must not throw. Throwing from a UCX callback is undefined behavior.
   unsigned long val = std::strtoul(port_str, nullptr, 10);
   if (val > static_cast<unsigned long>(std::numeric_limits<uint16_t>::max())) {
     LOG(ERROR) << "listenerCallback: port out of range for uint16_t: " << val;

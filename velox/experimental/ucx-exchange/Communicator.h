@@ -21,6 +21,8 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -54,6 +56,10 @@ class Communicator {
  public:
   const ucxx::AmReceiverCallbackOwnerType kAmCallbackOwner = "velox";
   const ucxx::AmReceiverCallbackIdType kAmCallbackId = 123;
+  // Separate callback id for the CPU-row exchange's handshake. Lets the
+  // CPU-row Acceptor coexist with the cudf Acceptor on the same listener
+  // without sharing dispatch state.
+  const ucxx::AmReceiverCallbackIdType kAmCpuCallbackId = 124;
 
   /// @brief Method to initialize the communicator and get a reference to it.
   /// @param port The port to listen on.
@@ -119,7 +125,8 @@ class Communicator {
   /// @brief Defers cleanup of a cancelled UCXX request to the main loop.
   /// The request (and the GPU buffers it references via its arg) will be
   /// held alive until UCX has fully processed the cancellation.
-  /// Must only be called from the Communicator thread.
+  /// Thread-safe: close paths may call this from driver threads or
+  /// communicator progress threads.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
 
   /// Returns the URL of the coordinator.
@@ -202,7 +209,7 @@ class Communicator {
 
   // Protects endpoints_. Must be recursive because removeEndpointRef() holds
   // the lock and calls closeBlocking(), which progresses the worker and can
-  // fire listenerCallback() re-entrantly — that callback also locks this mutex.
+  // fire listenerCallback() re-entrantly. That callback also locks this mutex.
   std::recursive_mutex endpointsMutex_;
 
   // Shared endpoints keyed by remote host:port.
@@ -226,13 +233,27 @@ class Communicator {
   // Cancelled UCXX requests whose GPU buffers may still be referenced by
   // UCX internals. Held alive here until isCompleted() returns true,
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
-  // are not freed prematurely.
+  // are not freed prematurely. With multiple progress threads,
+  // deferRequestCleanup() can be called from any of them, so we guard
+  // both push and the per-iteration sweep with this mutex.
+  std::mutex deferredRequestsMutex_;
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
+
+  // Auxiliary progress threads. The thread that called run() is the
+  // primary; it owns heartbeat / deferred cleanup / CommElement process()
+  // dispatch. Auxiliary threads only call worker_->progress() so UCX
+  // callbacks fire without concurrently advancing source/server state
+  // machines.
+  std::vector<std::thread> auxThreads_;
+  // Loop body shared between primary and aux threads.
+  void drainWorkAndProgress();
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{
       std::chrono::steady_clock::now()};
-  uint64_t workItemsProcessed_{0};
+  // Atomic because aux progress threads also increment this when
+  // running drainWorkAndProgress(). Read+reset on the primary thread.
+  std::atomic<uint64_t> workItemsProcessed_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

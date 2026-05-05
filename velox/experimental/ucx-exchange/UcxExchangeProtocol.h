@@ -79,6 +79,15 @@ struct HandshakeMsg {
   /// Generated randomly at Communicator startup. The server compares this
   /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
+  /// CPU-row exchange only: optional POSIX SHM object name created by the
+  /// source before the handshake. If the server can open it, both processes
+  /// share an IPC namespace and CPU SHM transport can be used for this
+  /// connection. Empty means the source did not request CPU SHM.
+  char cpuShmProbeName[256]{};
+  /// Token written into cpuShmProbeName. The server must read the same value
+  /// back before enabling CPU SHM, avoiding false positives from stale or
+  /// unrelated SHM objects with the same name.
+  uint64_t cpuShmProbeToken{0};
 };
 
 /// @brief Response sent from server to source after handshake.
@@ -88,8 +97,11 @@ struct HandshakeResponse {
   /// True if server and source are on the same node (same Communicator).
   /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
   bool isIntraNodeTransfer{false};
+  /// CPU-row exchange only: true when both sides enabled CPU SHM and the
+  /// server successfully opened the source's SHM probe object.
+  bool canUseCpuShm{false};
   /// Padding for alignment
-  uint8_t padding[7]{};
+  uint8_t padding[6]{};
 };
 
 constexpr uint32_t kMagicNumber = 0x12345678;

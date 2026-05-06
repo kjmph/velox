@@ -34,8 +34,6 @@
 
 namespace facebook::velox::ucx_exchange {
 
-class UcxCpuRowShmSlotPool;
-
 class UcxCpuRowExchangeServer
     : public CommElement,
       public std::enable_shared_from_this<UcxCpuRowExchangeServer> {
@@ -60,8 +58,7 @@ class UcxCpuRowExchangeServer
   static std::shared_ptr<UcxCpuRowExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key,
-      bool canUseCpuShm);
+      const PartitionKey& key);
 
   void process() override;
 
@@ -77,8 +74,7 @@ class UcxCpuRowExchangeServer
   explicit UcxCpuRowExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key,
-      bool canUseCpuShm);
+      const PartitionKey& key);
 
   std::shared_ptr<UcxCpuRowExchangeServer> getSelfPtr();
 
@@ -116,7 +112,6 @@ class UcxCpuRowExchangeServer
   // Hash of the partition-key string, used to derive UCX message tags.
   // See UcxExchangeProtocol.h for the tag layout.
   const uint32_t partitionKeyHash_;
-  const bool canUseCpuShm_;
 
   std::atomic<ServerState> state_;
   std::atomic<bool> closed_{false};
@@ -137,9 +132,6 @@ class UcxCpuRowExchangeServer
   int64_t payloadBytesStarted_{0};
   int64_t payloadBytesCompleted_{0};
   int64_t chunksStarted_{0};
-  int64_t producerSlotBundlesStarted_{0};
-  int64_t directShmBundlesStarted_{0};
-  int64_t heapBundlesStarted_{0};
 
   // The Request owns its callback closure; completed UCXX requests are
   // kept for the server lifetime because UCP wireup-replay can invoke

@@ -17,6 +17,7 @@
 
 #include <velox/exec/Task.h>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <unordered_set>
 #include "velox/experimental/ucx-exchange/UcxCpuRowQueues.h"
@@ -96,9 +97,6 @@ class UcxCpuRowOutputQueueManager {
       std::string_view taskId,
       int destination,
       std::shared_ptr<UcxCpuRowPayload> data);
-
-  std::optional<UcxCpuRowShmSlotLease>
-  tryAcquireSlot(std::string_view taskId, int destination, size_t bytes);
 
   /// Removes the queue for the given task. Calls `terminate` on the
   /// queue to wake up any waiting producers/consumers.

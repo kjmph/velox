@@ -19,10 +19,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -95,12 +93,9 @@ struct CpuRowMetaSendContext {
   std::shared_ptr<uint8_t> metadata;
 };
 
-// One on-the-wire frame. Either we own a chunk's IOBuf directly
-// (large chunks ship standalone; coalesce() on a single-segment
-// IOBuf is a no-op so this is true zero-copy on the send side), or we
-// own a packed heap buffer that aggregated several small chunks (one
-// memcpy per packed byte but bounded; keeps frame count and
-// per-frame UCX overhead in check).
+// One on-the-wire frame. Large chunks ship standalone when already
+// contiguous enough for UCX to read directly; smaller chunks are packed
+// into heap buffers to keep frame count and per-frame UCX overhead bounded.
 struct CpuRowSendFrame {
   void* ptr{nullptr};
   size_t len{0};
@@ -114,21 +109,7 @@ struct CpuRowSendFrame {
 // keeps every byte UCX is reading from alive across the whole bundle's
 // DMA.
 struct CpuRowMultiSendState {
-  ~CpuRowMultiSendState() {
-    if (slotPool &&
-        !receiverSlotRefsCommitted.load(std::memory_order_acquire)) {
-      for (auto slotId : slotIds) {
-        slotPool->release(slotId);
-      }
-    }
-  }
-
   std::vector<CpuRowSendFrame> frames;
-  std::vector<std::shared_ptr<UcxCpuRowPayload>> shmChunks;
-  std::shared_ptr<UcxCpuRowShmSegment> shmSegment;
-  std::shared_ptr<UcxCpuRowShmSlotPool> slotPool;
-  std::vector<uint32_t> slotIds;
-  std::atomic<bool> receiverSlotRefsCommitted{false};
   std::atomic<int32_t> pendingFrames{0};
   std::atomic<ucs_status_t> finalStatus{UCS_OK};
   uint32_t sequenceNumber{0};
@@ -161,12 +142,10 @@ void UcxCpuRowExchangeServer::setState(ServerState newState) {
 UcxCpuRowExchangeServer::UcxCpuRowExchangeServer(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
-    const PartitionKey& key,
-    bool canUseCpuShm)
+    const PartitionKey& key)
     : CommElement(communicator, endpointRef),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
-      canUseCpuShm_(canUseCpuShm),
       queueMgr_(UcxCpuRowOutputQueueManager::getInstanceRef()) {
   setState(ServerState::Created);
 }
@@ -175,10 +154,9 @@ UcxCpuRowExchangeServer::UcxCpuRowExchangeServer(
 std::shared_ptr<UcxCpuRowExchangeServer> UcxCpuRowExchangeServer::create(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
-    const PartitionKey& key,
-    bool canUseCpuShm) {
-  return std::shared_ptr<UcxCpuRowExchangeServer>(new UcxCpuRowExchangeServer(
-      communicator, endpointRef, key, canUseCpuShm));
+    const PartitionKey& key) {
+  return std::shared_ptr<UcxCpuRowExchangeServer>(
+      new UcxCpuRowExchangeServer(communicator, endpointRef, key));
 }
 
 void UcxCpuRowExchangeServer::process() {
@@ -343,42 +321,10 @@ void UcxCpuRowExchangeServer::sendData(
   // then packed into ~kFrameTargetBytes frames before the metadata is
   // built; the receiver allocates one buffer per frame and we must
   // advertise the post-pack sizes, not the per-chunk sizes.
-  enum class BundleTransport {
-    kProducerSlot,
-    kDirectShm,
-    kHeap,
-  };
-
   std::vector<std::shared_ptr<UcxCpuRowPayload>> chunks;
   int64_t combinedBytes = 0;
   int64_t combinedRows = 0;
-  BundleTransport firstTransport = BundleTransport::kHeap;
   if (firstChunk) {
-    auto bundleTransport = [](const std::shared_ptr<UcxCpuRowPayload>& chunk) {
-      if (chunk->shmSlotPool &&
-          chunk->shmSlotId != std::numeric_limits<uint32_t>::max()) {
-        return BundleTransport::kProducerSlot;
-      }
-      if (chunk->shmSegment) {
-        return BundleTransport::kDirectShm;
-      }
-      return BundleTransport::kHeap;
-    };
-
-    firstTransport = bundleTransport(firstChunk);
-    const auto* firstSlotPool =
-        firstChunk->shmSlotPool ? firstChunk->shmSlotPool.get() : nullptr;
-    auto canBundleWithFirst =
-        [&](const std::shared_ptr<UcxCpuRowPayload>& extra) {
-          if (bundleTransport(extra) != firstTransport) {
-            return false;
-          }
-          if (firstTransport == BundleTransport::kProducerSlot) {
-            return extra->shmSlotPool.get() == firstSlotPool;
-          }
-          return true;
-        };
-
     combinedBytes = firstChunk->numBytes;
     combinedRows = firstChunk->numRows;
     chunks.push_back(std::move(firstChunk));
@@ -386,11 +332,6 @@ void UcxCpuRowExchangeServer::sendData(
       auto extra = queueMgr_->tryGetData(
           partitionKey_.taskId, partitionKey_.destination);
       if (!extra) {
-        break;
-      }
-      if (!canBundleWithFirst(extra)) {
-        queueMgr_->requeueFront(
-            partitionKey_.taskId, partitionKey_.destination, std::move(extra));
         break;
       }
       combinedBytes += extra->numBytes;
@@ -409,17 +350,6 @@ void UcxCpuRowExchangeServer::sendData(
   ++bundlesStarted_;
   payloadBytesStarted_ += combinedBytes;
   chunksStarted_ += bundledChunks;
-  switch (firstTransport) {
-    case BundleTransport::kProducerSlot:
-      ++producerSlotBundlesStarted_;
-      break;
-    case BundleTransport::kDirectShm:
-      ++directShmBundlesStarted_;
-      break;
-    case BundleTransport::kHeap:
-      ++heapBundlesStarted_;
-      break;
-  }
 
   // Pack chunks into ~kFrameTargetBytes frames:
   //   - A chunk >= kStandaloneFrameMinBytes ships standalone
@@ -429,259 +359,6 @@ void UcxCpuRowExchangeServer::sendData(
   // Goal: keep UCX request overhead bounded without copying pages that are
   // already large enough to stand alone.
   auto multiState = std::make_shared<CpuRowMultiSendState>();
-
-  auto producerSlotPool = [&]() -> std::shared_ptr<UcxCpuRowShmSlotPool> {
-    if (!canUseCpuShm_ || chunks.empty()) {
-      return nullptr;
-    }
-    auto pool = chunks.front() ? chunks.front()->shmSlotPool : nullptr;
-    if (!pool) {
-      return nullptr;
-    }
-    for (const auto& chunk : chunks) {
-      if (!chunk || chunk->numBytes <= 0 || !chunk->shmSlotPool ||
-          chunk->shmSlotPool.get() != pool.get() ||
-          chunk->shmSlotId == std::numeric_limits<uint32_t>::max()) {
-        return nullptr;
-      }
-    }
-    return pool;
-  }();
-
-  // Producer-side slot-pool path. The producing driver serialized directly
-  // into reusable SHM slots owned by the task output queue; this server only
-  // publishes metadata. This is the slot path that avoids both per-message
-  // shm_open/fstat/mmap and the extra heap-to-slot copy.
-  if (producerSlotPool) {
-    multiState->shmChunks = std::move(chunks);
-    const size_t numFrames = multiState->shmChunks.size();
-    VELOX_CHECK_GT(numFrames, 0, "sendData requires a non-empty data bundle");
-
-    multiState->slotPool = producerSlotPool;
-    multiState->slotIds.reserve(numFrames);
-
-    UcxCpuRowMetadataMsg metadataMsg;
-    metadataMsg.dataSizeBytes = combinedBytes;
-    metadataMsg.frameSizes.reserve(numFrames);
-    metadataMsg.remainingBytes = {};
-    metadataMsg.atEnd = false;
-    metadataMsg.transport = UcxCpuRowMetadataMsg::Transport::kShmSlot;
-    metadataMsg.shmPoolName = producerSlotPool->name();
-    metadataMsg.shmPoolSize =
-        static_cast<WireDataSizeType>(producerSlotPool->totalSize());
-    metadataMsg.shmSlotSize =
-        static_cast<WireDataSizeType>(producerSlotPool->slotSize());
-    metadataMsg.shmSlotIds.reserve(numFrames);
-
-    for (const auto& chunk : multiState->shmChunks) {
-      const auto frameBytes = static_cast<size_t>(chunk->numBytes);
-      VELOX_CHECK_LE(
-          frameBytes,
-          producerSlotPool->slotSize(),
-          "CPU SHM producer slot frame exceeds slot size");
-      VELOX_CHECK(
-          producerSlotPool->isReady(chunk->shmSlotId),
-          "CPU SHM producer slot is not ready");
-      VELOX_CHECK(
-          producerSlotPool->addRef(chunk->shmSlotId),
-          "CPU SHM producer slot was freed before metadata publish");
-      multiState->slotIds.push_back(chunk->shmSlotId);
-      metadataMsg.frameSizes.push_back(
-          static_cast<WireDataSizeType>(frameBytes));
-      metadataMsg.shmSlotIds.push_back(
-          static_cast<WireLengthType>(chunk->shmSlotId));
-    }
-
-    multiState->sequenceNumber = sequenceNumber;
-    multiState->bytes = combinedBytes;
-    multiState->startTime = std::chrono::high_resolution_clock::now();
-
-    auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
-    uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber);
-
-    VLOG(3) << "@" << partitionKey_.taskId << " seq=" << sequenceNumber
-            << " publishing CPU SHM producer slot-pool bundle pool="
-            << producerSlotPool->name() << " frames=" << numFrames
-            << " bytes=" << combinedBytes << " bundledChunks=" << bundledChunks;
-
-    auto metaCtx = std::make_shared<CpuRowMetaSendContext>();
-    metaCtx->metadata = serializedMetadata;
-    std::weak_ptr<UcxCpuRowExchangeServer> weakMeta = weak_from_this();
-
-    setState(ServerState::WaitingForSendComplete);
-    ++inFlightSends_;
-
-    auto metaRequest = endpointRef_->endpoint_->tagSend(
-        metaCtx->metadata.get(),
-        serMetaSize,
-        ucxx::Tag{metadataTag},
-        false,
-        [tid = partitionKey_.toString(), metadataTag, weakMeta, multiState](
-            ucs_status_t status, std::shared_ptr<void> arg) {
-          auto ctx = std::static_pointer_cast<CpuRowMetaSendContext>(arg);
-          auto metaHolder = std::move(ctx->metadata);
-
-          if (status == UCS_OK) {
-            // Metadata completion hands the advertised slot references to the
-            // receiver. Producer-side payload references remain live until the
-            // local queue/server releases its shared_ptrs.
-            //
-            // After metadata is successfully submitted to UCX, receivers own
-            // unlinking the POSIX SHM name. The shared pool header contains
-            // the expected opener count, and the last receiver to open the
-            // pool unlinks the name. The local mapping stays valid through the
-            // shared_ptrs above.
-            if (multiState->slotPool) {
-              multiState->slotPool->disableUnlinkOnDestroy();
-            }
-            multiState->receiverSlotRefsCommitted.store(
-                true, std::memory_order_release);
-          }
-
-          auto self = weakMeta.lock();
-          if (!self) {
-            return;
-          }
-          self->enqueueStateEvent(
-              self,
-              [raw = self.get(),
-               status,
-               tid,
-               metadataTag,
-               multiState]() mutable {
-                if (raw->closed_.load(std::memory_order_acquire)) {
-                  VLOG(3) << "@" << raw->partitionKey_.taskId
-                          << " producer slot-pool metadata send callback "
-                             "after close, ignoring";
-                  return;
-                }
-                if (status == UCS_OK) {
-                  VLOG(3) << "@" << raw->partitionKey_.taskId
-                          << " producer slot-pool metadata sent to " << tid
-                          << " tag=" << std::hex << metadataTag;
-                } else {
-                  VLOG(0) << "@" << raw->partitionKey_.taskId
-                          << " Error in producer slot-pool metadata send: "
-                          << ucs_status_string(status) << " task: " << tid;
-                }
-                raw->sendComplete(status, multiState);
-              });
-        },
-        metaCtx);
-    metaRequests_.push_back(std::move(metaRequest));
-    return;
-  }
-
-  // Producer-side SHM chunks are already materialized in named shared memory.
-  // Publish those names directly and skip the communicator-thread copy into a
-  // new bundle.
-  const bool publishProducerShm =
-      canUseCpuShm_ && !chunks.empty() &&
-      std::all_of(chunks.begin(), chunks.end(), [](const auto& chunk) {
-        return chunk && chunk->shmSegment && chunk->numBytes > 0;
-      });
-  if (publishProducerShm) {
-    multiState->shmChunks = std::move(chunks);
-    const size_t numFrames = multiState->shmChunks.size();
-    VELOX_CHECK_GT(numFrames, 0, "sendData requires a non-empty data bundle");
-
-    multiState->sequenceNumber = sequenceNumber;
-    multiState->bytes = combinedBytes;
-    multiState->startTime = std::chrono::high_resolution_clock::now();
-
-    UcxCpuRowMetadataMsg metadataMsg;
-    metadataMsg.dataSizeBytes = combinedBytes;
-    metadataMsg.frameSizes.reserve(numFrames);
-    metadataMsg.shmNames.reserve(numFrames);
-    metadataMsg.remainingBytes = {};
-    metadataMsg.atEnd = false;
-    metadataMsg.transport = UcxCpuRowMetadataMsg::Transport::kShm;
-
-    for (const auto& chunk : multiState->shmChunks) {
-      const auto frameBytes = static_cast<size_t>(chunk->numBytes);
-      VELOX_CHECK_LE(
-          chunk->shmOffset,
-          chunk->shmSegment->size,
-          "CPU SHM direct-TX chunk offset exceeds backing segment");
-      VELOX_CHECK_LE(
-          frameBytes,
-          chunk->shmSegment->size - chunk->shmOffset,
-          "CPU SHM direct-TX chunk exceeds backing segment");
-      metadataMsg.frameSizes.push_back(
-          static_cast<WireDataSizeType>(frameBytes));
-      metadataMsg.shmNames.push_back(chunk->shmSegment->name);
-      VELOX_CHECK_EQ(
-          chunk->shmOffset,
-          0,
-          "CPU SHM direct-TX standalone chunk must start at offset 0");
-    }
-    metadataMsg.shmName = metadataMsg.shmNames.front();
-
-    auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
-    uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber);
-
-    VLOG(3) << "@" << partitionKey_.taskId << " seq=" << sequenceNumber
-            << " publishing CPU SHM direct-TX bundle frames=" << numFrames
-            << " bytes=" << combinedBytes << " bundledChunks=" << bundledChunks;
-
-    auto metaCtx = std::make_shared<CpuRowMetaSendContext>();
-    metaCtx->metadata = serializedMetadata;
-    std::weak_ptr<UcxCpuRowExchangeServer> weakMeta = weak_from_this();
-
-    setState(ServerState::WaitingForSendComplete);
-    ++inFlightSends_;
-
-    auto metaRequest = endpointRef_->endpoint_->tagSend(
-        metaCtx->metadata.get(),
-        serMetaSize,
-        ucxx::Tag{metadataTag},
-        false,
-        [tid = partitionKey_.toString(), metadataTag, weakMeta, multiState](
-            ucs_status_t status, std::shared_ptr<void> arg) {
-          auto ctx = std::static_pointer_cast<CpuRowMetaSendContext>(arg);
-          auto metaHolder = std::move(ctx->metadata);
-
-          if (status == UCS_OK) {
-            for (const auto& chunk : multiState->shmChunks) {
-              if (chunk->shmSegment) {
-                chunk->shmSegment->unlinkOnDestroy = false;
-              }
-            }
-          }
-
-          auto self = weakMeta.lock();
-          if (!self) {
-            return;
-          }
-          self->enqueueStateEvent(
-              self,
-              [raw = self.get(),
-               status,
-               tid,
-               metadataTag,
-               multiState]() mutable {
-                if (raw->closed_.load(std::memory_order_acquire)) {
-                  VLOG(3) << "@" << raw->partitionKey_.taskId
-                          << " direct-TX SHM metadata send callback after "
-                             "close, ignoring";
-                  return;
-                }
-                if (status == UCS_OK) {
-                  VLOG(3) << "@" << raw->partitionKey_.taskId
-                          << " direct-TX SHM metadata sent to " << tid
-                          << " tag=" << std::hex << metadataTag;
-                } else {
-                  VLOG(0) << "@" << raw->partitionKey_.taskId
-                          << " Error in direct-TX SHM metadata send: "
-                          << ucs_status_string(status) << " task: " << tid;
-                }
-                raw->sendComplete(status, multiState);
-              });
-        },
-        metaCtx);
-    metaRequests_.push_back(std::move(metaRequest));
-    return;
-  }
 
   if (!chunks.empty()) {
     std::vector<std::shared_ptr<UcxCpuRowPayload>> pendingChunks;
@@ -865,10 +542,7 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
           << " bundlesCompleted=" << bundlesCompleted_
           << " bytesStarted=" << payloadBytesStarted_
           << " bytesCompleted=" << payloadBytesCompleted_
-          << " chunksStarted=" << chunksStarted_
-          << " producerSlotBundles=" << producerSlotBundlesStarted_
-          << " directShmBundles=" << directShmBundlesStarted_
-          << " heapBundles=" << heapBundlesStarted_ << " firstPayloadToFinalMs="
+          << " chunksStarted=" << chunksStarted_ << " firstPayloadToFinalMs="
           << elapsedMillis(firstPayloadTime_, finalMetadataSendTime_)
           << " lastPayloadToFinalMs="
           << elapsedMillis(lastPayloadTime_, finalMetadataSendTime_);
@@ -995,13 +669,8 @@ void UcxCpuRowExchangeServer::sendComplete(
 
     // Completed UCXX requests are retained for the server lifetime to protect
     // callback closures from UCP wireup replay, but their captured send state
-    // must not keep payload buffers alive. Slot-pool payload destruction is
-    // what releases producer references and makes slots reusable; retaining
-    // shmChunks here turns a slot pool into a single-use pool for the entire
-    // task.
-    state->shmChunks.clear();
+    // must not keep payload buffers alive.
     state->frames.clear();
-    state->shmSegment.reset();
 
     if (!finalMetadataSent_) {
       setState(ServerState::ReadyToTransfer);

@@ -16,22 +16,16 @@
 #include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
-#include <cstring>
-#include <limits>
 #include <optional>
 
 namespace facebook::velox::ucx_exchange {
 namespace {
 
-constexpr uint64_t kDefaultMaxPageBytes = 1UL << 20; // 1 MiB
-constexpr uint64_t kDirectShmDefaultMaxPageBytes = 8UL << 20; // 8 MiB
-constexpr uint64_t kDefaultShmMinPayloadBytes = 64UL << 10; // 64 KiB
-constexpr int32_t kDirectShmDefaultTargetNumRows = 256'000;
+constexpr uint64_t kDefaultMaxPageBytes = 16UL << 20; // 16 MiB
 
 std::optional<uint64_t>
 readUint64Env(const char* name, uint64_t minValue, uint64_t maxValue) {
@@ -51,7 +45,7 @@ readUint64Env(const char* name, uint64_t minValue, uint64_t maxValue) {
   return std::clamp<uint64_t>(parsed, minValue, maxValue);
 }
 
-uint64_t configuredMaxPageBytes(bool directShmEnabled) {
+uint64_t configuredMaxPageBytes() {
   static const auto kConfigured = readUint64Env(
       "VELOX_UCX_CPU_MAX_PAGE_BYTES",
       UcxCpuRowPartitionedOutput::kMinDestinationSize,
@@ -59,229 +53,17 @@ uint64_t configuredMaxPageBytes(bool directShmEnabled) {
   if (kConfigured.has_value()) {
     return *kConfigured;
   }
-  return directShmEnabled ? kDirectShmDefaultMaxPageBytes
-                          : kDefaultMaxPageBytes;
+  return kDefaultMaxPageBytes;
 }
 
-int32_t configuredTargetNumRows(bool directShmEnabled) {
+int32_t configuredTargetNumRows() {
   static const auto kConfigured =
       readUint64Env("VELOX_UCX_CPU_TARGET_ROWS", 1, 16'000'000);
   if (kConfigured.has_value()) {
     return static_cast<int32_t>(*kConfigured);
   }
-  return directShmEnabled ? kDirectShmDefaultTargetNumRows
-                          : UcxCpuRowPartitionedOutput::kTargetNumRows;
+  return UcxCpuRowPartitionedOutput::kTargetNumRows;
 }
-
-uint64_t configuredShmMinPayloadBytes() {
-  static const auto kConfigured =
-      readUint64Env("VELOX_UCX_CPU_SHM_MIN_PAYLOAD_BYTES", 0, 64UL << 20);
-  return kConfigured.value_or(kDefaultShmMinPayloadBytes);
-}
-
-bool useDirectShmOutput(bool isBroadcast) {
-  return !isBroadcast && ucxCpuRowShmDirectTxEnabled();
-}
-
-bool useBroadcastSlotPoolOutput() {
-  static const bool kEnabled =
-      readUint64Env("VELOX_UCX_CPU_SHM_BROADCAST_SLOT_POOL", 0, 1)
-          .value_or(0) == 1;
-  return kEnabled;
-}
-
-bool useSlotPoolOutput(bool isBroadcast) {
-  return ucxCpuRowShmSlotPoolEnabled() &&
-      (!isBroadcast || useBroadcastSlotPoolOutput());
-}
-
-bool useShmSizedOutputPages(bool isBroadcast) {
-  return useDirectShmOutput(isBroadcast) || useSlotPoolOutput(isBroadcast);
-}
-
-class DirectShmOutputStream final : public OutputStream {
- public:
-  explicit DirectShmOutputStream(size_t initialSize)
-      : segment_(createUcxCpuRowShmSegment(initialSize)),
-        capacity_(segment_ ? initialSize : 0) {
-    if (segment_) {
-      segment_->unlinkOnDestroy = true;
-    }
-  }
-
-  bool valid() const {
-    return segment_ != nullptr;
-  }
-
-  void write(const char* s, std::streamsize count) override {
-    VELOX_CHECK_GE(count, 0);
-    const auto offset = static_cast<size_t>(position_);
-    VELOX_CHECK_LE(
-        offset,
-        capacity_,
-        "CPU SHM direct-TX stream offset exceeded backing segment");
-    const auto bytes = static_cast<size_t>(count);
-    VELOX_CHECK_LE(
-        bytes,
-        std::numeric_limits<size_t>::max() - offset,
-        "CPU SHM direct-TX stream size overflow");
-    ensureCapacity(offset + bytes);
-    std::memcpy(segment_->data() + offset, s, bytes);
-    position_ += static_cast<std::streamoff>(bytes);
-    highWater_ = std::max(highWater_, offset + bytes);
-    if (listener_) {
-      listener_->onWrite(s, count);
-    }
-  }
-
-  std::streampos tellp() const override {
-    return position_;
-  }
-
-  void seekp(std::streampos pos) override {
-    const auto offset = static_cast<std::streamoff>(pos);
-    VELOX_CHECK_GE(offset, 0);
-    ensureCapacity(static_cast<size_t>(offset));
-    position_ = pos;
-  }
-
-  std::shared_ptr<UcxCpuRowShmSegment> segment() const {
-    return segment_;
-  }
-
-  size_t offset() const {
-    return 0;
-  }
-
-  std::unique_ptr<folly::IOBuf> getIOBuf(size_t size) const {
-    VELOX_CHECK_NOT_NULL(segment_);
-    VELOX_CHECK_LE(
-        size, capacity_, "CPU SHM direct-TX IOBuf exceeds backing segment");
-    auto segmentHolder =
-        std::make_unique<std::shared_ptr<UcxCpuRowShmSegment>>(segment_);
-    return folly::IOBuf::takeOwnership(
-        segment_->data(),
-        size,
-        [](void* /*buf*/, void* userData) {
-          delete static_cast<std::shared_ptr<UcxCpuRowShmSegment>*>(userData);
-        },
-        segmentHolder.release());
-  }
-
- private:
-  void ensureCapacity(size_t required) {
-    if (required <= capacity_) {
-      return;
-    }
-
-    size_t newSize = std::max<size_t>(capacity_, 1);
-    while (newSize < required) {
-      VELOX_CHECK_LE(
-          newSize,
-          std::numeric_limits<size_t>::max() / 2,
-          "CPU SHM direct-TX stream size overflow");
-      newSize *= 2;
-    }
-
-    auto newSegment = createUcxCpuRowShmSegment(newSize);
-    VELOX_CHECK_NOT_NULL(newSegment, "Failed to grow CPU SHM direct-TX stream");
-    newSegment->unlinkOnDestroy = true;
-    if (highWater_ > 0) {
-      VELOX_CHECK_NOT_NULL(segment_);
-      std::memcpy(newSegment->data(), segment_->data(), highWater_);
-    }
-    segment_ = std::move(newSegment);
-    capacity_ = newSize;
-  }
-
-  std::shared_ptr<UcxCpuRowShmSegment> segment_;
-  size_t capacity_;
-  std::streampos position_{0};
-  size_t highWater_{0};
-};
-
-class SlotOutputStream final : public OutputStream {
- public:
-  explicit SlotOutputStream(UcxCpuRowShmSlotLease lease)
-      : pool_(std::move(lease.pool)),
-        slotId_(lease.slot.id),
-        data_(lease.slot.data),
-        capacity_(pool_->slotSize()) {}
-
-  ~SlotOutputStream() override {
-    if (releaseOnDestroy_ && pool_) {
-      pool_->release(slotId_);
-    }
-  }
-
-  void write(const char* s, std::streamsize count) override {
-    VELOX_CHECK_GE(count, 0);
-    const auto offset = static_cast<size_t>(position_);
-    VELOX_CHECK_LE(
-        offset,
-        capacity_,
-        "CPU SHM slot-pool stream offset exceeded backing slot");
-    const auto bytes = static_cast<size_t>(count);
-    VELOX_CHECK_LE(
-        bytes,
-        capacity_ - offset,
-        "CPU SHM slot-pool stream exceeded backing slot");
-    std::memcpy(data_ + offset, s, bytes);
-    position_ += static_cast<std::streamoff>(bytes);
-  }
-
-  std::streampos tellp() const override {
-    return position_;
-  }
-
-  void seekp(std::streampos pos) override {
-    const auto offset = static_cast<std::streamoff>(pos);
-    VELOX_CHECK_GE(offset, 0);
-    VELOX_CHECK_LE(
-        static_cast<size_t>(offset),
-        capacity_,
-        "CPU SHM slot-pool seek exceeded backing slot");
-    position_ = pos;
-  }
-
-  std::shared_ptr<UcxCpuRowShmSlotPool> pool() const {
-    return pool_;
-  }
-
-  uint32_t slotId() const {
-    return slotId_;
-  }
-
-  void markReady() {
-    pool_->markReady(slotId_);
-    releaseOnDestroy_ = false;
-  }
-
-  std::unique_ptr<folly::IOBuf> getIOBuf(size_t size) const {
-    VELOX_CHECK_LE(size, capacity_, "CPU SHM slot-pool IOBuf exceeds slot");
-    auto poolHolder =
-        std::make_unique<std::shared_ptr<UcxCpuRowShmSlotPool>>(pool_);
-    auto* rawData = data_;
-    auto* rawHolder = poolHolder.get();
-    auto buf = folly::IOBuf::takeOwnership(
-        rawData,
-        size,
-        [](void* /*buf*/, void* userData) {
-          delete static_cast<std::shared_ptr<UcxCpuRowShmSlotPool>*>(userData);
-        },
-        rawHolder);
-    poolHolder.release();
-    return buf;
-  }
-
- private:
-  std::shared_ptr<UcxCpuRowShmSlotPool> pool_;
-  uint32_t slotId_;
-  uint8_t* data_;
-  size_t capacity_;
-  std::streampos position_{0};
-  bool releaseOnDestroy_{true};
-};
 
 } // namespace
 
@@ -296,8 +78,6 @@ UcxCpuRowPartitionedOutput::Destination::Destination(
     VectorSerde::Options* serdeOptions,
     memory::MemoryPool* pool,
     bool eagerFlush,
-    bool directShmEnabled,
-    bool slotPoolEnabled,
     int32_t targetNumRowsBase,
     std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr,
     std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued)
@@ -307,8 +87,6 @@ UcxCpuRowPartitionedOutput::Destination::Destination(
       serdeOptions_(serdeOptions),
       pool_(pool),
       eagerFlush_(eagerFlush),
-      directShmEnabled_(directShmEnabled),
-      slotPoolEnabled_(slotPoolEnabled),
       targetNumRowsBase_(targetNumRowsBase),
       queueMgr_(std::move(queueMgr)),
       recordEnqueued_(std::move(recordEnqueued)),
@@ -414,44 +192,6 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
                    : BlockingReason::kNotBlocked;
   };
 
-  const bool useShmForPayload = initialSize >= configuredShmMinPayloadBytes();
-
-  if (slotPoolEnabled_ && useShmForPayload) {
-    auto lease = queueMgr_->tryAcquireSlot(taskId_, destination_, initialSize);
-    if (lease.has_value()) {
-      SlotOutputStream stream(std::move(*lease));
-      current_->flush(&stream);
-      clearVectorStreamGroup();
-
-      const int64_t flushedBytes = stream.tellp();
-      auto payload = std::make_unique<UcxCpuRowPayload>();
-      payload->shmSlotPool = stream.pool();
-      payload->shmSlotId = stream.slotId();
-      payload->releaseShmSlotOnDestroy = true;
-      payload->data = stream.getIOBuf(static_cast<size_t>(flushedBytes));
-      stream.markReady();
-      return enqueuePayload(std::move(payload), flushedBytes);
-    }
-  }
-
-  if (directShmEnabled_ && useShmForPayload) {
-    DirectShmOutputStream stream(initialSize);
-    if (stream.valid()) {
-      current_->flush(&stream);
-      clearVectorStreamGroup();
-
-      const int64_t flushedBytes = stream.tellp();
-      auto payload = std::make_unique<UcxCpuRowPayload>();
-      payload->shmSegment = stream.segment();
-      payload->shmOffset = stream.offset();
-      payload->data = stream.getIOBuf(static_cast<size_t>(flushedBytes));
-      return enqueuePayload(std::move(payload), flushedBytes);
-    }
-
-    VLOG(1) << "Failed to create CPU SHM direct-TX stream; falling back to "
-               "IOBuf serialization";
-  }
-
   IOBufOutputStream stream(
       *current_->pool(),
       /*listener=*/nullptr,
@@ -503,12 +243,8 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
       // can be bundled, so honoring the config flag here works against
       // throughput.
       eagerFlush_(false),
-      directShmEnabled_(useDirectShmOutput(planNode->isBroadcast())),
-      slotPoolEnabled_(useSlotPoolOutput(planNode->isBroadcast())),
-      maxPageBytes_(configuredMaxPageBytes(
-          useShmSizedOutputPages(planNode->isBroadcast()))),
-      targetNumRowsBase_(configuredTargetNumRows(
-          useShmSizedOutputPages(planNode->isBroadcast()))),
+      maxPageBytes_(configuredMaxPageBytes()),
+      targetNumRowsBase_(configuredTargetNumRows()),
       serde_(getNamedVectorSerde(planNode->serdeKind())),
       serdeOptions_(exec::getVectorSerdeOptions(
           common::stringToCompressionKind(operatorCtx_->driverCtx()
@@ -565,8 +301,6 @@ void UcxCpuRowPartitionedOutput::initializeDestinations() {
           serdeOptions_.get(),
           pool(),
           eagerFlush_,
-          directShmEnabled_,
-          slotPoolEnabled_,
           targetNumRowsBase_,
           queueMgr_,
           [this](uint64_t bytes, uint64_t rows) {

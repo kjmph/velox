@@ -79,29 +79,38 @@ struct HandshakeMsg {
   /// Generated randomly at Communicator startup. The server compares this
   /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
-  /// CPU-row exchange only: optional POSIX SHM object name created by the
-  /// source before the handshake. If the server can open it, both processes
-  /// share an IPC namespace and CPU SHM transport can be used for this
-  /// connection. Empty means the source did not request CPU SHM.
-  char cpuShmProbeName[256]{};
-  /// Token written into cpuShmProbeName. The server must read the same value
-  /// back before enabling CPU SHM, avoiding false positives from stale or
-  /// unrelated SHM objects with the same name.
-  uint64_t cpuShmProbeToken{0};
+};
+
+constexpr uint32_t kCpuRowHandshakeMagic = 0x43505558; // "CPUX"
+constexpr uint16_t kCpuRowHandshakeVersion = 1;
+
+/// CPU-row handshake envelope. The legacy HandshakeMsg remains unchanged for
+/// the GPU exchange path; CPU adds the source UCX worker address after this
+/// header so the producer can create a worker-address endpoint back to the
+/// source. Unlike UCX listener endpoints, worker-address endpoints let UCX
+/// select intra-node transports such as posix, sysv, or cma.
+struct CpuRowHandshakeHeader {
+  uint32_t magic{kCpuRowHandshakeMagic};
+  uint16_t version{kCpuRowHandshakeVersion};
+  uint16_t headerSize{sizeof(CpuRowHandshakeHeader)};
+  HandshakeMsg handshake;
+  uint32_t sourceWorkerAddressBytes{0};
+  /// Stable hash of the source same-host transport identity. Zero means
+  /// unknown. CPU-row exchange uses this to disable UCX endpoint error
+  /// handling only for compatible same-host data endpoints, allowing UCX to
+  /// select posix/sysv/cma locally while preserving error handling for
+  /// cross-host endpoints.
+  uint32_t sourceHostIdHash{0};
 };
 
 /// @brief Response sent from server to source after handshake.
-/// Informs the source whether intra-node transfer optimization is available,
-/// allowing the source to bypass UCXX for all subsequent data transfers.
+/// The GPU exchange path uses this to report same-process intra-node transfer
+/// availability. The CPU row exchange always transfers through UCX.
 struct HandshakeResponse {
-  /// True if server and source are on the same node (same Communicator).
-  /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
+  /// True if the GPU exchange source should use IntraNodeTransferRegistry.
   bool isIntraNodeTransfer{false};
-  /// CPU-row exchange only: true when both sides enabled CPU SHM and the
-  /// server successfully opened the source's SHM probe object.
-  bool canUseCpuShm{false};
   /// Padding for alignment
-  uint8_t padding[6]{};
+  uint8_t padding[7]{};
 };
 
 constexpr uint32_t kMagicNumber = 0x12345678;

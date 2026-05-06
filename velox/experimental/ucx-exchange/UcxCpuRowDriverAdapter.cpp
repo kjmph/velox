@@ -52,11 +52,18 @@ constexpr const char* kAdapterLabel = "CpuUcx";
 // is the kind of thing you don't want in a hot path.
 bool readEnabledFromEnv() {
   const char* value = std::getenv(kCpuExchangeEnabledEnv);
-  if (value == nullptr) {
+  if (value == nullptr || *value == '\0') {
     return false;
   }
-  std::string s(value);
-  return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
+  if (value[0] == '1' && value[1] == '\0') {
+    return true;
+  }
+  if (value[0] == '0' && value[1] == '\0') {
+    return false;
+  }
+  LOG(WARNING) << "[CPU-UCX] Ignoring invalid " << kCpuExchangeEnabledEnv << "="
+               << value << "; expected 0 or 1";
+  return false;
 }
 
 uint16_t readPortFromEnv() {
@@ -93,12 +100,13 @@ const CpuUcxConfig& cpuUcxConfig() {
   return instance;
 }
 
-// Communicator is a singleton; the adapter lazy-starts it on first
-// driver that opts in. Once running, it keeps running for the process
-// lifetime; there is no clean shutdown path here. That mirrors how the
-// cudf path leaves the Communicator running too.
+// Communicator is a singleton; the adapter lazy-starts it on first driver that
+// opts in. Once running, it stays up for the process lifetime. Detach only
+// releases std::thread ownership; it does not stop the Communicator. A graceful
+// service shutdown still needs to call Communicator::stop(). If that does not
+// happen, process exit tears down the detached thread with the rest of the
+// worker.
 std::once_flag communicatorStartedFlag;
-std::shared_ptr<std::thread> communicatorThread;
 
 // Per-(taskId, pipelineId) shared UcxCpuRowExchangeClient. All drivers
 // in the same pipeline of the same task share one client so that splits
@@ -239,8 +247,7 @@ void ensureCommunicatorStarted() {
       LOG(ERROR) << "[CPU-UCX] Communicator::initAndGet failed";
       return;
     }
-    communicatorThread =
-        std::make_shared<std::thread>([c = comm]() { c->run(); });
+    std::thread([c = comm]() { c->run(); }).detach();
   });
 }
 
@@ -340,14 +347,16 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       {
         std::lock_guard<std::mutex> lock(exchangeClientMapMutex());
         auto& clientMap = exchangeClientMap();
+        for (auto it = clientMap.begin(); it != clientMap.end();) {
+          if (it->second.expired()) {
+            it = clientMap.erase(it);
+          } else {
+            ++it;
+          }
+        }
         auto it = clientMap.find(key);
         if (it != clientMap.end()) {
           client = it->second.lock();
-          if (!client) {
-            // Stale weak_ptr; remove so the map doesn't grow unboundedly
-            // across thousands of queries.
-            clientMap.erase(it);
-          }
         }
         if (!client) {
           client = std::make_shared<UcxCpuRowExchangeClient>(

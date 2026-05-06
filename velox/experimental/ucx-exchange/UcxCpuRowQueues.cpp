@@ -16,19 +16,11 @@
 #include "velox/experimental/ucx-exchange/UcxCpuRowQueues.h"
 
 #include <algorithm>
-#include <atomic>
 #include <functional>
-#include <thread>
 
 #include "velox/common/time/Timer.h"
 
 namespace facebook::velox::ucx_exchange {
-
-UcxCpuRowPayload::~UcxCpuRowPayload() {
-  if (releaseShmSlotOnDestroy && shmSlotPool) {
-    shmSlotPool->release(shmSlotId);
-  }
-}
 
 void UcxCpuRowDestinationQueue::Stats::recordEnqueue(
     const UcxCpuRowPayload* payload) {
@@ -197,8 +189,6 @@ UcxCpuRowOutputQueue::UcxCpuRowOutputQueue(
     continueSize_ = (maxSize_ * kContinuePct) / 100;
   }
   queues_.reserve(numDestinations);
-  slotPools_.resize(numDestinations);
-  slotPoolBuild_.resize(numDestinations);
   for (int i = 0; i < numDestinations; ++i) {
     queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
   }
@@ -226,8 +216,6 @@ bool UcxCpuRowOutputQueue::initialize(
     queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
   }
   finishedBufferStats_.resize(queues_.size());
-  slotPools_.resize(queues_.size());
-  slotPoolBuild_.resize(queues_.size());
   // Release-store: paired with isInitialized()'s acquire-load so
   // lock-free readers see a fully-populated queue.
   initialized_.store(true, std::memory_order_release);
@@ -339,8 +327,6 @@ void UcxCpuRowOutputQueue::getData(
       queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
     }
     finishedBufferStats_.resize(queues_.size());
-    slotPools_.resize(queues_.size());
-    slotPoolBuild_.resize(queues_.size());
     auto* queue = queues_[destination].get();
     // queue can be nullptr if the destination's results have already
     // been deleted (post-cancellation). Return empty in that case.
@@ -442,184 +428,6 @@ void UcxCpuRowOutputQueue::requeueFront(
   queuedPayloads_++;
 }
 
-std::optional<UcxCpuRowShmSlotLease> UcxCpuRowOutputQueue::tryAcquireSlot(
-    int destination,
-    size_t bytes) {
-  if (!ucxCpuRowShmSlotPoolEnabled()) {
-    return std::nullopt;
-  }
-
-  std::lock_guard<std::mutex> l(mutex_);
-  if (destination < 0 || static_cast<size_t>(destination) >= queues_.size()) {
-    return std::nullopt;
-  }
-  if (queues_[destination] == nullptr) {
-    return std::nullopt;
-  }
-  if (static_cast<size_t>(destination) >= slotPools_.size()) {
-    slotPools_.resize(queues_.size());
-  }
-  if (static_cast<size_t>(destination) >= slotPoolBuild_.size()) {
-    slotPoolBuild_.resize(queues_.size());
-  }
-
-  const uint32_t expectedOpeners = expectedSlotPoolOpenersLocked(destination);
-  if (expectedOpeners == 0) {
-    return std::nullopt;
-  }
-
-  const auto slotBytes = static_cast<size_t>(ucxCpuRowShmSlotPoolSlotBytes());
-  if (bytes > slotBytes) {
-    ++slotPoolAcquireTooLarge_;
-    slotPoolAcquireTooLargeBytes_ += static_cast<int64_t>(bytes);
-    return std::nullopt;
-  }
-
-  auto& pools = slotPools_[destination];
-  for (auto& pool : pools) {
-    VELOX_DCHECK_NOT_NULL(pool);
-    auto slot = pool->tryAcquire(bytes);
-    if (slot.has_value()) {
-      ++slotPoolAcquireSuccesses_;
-      slotPoolAcquireSuccessBytes_ += static_cast<int64_t>(bytes);
-      return UcxCpuRowShmSlotLease{pool, *slot};
-    }
-  }
-
-  ++slotPoolAcquireMisses_;
-  slotPoolAcquireMissBytes_ += static_cast<int64_t>(bytes);
-
-  if (pools.size() >= ucxCpuRowShmSlotPoolMaxPools()) {
-    ++slotPoolPoolLimitMisses_;
-    return std::nullopt;
-  }
-
-  maybeStartSlotPoolCreateLocked(destination, bytes, expectedOpeners);
-  return std::nullopt;
-}
-
-void UcxCpuRowOutputQueue::maybeStartSlotPoolCreateLocked(
-    int destination,
-    size_t bytes,
-    uint32_t expectedOpeners) {
-  VELOX_DCHECK_GE(destination, 0);
-  if (static_cast<size_t>(destination) >= slotPoolBuild_.size()) {
-    slotPoolBuild_.resize(queues_.size());
-  }
-  auto& build = slotPoolBuild_[destination];
-  if (build.createInFlight) {
-    return;
-  }
-
-  auto& pools = slotPools_[destination];
-  const auto maxPools = ucxCpuRowShmSlotPoolMaxPools();
-  if (pools.size() >= maxPools) {
-    return;
-  }
-
-  const auto maxSlots = ucxCpuRowShmSlotPoolNumSlots();
-  const auto initialSlots =
-      std::min<uint32_t>(ucxCpuRowShmSlotPoolInitialSlots(), maxSlots);
-  const auto numSlots = build.nextNumSlots == 0
-      ? initialSlots
-      : std::min<uint32_t>(build.nextNumSlots, maxSlots);
-  const auto slotBytes = static_cast<size_t>(ucxCpuRowShmSlotPoolSlotBytes());
-  const auto taskId = task_ ? task_->taskId() : std::string("n/a");
-  const auto poolIndex = pools.size();
-
-  build.createInFlight = true;
-  build.inFlightNumSlots = numSlots;
-  ++slotPoolAsyncCreatesStarted_;
-
-  VLOG(1) << "[QUEUE-CPU] scheduling CPU SHM producer slot pool task=" << taskId
-          << " destination=" << destination << " poolIndex=" << poolIndex
-          << " slots=" << numSlots << " slotBytes=" << slotBytes
-          << " requestBytes=" << bytes << " expectedOpeners=" << expectedOpeners
-          << " maxPools=" << maxPools;
-
-  std::weak_ptr<UcxCpuRowOutputQueue> weakSelf = weak_from_this();
-  std::thread([weakSelf,
-               taskId,
-               destination,
-               expectedOpeners,
-               numSlots,
-               slotBytes,
-               maxSlots]() {
-    auto pool =
-        UcxCpuRowShmSlotPool::create(slotBytes, numSlots, expectedOpeners);
-    auto self = weakSelf.lock();
-    if (!self) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> l(self->mutex_);
-    if (destination < 0 ||
-        static_cast<size_t>(destination) >= self->queues_.size() ||
-        self->queues_[destination] == nullptr ||
-        static_cast<size_t>(destination) >= self->slotPoolBuild_.size()) {
-      if (destination >= 0 &&
-          static_cast<size_t>(destination) < self->slotPoolBuild_.size()) {
-        auto& build = self->slotPoolBuild_[destination];
-        if (build.createInFlight && build.inFlightNumSlots == numSlots) {
-          build.createInFlight = false;
-          build.inFlightNumSlots = 0;
-        }
-      }
-      ++self->slotPoolAsyncCreatesDropped_;
-      return;
-    }
-
-    auto& build = self->slotPoolBuild_[destination];
-    if (!build.createInFlight || build.inFlightNumSlots != numSlots) {
-      ++self->slotPoolAsyncCreatesDropped_;
-      return;
-    }
-    build.createInFlight = false;
-    build.inFlightNumSlots = 0;
-
-    if (self->atEnd_) {
-      ++self->slotPoolAsyncCreatesDropped_;
-      return;
-    }
-
-    if (!pool) {
-      ++self->slotPoolCreateFailures_;
-      VLOG(1) << "[QUEUE-CPU] failed to create CPU SHM slot pool task="
-              << taskId << " destination=" << destination
-              << " slots=" << numSlots
-              << " expectedOpeners=" << expectedOpeners;
-      return;
-    }
-
-    if (self->expectedSlotPoolOpenersLocked(destination) != expectedOpeners) {
-      ++self->slotPoolAsyncCreatesDropped_;
-      return;
-    }
-
-    auto& pools = self->slotPools_[destination];
-    if (pools.size() >= ucxCpuRowShmSlotPoolMaxPools()) {
-      ++self->slotPoolAsyncCreatesDropped_;
-      return;
-    }
-
-    const auto installedIndex = pools.size();
-    pools.push_back(pool);
-    ++self->slotPoolPoolsCreated_;
-    ++self->slotPoolAsyncCreatesCompleted_;
-    build.nextNumSlots = numSlots >= maxSlots
-        ? maxSlots
-        : std::min<uint32_t>(maxSlots, numSlots * 2);
-
-    VLOG(1) << "[QUEUE-CPU] created CPU SHM producer slot pool task=" << taskId
-            << " destination=" << destination << " poolIndex=" << installedIndex
-            << " name=" << pool->name() << " slots=" << pool->numSlots()
-            << " slotBytes=" << pool->slotSize()
-            << " totalBytes=" << pool->totalSize()
-            << " expectedOpeners=" << pool->expectedOpeners()
-            << " maxPools=" << ucxCpuRowShmSlotPoolMaxPools();
-  }).detach();
-}
-
 void UcxCpuRowOutputQueue::noMoreData() {
   checkIfDone(true);
 }
@@ -650,21 +458,7 @@ void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
               << " totalRows=" << totalRowsSent_
               << " chunks=" << totalPayloadsSent_
               << " avgRowsPerChunk=" << avgRows
-              << " totalBytes=" << totalBytesSent_
-              << " slotPoolAcquires=" << slotPoolAcquireSuccesses_
-              << " slotPoolAcquireBytes=" << slotPoolAcquireSuccessBytes_
-              << " slotPoolMisses=" << slotPoolAcquireMisses_
-              << " slotPoolMissBytes=" << slotPoolAcquireMissBytes_
-              << " slotPoolTooLarge=" << slotPoolAcquireTooLarge_
-              << " slotPoolTooLargeBytes=" << slotPoolAcquireTooLargeBytes_
-              << " slotPoolPoolsCreated=" << slotPoolPoolsCreated_
-              << " slotPoolPoolLimitMisses=" << slotPoolPoolLimitMisses_
-              << " slotPoolCreateFailures=" << slotPoolCreateFailures_
-              << " slotPoolAsyncCreatesStarted=" << slotPoolAsyncCreatesStarted_
-              << " slotPoolAsyncCreatesCompleted="
-              << slotPoolAsyncCreatesCompleted_
-              << " slotPoolAsyncCreatesDropped="
-              << slotPoolAsyncCreatesDropped_;
+              << " totalBytes=" << totalBytesSent_;
     }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
@@ -713,30 +507,6 @@ void UcxCpuRowOutputQueue::enqueueBroadcastOutputLocked(
   if (!noMoreQueues_) {
     dataToBroadcast_.emplace_back(std::move(data));
   }
-}
-
-uint32_t UcxCpuRowOutputQueue::expectedSlotPoolOpenersLocked(
-    int destination) const {
-  if (kind_ != core::PartitionedOutputNode::Kind::kBroadcast) {
-    return 1;
-  }
-
-  // Broadcast produces one logical payload on destination 0 and fans it out to
-  // all output buffers in enqueueBroadcastOutputLocked(). A shared slot-pool
-  // payload is safe only once the output-buffer set is final; otherwise a late
-  // receiver could be added after the pool name was unlinked by earlier
-  // receivers.
-  if (destination != 0 || !noMoreQueues_) {
-    return 0;
-  }
-
-  uint32_t openers = 0;
-  for (const auto& queue : queues_) {
-    if (queue != nullptr) {
-      ++openers;
-    }
-  }
-  return openers;
 }
 
 bool UcxCpuRowOutputQueue::isFinished() {
@@ -792,8 +562,6 @@ void UcxCpuRowOutputQueue::updateOutputBuffers(
         queues_.emplace_back(std::move(buffer));
       }
       finishedBufferStats_.resize(queues_.size());
-      slotPools_.resize(queues_.size());
-      slotPoolBuild_.resize(queues_.size());
     }
 
     if (!noMoreBuffers) {

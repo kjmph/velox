@@ -37,15 +37,13 @@
 
 namespace facebook::velox::ucx_exchange {
 
-class UcxCpuRowShmSlotPool;
-
 class UcxCpuRowPartitionedOutput : public exec::Operator {
  public:
   // Mirrors PartitionedOutput::kMinDestinationSize.
   static constexpr uint64_t kMinDestinationSize = 60 * 1024;
-  // Keep row count from capping pages at ~100-200 KiB before the byte target
-  // has a chance to fire.
-  static constexpr int32_t kTargetNumRows = 64'000;
+  // Keep row count from capping pages before the byte target has a chance to
+  // fire on wide, high-throughput CPU exchange runs.
+  static constexpr int32_t kTargetNumRows = 512'000;
 
   UcxCpuRowPartitionedOutput(
       int32_t operatorId,
@@ -79,8 +77,6 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
         VectorSerde::Options* serdeOptions,
         memory::MemoryPool* pool,
         bool eagerFlush,
-        bool directShmEnabled,
-        bool slotPoolEnabled,
         int32_t targetNumRowsBase,
         std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr,
         std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued);
@@ -145,8 +141,6 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
     VectorSerde::Options* const serdeOptions_;
     memory::MemoryPool* const pool_;
     const bool eagerFlush_;
-    const bool directShmEnabled_;
-    const bool slotPoolEnabled_;
     const int32_t targetNumRowsBase_;
     const std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
     const std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued_;
@@ -179,8 +173,6 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   const std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
   const int64_t maxBufferedBytes_;
   const bool eagerFlush_;
-  const bool directShmEnabled_;
-  const bool slotPoolEnabled_;
   const uint64_t maxPageBytes_;
   const int32_t targetNumRowsBase_;
   VectorSerde* const serde_;

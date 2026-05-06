@@ -18,19 +18,24 @@
 #include <cuda_runtime.h>
 #endif
 #include <gflags/gflags.h>
+#include <sys/stat.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
+#include <unistd.h>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <exception>
-#include <iostream>
+#include <fstream>
 #include <random>
+#include <sstream>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowAcceptor.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeModules.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #ifdef VELOX_ENABLE_CUDF
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
@@ -39,8 +44,7 @@
 
 #include <glog/logging.h>
 
-// gflag for whether the UCX exchange is active. GPU builds define this in
-// cudf/exec/ToCudf.cpp; CPU-only builds need a definition in this library.
+// gflag for whether the UCX exchange is active.
 DEFINE_bool(velox_ucx_exchange, true, "Enable UCX exchange");
 
 namespace {
@@ -62,13 +66,31 @@ int readIntEnv(const char* name, int defaultValue, int minValue, int maxValue) {
       std::clamp<long>(parsed, static_cast<long>(minValue), maxValue));
 }
 
+#ifndef VELOX_ENABLE_CUDF
+bool readBoolEnv(const char* name, bool defaultValue) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') {
+    return defaultValue;
+  }
+  if (env[0] == '0' && env[1] == '\0') {
+    return false;
+  }
+  if (env[0] == '1' && env[1] == '\0') {
+    return true;
+  }
+  LOG(WARNING) << "Ignoring invalid " << name << "=" << env
+               << "; expected 0 or 1";
+  return defaultValue;
+}
+#endif
+
 // Number of progress threads (primary + auxiliaries). Configurable via
-// VELOX_UCX_NUM_PROGRESS_THREADS; default 1. The CPU-row exchange posts
+// VELOX_UCX_NUM_PROGRESS_THREADS; default 4. The CPU-row exchange posts
 // UCX completions back into per-element state-event queues, so multiple
 // progress threads can advance UCX without concurrently mutating the
 // same source/server state machine.
 int progressThreadCount() {
-  return readIntEnv("VELOX_UCX_NUM_PROGRESS_THREADS", 1, 1, 64);
+  return readIntEnv("VELOX_UCX_NUM_PROGRESS_THREADS", 4, 1, 64);
 }
 } // namespace
 
@@ -103,10 +125,57 @@ struct UcxConfigView {
     return false;
   }
   static bool ucxxErrorHandling() {
-    return true;
+    return readBoolEnv("VELOX_UCX_CPU_ERROR_HANDLING", true);
   }
 #endif
 };
+
+std::string readLocalHostIdentity() {
+  if (const char* env = std::getenv("VELOX_UCX_CPU_HOST_ID")) {
+    if (*env != '\0') {
+      return std::string{"env:"} + env;
+    }
+  }
+
+  std::ifstream bootId("/proc/sys/kernel/random/boot_id");
+  std::string value;
+  if (bootId >> value && !value.empty()) {
+    value = std::string{"boot:"} + value;
+  }
+
+  if (value.empty()) {
+    std::array<char, 256> hostname{};
+    if (::gethostname(hostname.data(), hostname.size() - 1) == 0 &&
+        hostname[0] != '\0') {
+      value = std::string{"host:"} + hostname.data();
+    }
+  }
+
+  struct stat ipcNs {};
+  struct stat pidNs {};
+  if (value.empty() || ::stat("/proc/self/ns/ipc", &ipcNs) != 0 ||
+      ::stat("/proc/self/ns/pid", &pidNs) != 0) {
+    return "";
+  }
+
+  std::ostringstream out;
+  out << value << "|ipc:" << ipcNs.st_dev << ":" << ipcNs.st_ino
+      << "|pid:" << pidNs.st_dev << ":" << pidNs.st_ino;
+  return out.str();
+}
+
+uint32_t getLocalHostIdHash() {
+  const auto identity = readLocalHostIdentity();
+  if (identity.empty()) {
+    return 0;
+  }
+  return fnv1a_32(identity);
+}
+
+bool isSameKnownHost(uint32_t localHostIdHash, uint32_t peerHostIdHash) {
+  return localHostIdHash != 0 && peerHostIdHash != 0 &&
+      localHostIdHash == peerHostIdHash;
+}
 } // namespace
 
 // static
@@ -133,6 +202,8 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     std::uniform_int_distribution<uint64_t> dist;
     instancePtr_->workerId_ = dist(gen);
     LOG(INFO) << "Communicator workerId=" << instancePtr_->workerId_;
+    instancePtr_->hostIdHash_ = getLocalHostIdHash();
+    LOG(INFO) << "Communicator hostIdHash=" << instancePtr_->hostIdHash_;
     auto logLevel = UcxConfigView::exchangeLogLevel();
     LOG(INFO) << "ucx-exchange VLOG level set to " << logLevel;
     if (logLevel > 0) {
@@ -328,8 +399,8 @@ void Communicator::run() {
         removeEndpointRef(ep);
       }
 
-      // Drain the work queue and progress UCX, sharing the same loop
-      // body the auxiliary threads run.
+      // Drain primary-thread work and progress UCX. Auxiliary threads only
+      // call worker_->progress().
       drainWorkAndProgress();
 
       // Clean up deferred requests that UCX has fully processed.
@@ -467,6 +538,76 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     ep->setCloseCallback(EndpointRef::onClose, epRef);
   }
   return epRef;
+}
+
+bool Communicator::hasSameHostTransportIdentity(uint32_t peerHostIdHash) const {
+  return isSameKnownHost(hostIdHash_, peerHostIdHash);
+}
+
+std::shared_ptr<EndpointRef>
+Communicator::createSameHostEndpointRefFromWorkerAddress(
+    std::string_view workerAddress,
+    std::string peerIp,
+    uint32_t peerHostIdHash) {
+  if (workerAddress.empty()) {
+    return nullptr;
+  }
+
+  if (!hasSameHostTransportIdentity(peerHostIdHash)) {
+    VLOG(1) << "[CPU-UCX] not creating same-host worker-address endpoint "
+            << "peerIp=" << peerIp << " localHostIdHash=" << hostIdHash_
+            << " peerHostIdHash=" << peerHostIdHash;
+    return nullptr;
+  }
+
+  std::string key{workerAddress};
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    auto it = workerAddressEndpoints_.find(key);
+    if (it != workerAddressEndpoints_.end()) {
+      return it->second;
+    }
+  }
+
+  // This is a separate worker-address data connection, not the listener
+  // bootstrap connection. UCX wireup carries this endpoint's err_mode to the
+  // peer; the remote internal endpoint is created with the same mode. Do not
+  // mix modes across the two sides of a single listener/conn_request pair.
+  constexpr bool kErrorHandling = false;
+  VLOG(1) << "[CPU-UCX] creating same-host worker-address endpoint peerIp="
+          << peerIp << " localHostIdHash=" << hostIdHash_
+          << " peerHostIdHash=" << peerHostIdHash
+          << " errorHandling=" << kErrorHandling;
+  std::shared_ptr<ucxx::Endpoint> ep;
+  try {
+    auto address = ucxx::createAddressFromString(key);
+    ep = worker_->createEndpointFromWorkerAddress(address, kErrorHandling);
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to create UCX endpoint from worker address: "
+                 << e.what();
+    return nullptr;
+  }
+  if (ep == nullptr) {
+    return nullptr;
+  }
+
+  auto epRef = std::make_shared<EndpointRef>(ep, std::move(peerIp));
+
+  {
+    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    auto [it, inserted] = workerAddressEndpoints_.emplace(key, epRef);
+    if (!inserted) {
+      return it->second;
+    }
+  }
+  return epRef;
+}
+
+std::string Communicator::getWorkerAddress() const {
+  VELOX_CHECK_NOT_NULL(worker_, "Communicator worker is not initialized");
+  auto address = worker_->getAddress();
+  VELOX_CHECK_NOT_NULL(address, "Communicator worker address is null");
+  return address->getString();
 }
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {

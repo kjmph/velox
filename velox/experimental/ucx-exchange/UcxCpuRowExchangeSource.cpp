@@ -26,7 +26,6 @@
 #include <cstring>
 #include <limits>
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 
 using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
@@ -310,9 +309,6 @@ void UcxCpuRowExchangeSource::cleanUp() {
     dataRequests_.clear();
   }
 
-  shmSlotPools_.clear();
-  handshakeShmProbe_.reset();
-
   if (endpointRef_) {
     endpointRef_->removeCommElem(getSelfPtr());
     endpointRef_ = nullptr;
@@ -451,35 +447,32 @@ void UcxCpuRowExchangeSource::setEndpoint(
 }
 
 void UcxCpuRowExchangeSource::sendHandshake() {
-  std::shared_ptr<HandshakeMsg> handshakeReq = std::make_shared<HandshakeMsg>();
-  handshakeReq->destination = partitionKey_.destination;
+  std::string workerAddress = communicator_->getWorkerAddress();
+  VELOX_CHECK_LE(
+      workerAddress.size(),
+      std::numeric_limits<uint32_t>::max(),
+      "UCX worker address is too large: {} bytes",
+      workerAddress.size());
+  auto handshakeReq = std::make_shared<std::vector<uint8_t>>(
+      sizeof(CpuRowHandshakeHeader) + workerAddress.size());
+  CpuRowHandshakeHeader header{};
+  header.sourceWorkerAddressBytes = static_cast<uint32_t>(workerAddress.size());
+  header.sourceHostIdHash = communicator_->getHostIdHash();
+
+  auto* handshake = &header.handshake;
+  handshake->destination = partitionKey_.destination;
   strncpy(
-      handshakeReq->taskId,
+      handshake->taskId,
       partitionKey_.taskId.c_str(),
-      sizeof(handshakeReq->taskId) - 1);
-  handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
-  handshakeReq->workerId = communicator_->getWorkerId();
-  if (ucxCpuRowShmEnabled()) {
-    handshakeReq->cpuShmProbeToken =
-        (communicator_->getWorkerId() << 1) ^ partitionKeyHash_;
-    handshakeShmProbe_ = createUcxCpuRowShmSegment(sizeof(uint64_t));
-    if (handshakeShmProbe_) {
-      std::memcpy(
-          handshakeShmProbe_->data(),
-          &handshakeReq->cpuShmProbeToken,
-          sizeof(handshakeReq->cpuShmProbeToken));
-      handshakeShmProbe_->unlinkOnDestroy = true;
-      std::strncpy(
-          handshakeReq->cpuShmProbeName,
-          handshakeShmProbe_->name.c_str(),
-          sizeof(handshakeReq->cpuShmProbeName) - 1);
-      handshakeReq->cpuShmProbeName[sizeof(handshakeReq->cpuShmProbeName) - 1] =
-          '\0';
-    } else {
-      VLOG(1) << toString()
-              << " failed to create CPU SHM handshake probe; this connection "
-                 "will use UCX data frames";
-    }
+      sizeof(handshake->taskId) - 1);
+  handshake->taskId[sizeof(handshake->taskId) - 1] = '\0';
+  handshake->workerId = communicator_->getWorkerId();
+  std::memcpy(handshakeReq->data(), &header, sizeof(header));
+  if (!workerAddress.empty()) {
+    std::memcpy(
+        handshakeReq->data() + sizeof(CpuRowHandshakeHeader),
+        workerAddress.data(),
+        workerAddress.size());
   }
 
   VLOG(3) << toString() << " Sending handshake for " << partitionKey_.toString()
@@ -492,8 +485,8 @@ void UcxCpuRowExchangeSource::sendHandshake() {
       communicator_->kAmCallbackOwner, communicator_->kAmCpuCallbackId);
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   handshakeRequest_ = endpointRef_->endpoint_->amSend(
-      handshakeReq.get(),
-      sizeof(*handshakeReq),
+      handshakeReq->data(),
+      handshakeReq->size(),
       UCS_MEMORY_TYPE_HOST,
       info,
       false,
@@ -534,7 +527,6 @@ void UcxCpuRowExchangeSource::onHandshake(
     setState(ReceiverState::Done);
   } else {
     VLOG(3) << toString() << " + onHandshake " << ucs_status_string(status);
-    // Wait for the server to report whether the SHM probe succeeded.
     setStateIf(
         ReceiverState::WaitingForHandshakeComplete,
         ReceiverState::WaitingForHandshakeResponse);
@@ -596,14 +588,7 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
 
   auto response = std::static_pointer_cast<HandshakeResponse>(arg);
   VLOG(3) << toString() << " + CPU HandshakeResponse isIntraNodeTransfer="
-          << response->isIntraNodeTransfer
-          << " canUseCpuShm=" << response->canUseCpuShm;
-  if (handshakeShmProbe_) {
-    // If the peer opened the probe, it also unlinked it. Avoid a noisy
-    // duplicate unlink attempt when this side drops the probe mapping.
-    handshakeShmProbe_->unlinkOnDestroy = !response->canUseCpuShm;
-    handshakeShmProbe_.reset();
-  }
+          << response->isIntraNodeTransfer;
 
   setStateIf(
       ReceiverState::WaitingForHandshakeResponse,
@@ -705,8 +690,7 @@ void UcxCpuRowExchangeSource::onMetadata(
 
   VLOG(3) << toString() << " seq=" << sequenceNumber
           << " Datasize bytes == " << ptr->metadata.dataSizeBytes
-          << " numFrames=" << ptr->metadata.frameSizes.size()
-          << " transport=" << static_cast<uint8_t>(ptr->metadata.transport);
+          << " numFrames=" << ptr->metadata.frameSizes.size();
 
   if (ptr->metadata.atEnd) {
     atEnd_ = true;
@@ -735,269 +719,6 @@ void UcxCpuRowExchangeSource::onMetadata(
       totalFrameBytes,
       ptr->metadata.dataSizeBytes,
       "CPU row metadata frame bytes do not match total data size");
-
-  if (ptr->metadata.transport == UcxCpuRowMetadataMsg::Transport::kShmSlot) {
-    auto failToOpenSlotPool = [&]() {
-      std::string errorMsg = fmt::format(
-          "Failed to open advertised CPU SHM slot pool {} from host {}:{}, "
-          "task {}. UCX fallback is per-connection and remains available for "
-          "peers that fail the CPU SHM handshake probe.",
-          ptr->metadata.shmPoolName,
-          host_,
-          port_,
-          partitionKey_.toString());
-      VLOG(0) << errorMsg;
-      queue_->setError(errorMsg);
-      deliverEndMarker();
-      setState(ReceiverState::Done);
-    };
-
-    VELOX_CHECK_EQ(
-        ptr->metadata.shmSlotIds.size(),
-        numFrames,
-        "CPU SHM slot-pool metadata must carry one slot id per frame");
-    VELOX_CHECK(
-        !ptr->metadata.shmPoolName.empty(),
-        "CPU SHM slot-pool metadata must carry a pool name");
-    VELOX_CHECK_GT(
-        ptr->metadata.shmPoolSize,
-        0,
-        "CPU SHM slot-pool metadata must carry a positive pool size");
-    VELOX_CHECK_GT(
-        ptr->metadata.shmSlotSize,
-        0,
-        "CPU SHM slot-pool metadata must carry a positive slot size");
-
-    std::shared_ptr<UcxCpuRowShmSlotPool> slotPool;
-    auto it = shmSlotPools_.find(ptr->metadata.shmPoolName);
-    if (it != shmSlotPools_.end()) {
-      slotPool = it->second;
-      VELOX_CHECK_EQ(
-          slotPool->totalSize(),
-          static_cast<size_t>(ptr->metadata.shmPoolSize),
-          "Cached CPU SHM slot-pool size changed");
-      VELOX_CHECK_EQ(
-          slotPool->slotSize(),
-          static_cast<size_t>(ptr->metadata.shmSlotSize),
-          "Cached CPU SHM slot size changed");
-    } else {
-      // Record this receiver's first successful pool open. The last expected
-      // receiver unlinks the POSIX SHM name; later bundles reuse the cached
-      // mapping and do not touch the name again.
-      slotPool = UcxCpuRowShmSlotPool::open(
-          ptr->metadata.shmPoolName,
-          static_cast<size_t>(ptr->metadata.shmPoolSize),
-          true);
-      if (!slotPool) {
-        failToOpenSlotPool();
-        return;
-      }
-      auto [cacheIt, inserted] =
-          shmSlotPools_.emplace(ptr->metadata.shmPoolName, slotPool);
-      (void)inserted;
-      slotPool = cacheIt->second;
-    }
-
-    struct SlotHolder {
-      SlotHolder(std::shared_ptr<UcxCpuRowShmSlotPool> pool, uint32_t slotId)
-          : pool(std::move(pool)), slotId(slotId) {}
-
-      std::shared_ptr<UcxCpuRowShmSlotPool> pool;
-      uint32_t slotId;
-
-      ~SlotHolder() {
-        if (pool) {
-          pool->release(slotId);
-        }
-      }
-    };
-
-    std::unique_ptr<folly::IOBuf> chain;
-    auto appendSlotFrame = [&](std::shared_ptr<UcxCpuRowShmSlotPool> pool,
-                               uint32_t slotId,
-                               size_t frameSize) {
-      VELOX_CHECK_LT(
-          slotId, pool->numSlots(), "CPU SHM slot id is out of range");
-      VELOX_CHECK_LE(
-          frameSize, pool->slotSize(), "CPU SHM slot frame exceeds slot size");
-      VELOX_CHECK(
-          pool->isReady(slotId),
-          "CPU SHM slot was not ready when metadata arrived");
-
-      auto holder = std::make_unique<SlotHolder>(std::move(pool), slotId);
-      auto* slotData = holder->pool->slotData(slotId);
-      auto* rawHolder = holder.get();
-      auto seg = folly::IOBuf::takeOwnership(
-          slotData,
-          frameSize,
-          [](void* /*buf*/, void* userData) {
-            delete static_cast<SlotHolder*>(userData);
-          },
-          rawHolder);
-      holder.release();
-      if (!chain) {
-        chain = std::move(seg);
-      } else {
-        chain->appendToChain(std::move(seg));
-      }
-    };
-
-    for (size_t i = 0; i < numFrames; ++i) {
-      const auto frameSize = static_cast<size_t>(ptr->metadata.frameSizes[i]);
-      VELOX_CHECK_LE(
-          ptr->metadata.shmSlotIds[i],
-          static_cast<WireLengthType>(std::numeric_limits<uint32_t>::max()),
-          "CPU SHM slot id exceeds supported range");
-      appendSlotFrame(
-          slotPool,
-          static_cast<uint32_t>(ptr->metadata.shmSlotIds[i]),
-          frameSize);
-    }
-
-    if (!chain) {
-      std::string errorMsg = fmt::format(
-          "CPU SHM slot-pool bundle from host {}:{}, task {} had no frames",
-          host_,
-          port_,
-          partitionKey_.toString());
-      VLOG(0) << errorMsg;
-      queue_->setError(errorMsg);
-      deliverEndMarker();
-      setState(ReceiverState::Done);
-      return;
-    }
-
-    VLOG(3) << toString()
-            << " mapped CPU SHM slot-pool bundle seq=" << sequenceNumber
-            << " pool=" << ptr->metadata.shmPoolName
-            << " bytes=" << ptr->metadata.dataSizeBytes
-            << " frames=" << numFrames;
-
-    metrics_.numPayloads_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
-
-    auto received = std::make_unique<UcxCpuRowPayload>();
-    received->data = std::move(chain);
-    received->numBytes = ptr->metadata.dataSizeBytes;
-    received->numRows = 0;
-
-    inFlightSequences_.erase(sequenceNumber);
-    completedData_.emplace(sequenceNumber, std::move(received));
-    drainCompletedData();
-    postReceiveWindow();
-    return;
-  }
-
-  if (ptr->metadata.transport == UcxCpuRowMetadataMsg::Transport::kShm) {
-    auto failToOpenShm = [&](std::string_view shmName) {
-      std::string errorMsg = fmt::format(
-          "Failed to open advertised CPU SHM bundle {} from host {}:{}, task "
-          "{}. The sender enabled SHM for this connection, so this usually "
-          "indicates stale metadata, premature SHM unlink, or a broken shared "
-          "IPC namespace. UCX fallback is per-connection and remains available "
-          "for peers that fail the CPU SHM handshake probe.",
-          shmName,
-          host_,
-          port_,
-          partitionKey_.toString());
-      VLOG(0) << errorMsg;
-      queue_->setError(errorMsg);
-      deliverEndMarker();
-      setState(ReceiverState::Done);
-    };
-
-    std::unique_ptr<folly::IOBuf> chain;
-    auto appendShmFrame = [&](std::shared_ptr<UcxCpuRowShmSegment> shmSegment,
-                              size_t offset,
-                              size_t frameSize) {
-      auto* data = shmSegment->data() + offset;
-      auto segmentHolder =
-          std::make_unique<std::shared_ptr<UcxCpuRowShmSegment>>(
-              std::move(shmSegment));
-      auto seg = folly::IOBuf::takeOwnership(
-          data,
-          frameSize,
-          [](void* /*buf*/, void* userData) {
-            delete static_cast<std::shared_ptr<UcxCpuRowShmSegment>*>(userData);
-          },
-          segmentHolder.release());
-      if (!chain) {
-        chain = std::move(seg);
-      } else {
-        chain->appendToChain(std::move(seg));
-      }
-    };
-
-    if (!ptr->metadata.shmNames.empty()) {
-      VELOX_CHECK_EQ(
-          ptr->metadata.shmNames.size(),
-          numFrames,
-          "CPU SHM direct-TX metadata must carry one SHM name per frame");
-      for (size_t i = 0; i < numFrames; ++i) {
-        const auto frameSize = static_cast<size_t>(ptr->metadata.frameSizes[i]);
-        auto shmSegment =
-            openUcxCpuRowShmSegment(ptr->metadata.shmNames[i], frameSize, true);
-        if (!shmSegment) {
-          failToOpenShm(ptr->metadata.shmNames[i]);
-          return;
-        }
-        appendShmFrame(std::move(shmSegment), 0, frameSize);
-      }
-    } else {
-      auto shmSegment = openUcxCpuRowShmSegment(
-          ptr->metadata.shmName,
-          static_cast<size_t>(ptr->metadata.dataSizeBytes),
-          true);
-      if (!shmSegment) {
-        failToOpenShm(ptr->metadata.shmName);
-        return;
-      }
-
-      size_t offset = 0;
-      for (size_t i = 0; i < numFrames; ++i) {
-        const auto frameSize = static_cast<size_t>(ptr->metadata.frameSizes[i]);
-        appendShmFrame(shmSegment, offset, frameSize);
-        offset += frameSize;
-      }
-      VELOX_CHECK_EQ(
-          offset,
-          static_cast<size_t>(ptr->metadata.dataSizeBytes),
-          "CPU SHM bundle size mismatch");
-    }
-
-    if (!chain) {
-      std::string errorMsg = fmt::format(
-          "CPU SHM bundle from host {}:{}, task {} had no frames",
-          host_,
-          port_,
-          partitionKey_.toString());
-      VLOG(0) << errorMsg;
-      queue_->setError(errorMsg);
-      deliverEndMarker();
-      setState(ReceiverState::Done);
-      return;
-    }
-
-    VLOG(3) << toString() << " mapped CPU SHM bundle seq=" << sequenceNumber
-            << " name=" << ptr->metadata.shmName
-            << " bytes=" << ptr->metadata.dataSizeBytes
-            << " frames=" << numFrames << " shmObjects="
-            << (ptr->metadata.shmNames.empty() ? 1 : numFrames);
-
-    metrics_.numPayloads_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
-
-    auto received = std::make_unique<UcxCpuRowPayload>();
-    received->data = std::move(chain);
-    received->numBytes = ptr->metadata.dataSizeBytes;
-    received->numRows = 0;
-
-    inFlightSequences_.erase(sequenceNumber);
-    completedData_.emplace(sequenceNumber, std::move(received));
-    drainCompletedData();
-    postReceiveWindow();
-    return;
-  }
 
   // Allocate one buffer per frame. The receiver stitches them into an
   // IOBuf chain on the last completion; no coalesce, no extra

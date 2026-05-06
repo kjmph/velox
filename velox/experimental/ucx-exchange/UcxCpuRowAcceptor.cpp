@@ -20,10 +20,75 @@
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeServer.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+struct ParsedCpuHandshake {
+  HandshakeMsg handshake;
+  std::string_view sourceWorkerAddress;
+  uint32_t sourceHostIdHash{0};
+};
+
+ParsedCpuHandshake parseCpuHandshake(ucxx::Buffer& buffer) {
+  const auto bufferSize = buffer.getSize();
+  VELOX_CHECK_GE(
+      bufferSize,
+      sizeof(HandshakeMsg),
+      "CPU AMCallback: received buffer size ({}) is smaller than HandshakeMsg "
+      "({}).",
+      bufferSize,
+      sizeof(HandshakeMsg));
+
+  if (bufferSize < sizeof(CpuRowHandshakeHeader)) {
+    ParsedCpuHandshake parsed;
+    std::memcpy(&parsed.handshake, buffer.data(), sizeof(parsed.handshake));
+    return parsed;
+  }
+
+  CpuRowHandshakeHeader header;
+  std::memcpy(&header, buffer.data(), sizeof(header));
+  if (header.magic != kCpuRowHandshakeMagic) {
+    ParsedCpuHandshake parsed;
+    std::memcpy(&parsed.handshake, buffer.data(), sizeof(parsed.handshake));
+    return parsed;
+  }
+
+  VELOX_CHECK_EQ(
+      header.version,
+      kCpuRowHandshakeVersion,
+      "CPU AMCallback: unsupported CpuRowHandshakeHeader version {}",
+      header.version);
+  VELOX_CHECK_GE(
+      header.headerSize,
+      sizeof(CpuRowHandshakeHeader),
+      "CPU AMCallback: invalid CpuRowHandshakeHeader size {}",
+      header.headerSize);
+  VELOX_CHECK_LE(
+      header.headerSize,
+      bufferSize,
+      "CPU AMCallback: CpuRowHandshakeHeader size {} exceeds buffer size {}",
+      header.headerSize,
+      bufferSize);
+  VELOX_CHECK_LE(
+      header.sourceWorkerAddressBytes,
+      bufferSize - header.headerSize,
+      "CPU AMCallback: source worker address length {} exceeds remaining "
+      "handshake bytes {}",
+      header.sourceWorkerAddressBytes,
+      bufferSize - header.headerSize);
+
+  const auto* address =
+      reinterpret_cast<const char*>(buffer.data()) + header.headerSize;
+  return {
+      header.handshake,
+      std::string_view(address, header.sourceWorkerAddressBytes),
+      header.sourceHostIdHash};
+}
+
+} // namespace
 
 /* static */
 void UcxCpuRowAcceptor::cStyleAMCallback(
@@ -36,16 +101,9 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
   auto buffer =
       std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
   VELOX_CHECK_NOT_NULL(buffer, "CPU AMCallback: failed to get receive buffer");
-  VELOX_CHECK_GE(
-      buffer->getSize(),
-      sizeof(HandshakeMsg),
-      "CPU AMCallback: received buffer size ({}) is smaller than HandshakeMsg "
-      "({}).",
-      buffer->getSize(),
-      sizeof(HandshakeMsg));
 
-  const auto* handshakePtr =
-      reinterpret_cast<const HandshakeMsg*>(buffer->data());
+  const auto parsedHandshake = parseCpuHandshake(*buffer);
+  const auto* handshakePtr = &parsedHandshake.handshake;
   const auto taskIdLength =
       ::strnlen(handshakePtr->taskId, sizeof(handshakePtr->taskId));
   VELOX_CHECK_LT(
@@ -56,44 +114,55 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
       taskIdLength, 0, "CPU AMCallback: task ID in HandshakeMsg is empty");
 
   std::shared_ptr<Communicator> communicator = Communicator::getInstance();
-  auto epRef = communicator->findEndpointRefByHandle(ep);
-  VELOX_CHECK_NOT_NULL(epRef, "CPU AMCallback: could not find endpoint ref");
+  auto bootstrapEpRef = communicator->findEndpointRefByHandle(ep);
+  VELOX_CHECK_NOT_NULL(
+      bootstrapEpRef, "CPU AMCallback: could not find endpoint ref");
 
   const PartitionKey key{
       std::string(handshakePtr->taskId, taskIdLength),
       handshakePtr->destination};
 
-  bool canUseCpuShm = false;
-  if (ucxCpuRowShmEnabled() && handshakePtr->cpuShmProbeName[0] != '\0') {
-    const auto probeNameLength = ::strnlen(
-        handshakePtr->cpuShmProbeName, sizeof(handshakePtr->cpuShmProbeName));
-    if (probeNameLength < sizeof(handshakePtr->cpuShmProbeName)) {
-      auto probeSegment = openUcxCpuRowShmSegment(
-          std::string_view(handshakePtr->cpuShmProbeName, probeNameLength),
-          sizeof(uint64_t),
-          false);
-      if (probeSegment) {
-        uint64_t probeToken = 0;
-        std::memcpy(&probeToken, probeSegment->data(), sizeof(probeToken));
-        canUseCpuShm = probeToken == handshakePtr->cpuShmProbeToken;
-        probeSegment->unlinkOnDestroy = canUseCpuShm;
-      }
+  auto epRef = bootstrapEpRef;
+  const bool workerAddressEndpoint =
+      !parsedHandshake.sourceWorkerAddress.empty();
+  const bool sameHost = communicator->hasSameHostTransportIdentity(
+      parsedHandshake.sourceHostIdHash);
+  if (workerAddressEndpoint && sameHost) {
+    if (auto dataEpRef =
+            communicator->createSameHostEndpointRefFromWorkerAddress(
+                parsedHandshake.sourceWorkerAddress,
+                bootstrapEpRef->getPeerIp(),
+                parsedHandshake.sourceHostIdHash)) {
+      epRef = std::move(dataEpRef);
+      VLOG(1) << "[ACCEPTOR-CPU] using same-host worker-address endpoint for "
+              << key.toString() << " sourceWorkerAddressBytes="
+              << parsedHandshake.sourceWorkerAddress.size()
+              << " sourceHostIdHash=" << parsedHandshake.sourceHostIdHash;
+    } else {
+      VLOG(1) << "[ACCEPTOR-CPU] failed to create same-host worker-address "
+                 "endpoint for "
+              << key.toString() << "; using listener endpoint";
     }
+  } else {
+    VLOG(1) << "[ACCEPTOR-CPU] using listener endpoint for " << key.toString()
+            << " workerAddressBytes="
+            << parsedHandshake.sourceWorkerAddress.size()
+            << " sourceHostIdHash=" << parsedHandshake.sourceHostIdHash
+            << " sameHost=" << sameHost;
   }
 
   auto exchangeServer =
-      UcxCpuRowExchangeServer::create(communicator, epRef, key, canUseCpuShm);
+      UcxCpuRowExchangeServer::create(communicator, epRef, key);
 
   epRef->addCommElem(exchangeServer);
   communicator->registerCommElement(exchangeServer);
 
   VLOG(2) << "[ACCEPTOR-CPU] new server: " << exchangeServer->toString()
           << " peerIp=" << epRef->getPeerIp()
-          << " canUseCpuShm=" << canUseCpuShm;
+          << " workerAddressEndpoint=" << (epRef != bootstrapEpRef);
 
   auto response = std::make_shared<HandshakeResponse>();
   response->isIntraNodeTransfer = false;
-  response->canUseCpuShm = canUseCpuShm;
 
   uint64_t responseTag = getHandshakeResponseTag(fnv1a_32(key.toString()));
   epRef->endpoint_->tagSend(

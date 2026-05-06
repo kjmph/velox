@@ -1204,8 +1204,8 @@ void Task::initializePartitionOutput() {
     // Mirror the OutputBufferManager initialization for the CPU-row UCX
     // queue manager so UcxCpuRowPartitionedOutput has a queue to enqueue
     // into. The IBM ibm-research-preview branch does the same for the
-    // cudf path (gated on cudf.exchange); for the CPU POC we always
-    // initialize when the library is compiled in — the queue is just a
+    // cudf path (gated on cudf.exchange); for the CPU path we always
+    // initialize when the library is compiled in. The queue is just a
     // map entry, harmless if our DriverAdapter never fires.
     {
       auto cpuQueueMgr = facebook::velox::ucx_exchange::
@@ -1707,12 +1707,18 @@ void Task::addSplitToStoreLocked(
     uint32_t groupId,
     const exec::Split& split,
     std::vector<ContinuePromise>& promises) {
-  auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, groupId);
+  auto& splitsStore = splitsState.groupSplitsStores[groupId];
+  if (!splitsStore) {
+    setSplitsStore(
+        splitsStore,
+        std::make_unique<QueueSplitsStore>(!splitsState.sourceIsTableScan));
+  }
   if (split.isBarrier()) {
     splitsStore->requestBarrier(split.barrier->numDrivers, promises);
     return;
   }
-  auto* queueSplitsStore = checkedPointerCast<QueueSplitsStore>(splitsStore);
+  auto* queueSplitsStore =
+      checkedPointerCast<QueueSplitsStore>(splitsStore.get());
   queueSplitsStore->addSplit(split, promises);
 }
 
@@ -1726,7 +1732,7 @@ void Task::noMoreSplitsForGroup(
 
     auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
     noMoreSplitsForStore(
-        getOrCreateSplitsStoreLocked(splitsState, splitGroupId), promises);
+        splitsState.groupSplitsStores[splitGroupId].get(), promises);
 
     // There were no splits in this group, hence, no active drivers. Mark the
     // group complete.
@@ -1821,18 +1827,6 @@ void Task::setSplitsStore(
   splitsStore = std::move(newSplitsStore);
   splitsStore->setTaskStats(taskStats_);
   splitsStore->setPreloadingSplits(preloadingSplits_);
-}
-
-SplitsStore* Task::getOrCreateSplitsStoreLocked(
-    SplitsState& splitsState,
-    uint32_t splitGroupId) {
-  auto& splitsStore = splitsState.groupSplitsStores[splitGroupId];
-  if (!splitsStore) {
-    setSplitsStore(
-        splitsStore,
-        std::make_unique<QueueSplitsStore>(!splitsState.sourceIsTableScan));
-  }
-  return splitsStore.get();
 }
 
 ContinueFuture Task::requestBarrier() {
@@ -2048,7 +2042,12 @@ BlockingReason Task::getSplitOrFuture(
     ContinueFuture& future) {
   std::lock_guard<std::timed_mutex> l(mutex_);
   auto& splitsState = getPlanNodeSplitsStateLocked(planNodeId);
-  auto* splitsStore = getOrCreateSplitsStoreLocked(splitsState, splitGroupId);
+  auto& splitsStore = splitsState.groupSplitsStores[splitGroupId];
+  if (!splitsStore) {
+    setSplitsStore(
+        splitsStore,
+        std::make_unique<QueueSplitsStore>(!splitsState.sourceIsTableScan));
+  }
   return splitsStore->nextSplit(
              driverId, maxPreloadSplits, preload, split, future)
       ? BlockingReason::kNotBlocked
@@ -2549,18 +2548,13 @@ ContinueFuture Task::terminate(TaskState terminalState) {
         "Termination time has already been set, this should only happen once.");
     taskStats_.terminationTimeMs = getCurrentTimeMs();
     if (state_ == TaskState::kCanceled || state_ == TaskState::kAborted) {
-      // Construct the exception directly instead of going through VELOX_FAIL to
-      // avoid error log when cancellation is expected.
-      exception_ = std::make_exception_ptr(VeloxRuntimeError(
-          __FILE__,
-          __LINE__,
-          __FUNCTION__,
-          /*expression=*/"",
-          state_ == TaskState::kCanceled ? "Cancelled"
-                                         : "Aborted for external error",
-          error_source::kErrorSourceRuntime,
-          error_code::kInvalidState,
-          /*isRetriable=*/false));
+      try {
+        VELOX_FAIL(
+            state_ == TaskState::kCanceled ? "Cancelled"
+                                           : "Aborted for external error");
+      } catch (const std::exception&) {
+        exception_ = std::current_exception();
+      }
     }
     if (state_ != TaskState::kFinished) {
       VELOX_CHECK(!cancellationSource_.isCancellationRequested());
@@ -2742,8 +2736,7 @@ void Task::maybeRemoveFromOutputBufferManager() {
       {
         std::lock_guard<std::timed_mutex> l(mutex_);
         auto optStats = cpuQueueMgr->stats(taskId_);
-        if (!taskStats_.outputBufferStats.has_value() &&
-            optStats.has_value()) {
+        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
           taskStats_.outputBufferStats = optStats;
         }
       }

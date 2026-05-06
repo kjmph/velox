@@ -21,16 +21,13 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <vector>
 #include "velox/core/PlanNode.h"
 #include "velox/exec/OutputBuffer.h" // for the Stats structure
 #include "velox/exec/Task.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 
 /// CPU RowVector mirror of UcxQueues.h. Structure intentionally tracks
 /// the cudf version closely so future merging/templating is mechanical.
@@ -41,28 +38,15 @@
 
 namespace facebook::velox::ucx_exchange {
 
-struct UcxCpuRowShmSlotLease {
-  std::shared_ptr<UcxCpuRowShmSlotPool> pool;
-  UcxCpuRowShmSlotPool::Slot slot;
-};
-
 /// One serialized RowVector chunk plus enough metadata for the queue to
 /// report stats and apply backpressure without walking the IOBuf chain.
 ///
 /// `data` holds the bytes produced by PrestoVectorSerde::flush(); typically
-/// a multi-buffer IOBuf chain. When CPU SHM direct-TX is enabled, `data`
-/// wraps `shmSegment` so UCX fallback can still read the bytes without
-/// reserializing. `numBytes` is the total chain length cached at enqueue time.
+/// a multi-buffer IOBuf chain. `numBytes` is the total chain length cached at
+/// enqueue time.
 /// `numRows` is the row count of the original RowVector before serialization.
 struct UcxCpuRowPayload {
-  ~UcxCpuRowPayload();
-
   std::unique_ptr<folly::IOBuf> data;
-  std::shared_ptr<UcxCpuRowShmSegment> shmSegment;
-  std::shared_ptr<UcxCpuRowShmSlotPool> shmSlotPool;
-  size_t shmOffset{0};
-  uint32_t shmSlotId{std::numeric_limits<uint32_t>::max()};
-  bool releaseShmSlotOnDestroy{false};
   int32_t numRows{0};
   int64_t numBytes{0};
 };
@@ -226,13 +210,8 @@ class UcxCpuRowOutputQueue
   std::shared_ptr<UcxCpuRowPayload> tryGetData(int destination);
 
   /// Put a payload back at the head of a destination queue after an
-  /// optimistic tryGetData() drain. Used by the exchange server when
-  /// preserving transport-homogeneous bundles.
+  /// optimistic tryGetData() drain.
   void requeueFront(int destination, std::shared_ptr<UcxCpuRowPayload> data);
-
-  std::optional<UcxCpuRowShmSlotLease> tryAcquireSlot(
-      int destination,
-      size_t bytes);
 
   /// Indicates that one driver finished producing. The queue closes
   /// once all drivers report and all queued data has drained.
@@ -290,18 +269,6 @@ class UcxCpuRowOutputQueue
       std::shared_ptr<UcxCpuRowPayload> data,
       std::vector<UcxCpuRowDataAvailable>& dataAvailableCbs);
 
-  uint32_t expectedSlotPoolOpenersLocked(int destination) const;
-  void maybeStartSlotPoolCreateLocked(
-      int destination,
-      size_t bytes,
-      uint32_t expectedOpeners);
-
-  struct SlotPoolBuildState {
-    uint32_t nextNumSlots{0};
-    uint32_t inFlightNumSlots{0};
-    bool createInFlight{false};
-  };
-
   std::shared_ptr<exec::Task> task_{nullptr};
 
   core::PartitionedOutputNode::Kind kind_{
@@ -323,8 +290,6 @@ class UcxCpuRowOutputQueue
   std::mutex mutex_;
 
   std::vector<std::unique_ptr<UcxCpuRowDestinationQueue>> queues_;
-  std::vector<std::vector<std::shared_ptr<UcxCpuRowShmSlotPool>>> slotPools_;
-  std::vector<SlotPoolBuildState> slotPoolBuild_;
   std::vector<exec::DestinationBuffer::Stats> finishedBufferStats_;
 
   uint32_t numFinished_{0};
@@ -341,19 +306,6 @@ class UcxCpuRowOutputQueue
   int64_t totalBytesSent_{0};
   int64_t totalRowsSent_{0};
   int64_t totalPayloadsSent_{0};
-
-  int64_t slotPoolAcquireSuccesses_{0};
-  int64_t slotPoolAcquireMisses_{0};
-  int64_t slotPoolAcquireTooLarge_{0};
-  int64_t slotPoolPoolsCreated_{0};
-  int64_t slotPoolPoolLimitMisses_{0};
-  int64_t slotPoolCreateFailures_{0};
-  int64_t slotPoolAsyncCreatesStarted_{0};
-  int64_t slotPoolAsyncCreatesCompleted_{0};
-  int64_t slotPoolAsyncCreatesDropped_{0};
-  int64_t slotPoolAcquireSuccessBytes_{0};
-  int64_t slotPoolAcquireMissBytes_{0};
-  int64_t slotPoolAcquireTooLargeBytes_{0};
 
   uint64_t queueStartMs_{0};
   double totalQueuedBytesMs_{0};

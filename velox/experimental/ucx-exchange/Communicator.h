@@ -16,9 +16,14 @@
 #pragma once
 
 #include <ucxx/api.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -108,6 +113,30 @@ class Communicator {
   [[nodiscard]] std::shared_ptr<EndpointRef> assocEndpointRef(
       std::shared_ptr<CommElement> commElement,
       HostPort hostPort);
+
+  /// Returns true if the peer has the same non-zero transport identity.
+  [[nodiscard]] bool hasSameHostTransportIdentity(
+      uint32_t peerHostIdHash) const;
+
+  /// Creates a same-host endpoint from a serialized UCX worker address. This
+  /// avoids the listener/client-server connection-manager path for local data
+  /// traffic, allowing UCX to select same-host transports (posix/sysv/cma).
+  /// Cross-host or unknown peers should use the listener/bootstrap endpoint.
+  [[nodiscard]] std::shared_ptr<EndpointRef>
+  createSameHostEndpointRefFromWorkerAddress(
+      std::string_view workerAddress,
+      std::string peerIp = "",
+      uint32_t peerHostIdHash = 0);
+
+  /// Returns this process' serialized UCX worker address.
+  [[nodiscard]] std::string getWorkerAddress() const;
+
+  /// Returns a stable same-host transport identity hash. Equal non-zero values
+  /// mean two Communicators are expected to share the host/namespace setup
+  /// needed by UCX same-host transports; zero means unknown.
+  [[nodiscard]] uint32_t getHostIdHash() const {
+    return hostIdHash_;
+  }
 
   /// @brief Removes an endpoint from the communicator. This is required when
   /// the endpoint has become stale since the other side has disappeared.
@@ -215,6 +244,10 @@ class Communicator {
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;
 
+  // Same-host CPU data endpoints keyed by serialized UCX worker address.
+  // Cross-host and unknown peers stay on endpoints_.
+  std::map<std::string, std::shared_ptr<EndpointRef>> workerAddressEndpoints_;
+
   // Signals the UCXX worker to wake up from a blocking
   // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
   // or if not in blocking progress mode.
@@ -224,6 +257,11 @@ class Communicator {
   // Generated once at initialization. Used by the Acceptor to determine
   // if a connecting source is in the same process (intra-node transfer).
   uint64_t workerId_{0};
+
+  // Stable same-host transport identity hash. This differs from workerId_:
+  // all workers with the same host/namespace setup should have the same
+  // hostIdHash_.
+  uint32_t hostIdHash_{0};
 
   // Queue of endpoints that need cleanup, populated by callbacks.
   // UCX callbacks cannot call progress functions (like closeBlocking),
@@ -245,14 +283,13 @@ class Communicator {
   // callbacks fire without concurrently advancing source/server state
   // machines.
   std::vector<std::thread> auxThreads_;
-  // Loop body shared between primary and aux threads.
+  // Primary-thread work dispatch plus UCX progress.
   void drainWorkAndProgress();
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{
       std::chrono::steady_clock::now()};
-  // Atomic because aux progress threads also increment this when
-  // running drainWorkAndProgress(). Read+reset on the primary thread.
+  // Atomic so heartbeat can reset with a single exchange().
   std::atomic<uint64_t> workItemsProcessed_{0};
 };
 

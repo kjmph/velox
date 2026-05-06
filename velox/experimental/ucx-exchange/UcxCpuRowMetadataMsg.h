@@ -42,43 +42,15 @@ namespace facebook::velox::ucx_exchange {
 ///   [numRem      (8 bytes)]   -- number of `remainingBytes` entries
 ///   [remBytes    (numRem * 8)]
 ///   [atEnd       (1 byte)]
-///   [transport   (1 byte)]    -- optional; defaults to UCX for older records
-///   [shmNameSize (4 bytes)]   -- optional; only present with transport
-///   [shmName     (N bytes)]
-///   [numShmNames (8 bytes)]   -- optional; 1 SHM object per frame
-///   [shmNames    (numShmNames * (4-byte size + bytes))]
-///   [shmPoolNameSize (4 bytes)] -- optional; SHM slot-pool name
-///   [shmPoolName     (N bytes)]
-///   [shmPoolSize     (8 bytes)]
-///   [shmSlotSize     (8 bytes)]
-///   [numShmSlotIds   (8 bytes)]
-///   [shmSlotIds      (numShmSlotIds * 8)]
 ///
-/// UCX data bundles become N tagSends, one per frame, while SHM bundles
-/// either carry the same frame layout inside one shared-memory object
-/// (`shmName`), one already-serialized SHM object per frame (`shmNames`),
-/// or one pre-mapped shared-memory slot per frame (`shmPoolName` +
-/// `shmSlotIds`).
+/// UCX data bundles become N tagSends, one per frame.
 /// The receiver stitches frames into an IOBuf chain, which PrestoSerializer's
 /// stream reader walks natively.
 struct UcxCpuRowMetadataMsg {
-  enum class Transport : uint8_t {
-    kUcx = 0,
-    kShm = 1,
-    kShmSlot = 2,
-  };
-
   WireDataSizeType dataSizeBytes{0};
   std::vector<WireDataSizeType> frameSizes;
   std::vector<WireRemainingElementType> remainingBytes;
   bool atEnd{false};
-  Transport transport{Transport::kUcx};
-  std::string shmName;
-  std::vector<std::string> shmNames;
-  std::string shmPoolName;
-  WireDataSizeType shmPoolSize{0};
-  WireDataSizeType shmSlotSize{0};
-  std::vector<WireLengthType> shmSlotIds;
 
   uint32_t getSerializedSize() const {
     uint64_t totalSize = sizeof(kMagicNumber) + sizeof(uint32_t);
@@ -88,22 +60,6 @@ struct UcxCpuRowMetadataMsg {
     totalSize += sizeof(WireLengthType); // numRemaining count
     totalSize += remainingBytes.size() * sizeof(remainingBytes[0]);
     totalSize += sizeof(uint8_t); // atEnd
-    totalSize += sizeof(uint8_t); // transport
-    totalSize += sizeof(uint32_t); // shmName size
-    totalSize += shmName.size();
-    totalSize += sizeof(WireLengthType); // shmNames count
-    for (const auto& name : shmNames) {
-      totalSize += sizeof(uint32_t);
-      totalSize += name.size();
-    }
-    if (!shmPoolName.empty() || !shmSlotIds.empty()) {
-      totalSize += sizeof(uint32_t); // shmPoolName size
-      totalSize += shmPoolName.size();
-      totalSize += sizeof(shmPoolSize);
-      totalSize += sizeof(shmSlotSize);
-      totalSize += sizeof(WireLengthType); // shmSlotIds count
-      totalSize += shmSlotIds.size() * sizeof(shmSlotIds[0]);
-    }
     if (totalSize > std::numeric_limits<uint32_t>::max()) {
       return std::numeric_limits<uint32_t>::max();
     }

@@ -24,7 +24,6 @@ set(
   # CPU RowVector mirror of the cudf stack. PrestoSerializer-based, no
   # cudf dependency.
   UcxCpuRowMetadataMsg.cpp
-  UcxCpuRowShm.cpp
   UcxCpuRowQueues.cpp
   UcxCpuRowOutputQueueManager.cpp
   UcxCpuRowExchangeServer.cpp

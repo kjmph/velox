@@ -18,7 +18,6 @@
 #include <ucxx/api.h>
 #include <map>
 #include <set>
-#include <unordered_map>
 #include "velox/common/Enums.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
@@ -35,9 +34,6 @@
 /// delivery over UCX.
 
 namespace facebook::velox::ucx_exchange {
-
-struct UcxCpuRowShmSegment;
-class UcxCpuRowShmSlotPool;
 
 struct UcxCpuRowExchangeMetrics {
   UcxCpuRowExchangeMetrics()
@@ -221,9 +217,6 @@ class UcxCpuRowExchangeSource
   std::shared_ptr<ucxx::Request> handshakeResponseRequest_{nullptr};
   std::vector<std::shared_ptr<ucxx::Request>> metadataRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
-  std::shared_ptr<UcxCpuRowShmSegment> handshakeShmProbe_;
-  std::unordered_map<std::string, std::shared_ptr<UcxCpuRowShmSlotPool>>
-      shmSlotPools_;
 };
 
 } // namespace facebook::velox::ucx_exchange

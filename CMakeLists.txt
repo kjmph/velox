@@ -153,7 +153,7 @@ option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
 # is normally pulled in alongside cuDF (the IBM ibm-research-preview branch
 # adds add_subdirectory there gated on VELOX_ENABLE_CUDF). Upstream main has
 # no such add_subdirectory, so this option re-enables the build path
-# independently of cuDF — needed for the CPU UCX-row POC.
+# independently of cuDF, which is needed for CPU UCX-row exchange.
 option(
   VELOX_ENABLE_UCX_EXCHANGE
   "Build the experimental UCX exchange library. Requires UCX dev libs."
@@ -525,7 +525,7 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   endif()
 endif()
 
-# Standalone ucxx fetch for the CPU UCX-row POC. The cudf path above
+# Standalone ucxx fetch for CPU UCX-row exchange. The cudf path above
 # already pulls ucxx in transitively, so we only run this when
 # VELOX_ENABLE_UCX_EXCHANGE is on but cudf is off.
 if(VELOX_ENABLE_UCX_EXCHANGE AND NOT VELOX_ENABLE_CUDF)

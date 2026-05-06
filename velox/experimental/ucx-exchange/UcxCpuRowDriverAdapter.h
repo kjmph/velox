@@ -28,7 +28,7 @@
 /// `etc/config.properties` doesn't auto-flow into Velox's QueryConfig
 /// (only session properties do, which are per-query).
 ///
-///   VELOX_UCX_CPU_EXCHANGE=1       # any of "1", "true", "TRUE", "yes"
+///   VELOX_UCX_CPU_EXCHANGE=1       # use 0 or 1
 ///   VELOX_UCX_CPU_PORT=10083       # default kDefaultCpuExchangePort
 ///
 /// The adapter assumes that exchange splits on UCX edges point at native

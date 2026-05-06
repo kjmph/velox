@@ -152,18 +152,6 @@ void UcxCpuRowOutputQueueManager::requeueFront(
   queue->requeueFront(destination, std::move(data));
 }
 
-std::optional<UcxCpuRowShmSlotLease>
-UcxCpuRowOutputQueueManager::tryAcquireSlot(
-    std::string_view taskId,
-    int destination,
-    size_t bytes) {
-  auto queue = getQueueIfExists(taskId);
-  if (!queue) {
-    return std::nullopt;
-  }
-  return queue->tryAcquireSlot(destination, bytes);
-}
-
 void UcxCpuRowOutputQueueManager::removeTask(std::string_view taskId) {
   std::string taskIdStr{taskId};
   auto queue = queues_.withLock(

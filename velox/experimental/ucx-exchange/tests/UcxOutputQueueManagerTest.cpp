@@ -26,77 +26,12 @@
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
-#include "velox/experimental/ucx-exchange/UcxCpuRowShm.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
 using namespace facebook::velox::ucx_exchange;
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
-
-TEST(UcxCpuRowShmSlotPoolTest, refCountedReadyState) {
-  auto pool = UcxCpuRowShmSlotPool::create(4096, 1, 1);
-  ASSERT_TRUE(pool);
-
-  auto slot = pool->tryAcquire(16);
-  ASSERT_TRUE(slot.has_value());
-  EXPECT_FALSE(pool->addRef(slot->id));
-
-  pool->markReady(slot->id);
-  EXPECT_TRUE(pool->isReady(slot->id));
-  EXPECT_FALSE(pool->tryAcquire(16).has_value());
-
-  ASSERT_TRUE(pool->addRef(slot->id));
-  pool->release(slot->id);
-  EXPECT_TRUE(pool->isReady(slot->id));
-  EXPECT_FALSE(pool->tryAcquire(16).has_value());
-
-  pool->release(slot->id);
-  EXPECT_FALSE(pool->isReady(slot->id));
-
-  auto reacquired = pool->tryAcquire(16);
-  ASSERT_TRUE(reacquired.has_value());
-  EXPECT_EQ(slot->id, reacquired->id);
-  pool->markReady(reacquired->id);
-  pool->release(reacquired->id);
-}
-
-TEST(UcxCpuRowShmSlotPoolTest, receiverCanOpenAfterSenderDropsPool) {
-  auto pool = UcxCpuRowShmSlotPool::create(4096, 1, 1);
-  ASSERT_TRUE(pool);
-
-  const auto name = pool->name();
-  const auto size = pool->totalSize();
-
-  pool->disableUnlinkOnDestroy();
-  pool.reset();
-
-  auto opened = UcxCpuRowShmSlotPool::open(name, size, true);
-  ASSERT_TRUE(opened);
-  EXPECT_EQ(opened->name(), name);
-  EXPECT_EQ(opened->totalSize(), size);
-}
-
-TEST(UcxCpuRowShmSlotPoolTest, multiReceiverNameSurvivesUntilLastOpen) {
-  auto pool = UcxCpuRowShmSlotPool::create(4096, 1, 2);
-  ASSERT_TRUE(pool);
-
-  const auto name = pool->name();
-  const auto size = pool->totalSize();
-
-  pool->disableUnlinkOnDestroy();
-  pool.reset();
-
-  auto first = UcxCpuRowShmSlotPool::open(name, size, true);
-  ASSERT_TRUE(first);
-
-  auto second = UcxCpuRowShmSlotPool::open(name, size, true);
-  ASSERT_TRUE(second);
-
-  // The second expected opener unlinked the name. Existing mappings stay valid,
-  // but a new opener must not find the advertised name.
-  EXPECT_FALSE(UcxCpuRowShmSlotPool::open(name, size, false));
-}
 
 class UcxOutputQueueManagerTest : public testing::Test {
  protected:

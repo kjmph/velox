@@ -66,16 +66,6 @@ uint32_t maxInFlightBundles() {
   return kDepth;
 }
 
-int64_t elapsedMillis(
-    std::chrono::steady_clock::time_point start,
-    std::chrono::steady_clock::time_point end =
-        std::chrono::steady_clock::now()) {
-  if (start == std::chrono::steady_clock::time_point{}) {
-    return -1;
-  }
-  return std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-      .count();
-}
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -112,9 +102,6 @@ struct CpuRowMultiSendState {
   std::vector<CpuRowSendFrame> frames;
   std::atomic<int32_t> pendingFrames{0};
   std::atomic<ucs_status_t> finalStatus{UCS_OK};
-  uint32_t sequenceNumber{0};
-  int64_t bytes{0};
-  std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
 };
 
 // Target packed-frame size on the wire. Small chunks are accumulated into a
@@ -323,10 +310,8 @@ void UcxCpuRowExchangeServer::sendData(
   // advertise the post-pack sizes, not the per-chunk sizes.
   std::vector<std::shared_ptr<UcxCpuRowPayload>> chunks;
   int64_t combinedBytes = 0;
-  int64_t combinedRows = 0;
   if (firstChunk) {
     combinedBytes = firstChunk->numBytes;
-    combinedRows = firstChunk->numRows;
     chunks.push_back(std::move(firstChunk));
     while (combinedBytes < kBundleTargetBytes) {
       auto extra = queueMgr_->tryGetData(
@@ -335,21 +320,11 @@ void UcxCpuRowExchangeServer::sendData(
         break;
       }
       combinedBytes += extra->numBytes;
-      combinedRows += extra->numRows;
       chunks.push_back(std::move(extra));
     }
   }
-  const int64_t bundledChunks = static_cast<int64_t>(chunks.size());
-  VELOX_CHECK_GT(bundledChunks, 0, "sendData requires a non-empty data bundle");
+  VELOX_CHECK_GT(chunks.size(), 0, "sendData requires a non-empty data bundle");
   const uint32_t sequenceNumber = sequenceNumber_++;
-  const auto now = std::chrono::steady_clock::now();
-  if (firstPayloadTime_ == std::chrono::steady_clock::time_point{}) {
-    firstPayloadTime_ = now;
-  }
-  lastPayloadTime_ = now;
-  ++bundlesStarted_;
-  payloadBytesStarted_ += combinedBytes;
-  chunksStarted_ += bundledChunks;
 
   // Pack chunks into ~kFrameTargetBytes frames:
   //   - A chunk >= kStandaloneFrameMinBytes ships standalone
@@ -413,15 +388,11 @@ void UcxCpuRowExchangeServer::sendData(
   }
   const size_t numFrames = multiState->frames.size();
   VELOX_CHECK_GT(numFrames, 0, "sendData requires a non-empty data bundle");
-  multiState->sequenceNumber = sequenceNumber;
-  multiState->bytes = combinedBytes;
-  multiState->startTime = std::chrono::high_resolution_clock::now();
 
   VLOG(4) << "[ExSrv-CPU " << partitionKey_.toString()
           << " seq=" << sequenceNumber
-          << "] sendData hasData=" << (numFrames > 0)
-          << " bundledChunks=" << bundledChunks << " frames=" << numFrames
-          << " size=" << combinedBytes << " rows=" << combinedRows;
+          << "] sendData hasData=" << (numFrames > 0) << " frames=" << numFrames
+          << " size=" << combinedBytes;
 
   // Build metadata reflecting the packed frame layout.
   UcxCpuRowMetadataMsg metadataMsg;
@@ -532,20 +503,7 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
   }
 
   finalMetadataSent_ = true;
-  finalMetadataSendTime_ = std::chrono::steady_clock::now();
   const uint32_t sequenceNumber = sequenceNumber_++;
-  VLOG(1) << "[TAIL-CPU] task=" << partitionKey_.taskId
-          << " destination=" << partitionKey_.destination
-          << " event=final-marker-send seq=" << sequenceNumber
-          << " inFlight=" << inFlightSends_
-          << " bundlesStarted=" << bundlesStarted_
-          << " bundlesCompleted=" << bundlesCompleted_
-          << " bytesStarted=" << payloadBytesStarted_
-          << " bytesCompleted=" << payloadBytesCompleted_
-          << " chunksStarted=" << chunksStarted_ << " firstPayloadToFinalMs="
-          << elapsedMillis(firstPayloadTime_, finalMetadataSendTime_)
-          << " lastPayloadToFinalMs="
-          << elapsedMillis(lastPayloadTime_, finalMetadataSendTime_);
 
   UcxCpuRowMetadataMsg metadataMsg;
   metadataMsg.dataSizeBytes = 0;
@@ -581,15 +539,7 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
   // the metadata bytes alive until completion. Match the GPU UCX exchange
   // lifetime rule: producer output is consumed once the final marker is
   // published, not when the send completion callback eventually runs.
-  const auto deleteStart = std::chrono::steady_clock::now();
   queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
-  const auto deleteMicros =
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now() - deleteStart)
-          .count();
-  VLOG(1) << "[TAIL-CPU] task=" << partitionKey_.taskId
-          << " destination=" << partitionKey_.destination
-          << " event=delete-results durationUs=" << deleteMicros;
 }
 
 void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
@@ -600,11 +550,6 @@ void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
   }
 
   if (status == UCS_OK) {
-    VLOG(1) << "[TAIL-CPU] task=" << partitionKey_.taskId
-            << " destination=" << partitionKey_.destination
-            << " event=final-marker-complete status=OK"
-            << " finalMetadataMs=" << elapsedMillis(finalMetadataSendTime_)
-            << " inFlight=" << inFlightSends_;
     finalMetadataCompleted_ = true;
     maybeFinish();
   } else {
@@ -618,19 +563,6 @@ void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
 void UcxCpuRowExchangeServer::maybeFinish() {
   if (finalMetadataCompleted_ && inFlightSends_ == 0 &&
       getState() != ServerState::Done) {
-    const auto now = std::chrono::steady_clock::now();
-    VLOG(1) << "[TAIL-CPU] task=" << partitionKey_.taskId
-            << " destination=" << partitionKey_.destination
-            << " event=server-done"
-            << " firstPayloadToDoneMs=" << elapsedMillis(firstPayloadTime_, now)
-            << " finalMarkerToDoneMs="
-            << elapsedMillis(finalMetadataSendTime_, now)
-            << " lastSendCompleteToDoneMs="
-            << elapsedMillis(lastSendCompleteTime_, now)
-            << " bundlesStarted=" << bundlesStarted_
-            << " bundlesCompleted=" << bundlesCompleted_
-            << " bytesStarted=" << payloadBytesStarted_
-            << " bytesCompleted=" << payloadBytesCompleted_;
     setState(ServerState::Done);
     communicator_->addToWorkQueue(getSelfPtr());
   }
@@ -649,24 +581,6 @@ void UcxCpuRowExchangeServer::sendComplete(
   --inFlightSends_;
 
   if (status == UCS_OK) {
-    auto end = std::chrono::high_resolution_clock::now();
-    lastSendCompleteTime_ = std::chrono::steady_clock::now();
-    ++bundlesCompleted_;
-    payloadBytesCompleted_ += state->bytes;
-    auto duration = end - state->startTime;
-    auto micros =
-        std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    auto throughput = (micros > 0) ? (state->bytes / micros) : 0;
-
-    VLOG(3) << "@" << partitionKey_.taskId << " seq=" << state->sequenceNumber
-            << " duration: "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
-                   .count()
-            << " ms";
-    VLOG(3) << "@" << partitionKey_.taskId << " seq=" << state->sequenceNumber
-            << " throughput: " << throughput
-            << " MByte/s inFlight=" << inFlightSends_;
-
     // Completed UCXX requests are retained for the server lifetime to protect
     // callback closures from UCP wireup replay, but their captured send state
     // must not keep payload buffers alive.

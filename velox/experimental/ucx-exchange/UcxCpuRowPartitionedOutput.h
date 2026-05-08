@@ -16,6 +16,8 @@
 #pragma once
 
 #include <folly/Random.h>
+#include <algorithm>
+#include <cstdint>
 #include "velox/common/memory/ByteStream.h"
 #include "velox/exec/Operator.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
@@ -36,6 +38,8 @@
 ///     UcxCpuRowExchangeServer can pick them up
 
 namespace facebook::velox::ucx_exchange {
+
+class UcxVectorStreamGroup;
 
 class UcxCpuRowPartitionedOutput : public exec::Operator {
  public:
@@ -150,7 +154,7 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
     raw_vector<vector_size_t> rows_;
     vector_size_t rowIdx_{0};
 
-    std::unique_ptr<VectorStreamGroup> current_;
+    std::unique_ptr<UcxVectorStreamGroup> current_;
     bool needsStreamTreeRecreation_{false};
     bool finished_{false};
 

@@ -14,16 +14,171 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
+#include "velox/common/memory/ByteStream.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace facebook::velox::ucx_exchange {
+
 namespace {
+
+class UcxRetainedStreamArena final : public StreamArena {
+ public:
+  UcxRetainedStreamArena(
+      memory::MemoryPool* pool,
+      bool retainMemory,
+      uint64_t maxRetainedBytes)
+      : StreamArena(pool),
+        pool_(pool),
+        retainMemory_(retainMemory),
+        maxRetainedBytes_(maxRetainedBytes) {}
+
+  ~UcxRetainedStreamArena() override {
+    releaseRetained();
+  }
+
+  void newRange(int64_t bytes, ByteRange* lastRange, ByteRange* range)
+      override {
+    newRangeImpl(bytes, lastRange, range);
+  }
+
+  size_t size() const override {
+    return size_;
+  }
+
+  void clear() override {
+    releaseRetained();
+  }
+
+  memory::MemoryPool* pool() const {
+    return pool_;
+  }
+
+  void resetForReuse() {
+    if (!retainMemory_ || retainedBytes_ > maxRetainedBytes_) {
+      releaseRetained();
+    }
+
+    size_ = 0;
+    allocationIndex_ = 0;
+    countedAllocationIndex_ = 0;
+    currentRun_ = 0;
+    currentOffset_ = 0;
+    largeAllocationIndex_ = 0;
+  }
+
+ private:
+  static constexpr memory::MachinePageCount kAllocationQuantum{2};
+
+  void newRangeImpl(int64_t bytes, ByteRange* /*lastRange*/, ByteRange* range) {
+    VELOX_CHECK_GT(bytes, 0, "StreamArena::newRange can't be zero length");
+    const memory::MachinePageCount numPages =
+        memory::AllocationTraits::numPages(bytes);
+    if (numPages > pool_->largestSizeClass()) {
+      newLargeRange(numPages, range);
+      return;
+    }
+
+    for (;;) {
+      if (allocationIndex_ >= allocations_.size()) {
+        memory::Allocation allocation;
+        pool_->allocateNonContiguous(
+            std::max(kAllocationQuantum, numPages), allocation);
+        retainedBytes_ += allocation.byteSize();
+        allocations_.push_back(std::move(allocation));
+      }
+
+      auto& allocation = allocations_[allocationIndex_];
+      if (allocationIndex_ >= countedAllocationIndex_) {
+        size_ += allocation.byteSize();
+        countedAllocationIndex_ = allocationIndex_ + 1;
+      }
+
+      if (currentRun_ >= allocation.numRuns()) {
+        ++allocationIndex_;
+        currentRun_ = 0;
+        currentOffset_ = 0;
+        continue;
+      }
+
+      auto run = allocation.runAt(currentRun_);
+      range->buffer = run.data() + currentOffset_;
+      const int64_t availableBytes = run.numBytes() - currentOffset_;
+      range->size = std::min<int64_t>(bytes, availableBytes);
+      range->position = 0;
+      currentOffset_ += range->size;
+      VELOX_DCHECK_LE(currentOffset_, run.numBytes());
+      if (currentOffset_ == run.numBytes()) {
+        ++currentRun_;
+        currentOffset_ = 0;
+      }
+      return;
+    }
+  }
+
+  void newLargeRange(memory::MachinePageCount numPages, ByteRange* range) {
+    const auto requestedBytes = memory::AllocationTraits::pageBytes(numPages);
+    std::optional<size_t> selected;
+    for (size_t i = largeAllocationIndex_; i < largeAllocations_.size(); ++i) {
+      if (largeAllocations_[i].size() >= requestedBytes) {
+        selected = i;
+        break;
+      }
+    }
+
+    if (selected.has_value()) {
+      if (*selected != largeAllocationIndex_) {
+        std::swap(
+            largeAllocations_[*selected],
+            largeAllocations_[largeAllocationIndex_]);
+      }
+    } else {
+      memory::ContiguousAllocation allocation;
+      pool_->allocateContiguous(numPages, allocation);
+      retainedBytes_ += allocation.size();
+      largeAllocations_.insert(
+          largeAllocations_.begin() + largeAllocationIndex_,
+          std::move(allocation));
+    }
+
+    auto& allocation = largeAllocations_[largeAllocationIndex_++];
+    range->buffer = allocation.data();
+    range->size = allocation.size();
+    range->position = 0;
+    size_ += range->size;
+  }
+
+  void releaseRetained() {
+    allocations_.clear();
+    largeAllocations_.clear();
+    retainedBytes_ = 0;
+    size_ = 0;
+    allocationIndex_ = 0;
+    countedAllocationIndex_ = 0;
+    currentRun_ = 0;
+    currentOffset_ = 0;
+    largeAllocationIndex_ = 0;
+  }
+
+  memory::MemoryPool* const pool_;
+  const bool retainMemory_;
+  const uint64_t maxRetainedBytes_;
+  std::vector<memory::Allocation> allocations_;
+  std::vector<memory::ContiguousAllocation> largeAllocations_;
+  uint64_t retainedBytes_{0};
+  uint64_t size_{0};
+  size_t allocationIndex_{0};
+  size_t countedAllocationIndex_{0};
+  int32_t currentRun_{0};
+  int32_t currentOffset_{0};
+  size_t largeAllocationIndex_{0};
+};
 
 constexpr uint64_t kDefaultMaxPageBytes = 16UL << 20; // 16 MiB
 
@@ -65,7 +220,111 @@ int32_t configuredTargetNumRows() {
   return UcxCpuRowPartitionedOutput::kTargetNumRows;
 }
 
+bool retainStreamArenaEnabled() {
+  static const bool kEnabled = [] {
+    const char* value = std::getenv("VELOX_UCX_CPU_RETAIN_STREAM_ARENA");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return kEnabled;
+}
+
+uint64_t retainedStreamArenaMaxBytes() {
+  static const auto kConfigured = readUint64Env(
+      "VELOX_UCX_CPU_RETAIN_STREAM_ARENA_MAX_BYTES",
+      memory::AllocationTraits::kPageSize,
+      1UL << 30);
+  if (kConfigured.has_value()) {
+    return *kConfigured;
+  }
+  return 64UL << 20;
+}
+
 } // namespace
+
+class UcxVectorStreamGroup final {
+ public:
+  UcxVectorStreamGroup(
+      memory::MemoryPool* pool,
+      VectorSerde* serde,
+      bool retainMemory,
+      uint64_t maxRetainedBytes)
+      : serde_(serde != nullptr ? serde : getVectorSerde()) {
+    if (retainMemory) {
+      retainedArena_ = std::make_unique<UcxRetainedStreamArena>(
+          pool, retainMemory, maxRetainedBytes);
+    } else {
+      stock_ = std::make_unique<VectorStreamGroup>(pool, serde_);
+    }
+  }
+
+  void createStreamTree(
+      RowTypePtr type,
+      int32_t numRows,
+      const VectorSerde::Options* options = nullptr) {
+    if (stock_ != nullptr) {
+      stock_->createStreamTree(std::move(type), numRows, options);
+      return;
+    }
+    serializer_ = serde_->createIterativeSerializer(
+        type, numRows, retainedArena_.get(), options);
+  }
+
+  void append(
+      const RowVectorPtr& vector,
+      const folly::Range<const IndexRange*>& ranges,
+      Scratch& scratch) {
+    if (stock_ != nullptr) {
+      stock_->append(vector, ranges, scratch);
+      return;
+    }
+    serializer_->append(vector, ranges, scratch);
+  }
+
+  void append(
+      const RowVectorPtr& vector,
+      const folly::Range<const vector_size_t*>& rows,
+      Scratch& scratch) {
+    if (stock_ != nullptr) {
+      stock_->append(vector, rows, scratch);
+      return;
+    }
+    serializer_->append(vector, rows, scratch);
+  }
+
+  void flush(OutputStream* stream) {
+    if (stock_ != nullptr) {
+      stock_->flush(stream);
+      return;
+    }
+    serializer_->flush(stream);
+  }
+
+  size_t size() const {
+    return stock_ != nullptr ? stock_->size() : retainedArena_->size();
+  }
+
+  memory::MemoryPool* pool() const {
+    return stock_ != nullptr ? stock_->pool() : retainedArena_->pool();
+  }
+
+  void resetForNextStreamTree() {
+    if (stock_ != nullptr) {
+      stock_->clear();
+      return;
+    }
+    // Destroy the serializer before rewinding the arena. Serializer streams
+    // hold raw ByteRanges into the arena; no old stream state is reused after
+    // flush.
+    serializer_.reset();
+    retainedArena_->resetForReuse();
+  }
+
+ private:
+  std::unique_ptr<VectorStreamGroup> stock_;
+  std::unique_ptr<UcxRetainedStreamArena> retainedArena_;
+  VectorSerde* serde_{nullptr};
+  std::unique_ptr<IterativeVectorSerializer> serializer_;
+};
 
 using exec::BlockingReason;
 
@@ -98,7 +357,11 @@ void UcxCpuRowPartitionedOutput::Destination::createVectorStreamGroup(
     const RowVectorPtr& output) {
   if (current_ == nullptr || needsStreamTreeRecreation_) {
     if (current_ == nullptr) {
-      current_ = std::make_unique<VectorStreamGroup>(pool_, serde_);
+      current_ = std::make_unique<UcxVectorStreamGroup>(
+          pool_,
+          serde_,
+          retainStreamArenaEnabled(),
+          retainedStreamArenaMaxBytes());
     }
     const auto rowType = asRowType(output->type());
     current_->createStreamTree(rowType, rowsInCurrent_, serdeOptions_);
@@ -107,11 +370,11 @@ void UcxCpuRowPartitionedOutput::Destination::createVectorStreamGroup(
 }
 
 void UcxCpuRowPartitionedOutput::Destination::clearVectorStreamGroup() {
-  current_->clear();
-  // The underlying StreamArena's memory is recycled by clear(); the
-  // serializer holds raw pointers into it, so we must call
-  // createStreamTree() again before the next append. Mirrors the
-  // standard PartitionedOutput's same-name fix.
+  current_->resetForNextStreamTree();
+  // Serializer streams hold raw ByteRanges into the arena. After flush, drop
+  // the serializer and create a fresh stream tree before the next append.
+  // resetForNextStreamTree() may retain the arena allocation behind an opt-in
+  // flag, but no old stream state or payload length is reused.
   needsStreamTreeRecreation_ = true;
 }
 
@@ -196,7 +459,6 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
       *current_->pool(),
       /*listener=*/nullptr,
       initialSize);
-
   current_->flush(&stream);
   clearVectorStreamGroup();
 
@@ -375,7 +637,8 @@ void UcxCpuRowPartitionedOutput::addInput(RowVectorPtr input) {
   if (numDestinations_ == 1) {
     destinations_[0]->addRows(IndexRange{0, numInput});
   } else {
-    auto singlePartition = partitionFunction_->partition(*input_, partitions_);
+    const auto singlePartition =
+        partitionFunction_->partition(*input_, partitions_);
     if (replicateNullsAndAny_) {
       collectNullRows();
       vector_size_t start = 0;

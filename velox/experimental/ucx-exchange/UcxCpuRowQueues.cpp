@@ -451,15 +451,6 @@ void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
     if (!atEnd_) {
       return;
     }
-    {
-      int64_t avgRows =
-          totalPayloadsSent_ > 0 ? totalRowsSent_ / totalPayloadsSent_ : 0;
-      VLOG(1) << "[OUTPUT-STATS] task=" << (task_ ? task_->taskId() : "n/a")
-              << " totalRows=" << totalRowsSent_
-              << " chunks=" << totalPayloadsSent_
-              << " avgRowsPerChunk=" << avgRows
-              << " totalBytes=" << totalBytesSent_;
-    }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
         queue->enqueueBack(nullptr);

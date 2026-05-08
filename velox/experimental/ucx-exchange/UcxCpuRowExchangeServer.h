@@ -20,7 +20,6 @@
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
-#include <chrono>
 #include <memory>
 #include "velox/common/Enums.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -121,17 +120,6 @@ class UcxCpuRowExchangeServer
   bool waitingForData_{false};
   bool finalMetadataSent_{false};
   bool finalMetadataCompleted_{false};
-
-  std::chrono::steady_clock::time_point firstPayloadTime_;
-  std::chrono::steady_clock::time_point lastPayloadTime_;
-  std::chrono::steady_clock::time_point finalMetadataSendTime_;
-  std::chrono::steady_clock::time_point lastSendCompleteTime_;
-
-  int64_t bundlesStarted_{0};
-  int64_t bundlesCompleted_{0};
-  int64_t payloadBytesStarted_{0};
-  int64_t payloadBytesCompleted_{0};
-  int64_t chunksStarted_{0};
 
   // The Request owns its callback closure; completed UCXX requests are
   // kept for the server lifetime because UCP wireup-replay can invoke

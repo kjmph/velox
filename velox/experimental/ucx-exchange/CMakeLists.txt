@@ -40,6 +40,8 @@ set(
 # compiled when VELOX_ENABLE_CUDF is on.
 set(
   UCX_EXCHANGE_CUDF_SOURCES
+  UcxCudfOutputQueueManagerBridge.cpp
+  UcxCudfDriverAdapter.cpp
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp
   UcxQueues.cpp

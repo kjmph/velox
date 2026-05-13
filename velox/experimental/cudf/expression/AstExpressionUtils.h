@@ -38,6 +38,8 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <sstream>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -458,6 +460,30 @@ inline bool hasNonAstSubexprSpanningBothSides(
   return false;
 }
 
+std::string rowTypeDebugString(const RowTypePtr& rowType) {
+  std::ostringstream out;
+  out << "[";
+  for (auto i = 0UL; i < rowType->size(); ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << rowType->nameOf(i) << ":" << rowType->childAt(i)->toString();
+  }
+  out << "]";
+  return out.str();
+}
+
+std::string rowSchemasDebugString(const std::vector<RowTypePtr>& rowTypes) {
+  std::ostringstream out;
+  for (auto i = 0UL; i < rowTypes.size(); ++i) {
+    if (i > 0) {
+      out << "; ";
+    }
+    out << "side " << i << " " << rowTypeDebugString(rowTypes[i]);
+  }
+  return out.str();
+}
+
 // get nested column indices
 std::vector<int> getNestedColumnIndices(
     const TypePtr& rowType,
@@ -509,7 +535,11 @@ cudf::ast::expression const& AstContext::addPrecomputeInstruction(
           sideIdx, columnIndex, instruction, fieldName, node);
     }
   }
-  VELOX_FAIL("Field not found: {}", name);
+  VELOX_FAIL(
+      "Field not found: {}. rootExpr: {}. inputSchemas: {}",
+      name,
+      rootExpr ? rootExpr->toString() : "<null>",
+      rowSchemasDebugString(inputRowSchema));
 }
 
 /// Handles logical AND/OR expressions with multiple inputs by converting them
@@ -703,7 +733,13 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         }
       }
     }
-    VELOX_FAIL("Field not found: {}", name);
+    VELOX_FAIL(
+        "Field not found: {}. fieldName: {}. expr: {}. rootExpr: {}. inputSchemas: {}",
+        name,
+        fieldName,
+        expr ? expr->toString() : "<null>",
+        rootExpr ? rootExpr->toString() : "<null>",
+        rowSchemasDebugString(inputRowSchema));
   } else {
     VELOX_UNREACHABLE("Unsupported expression: {}", name);
   }

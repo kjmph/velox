@@ -17,10 +17,27 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
+#include <string>
 
 #include "velox/common/time/Timer.h"
 
 namespace facebook::velox::ucx_exchange {
+namespace {
+
+int64_t saturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
+  constexpr uint64_t kMax =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  if (lhs == 0 || rhs == 0) {
+    return 0;
+  }
+  if (lhs > kMax / rhs) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  return static_cast<int64_t>(lhs * rhs);
+}
+
+} // namespace
 
 void UcxCpuRowDestinationQueue::Stats::recordEnqueue(
     const UcxCpuRowPayload* payload) {
@@ -293,14 +310,17 @@ bool UcxCpuRowOutputQueue::checkBlocked(ContinueFuture* future) {
     std::lock_guard<std::mutex> l(mutex_);
     reconcileQueuedStatsLocked("checkBlocked");
     maybeUnblockProducersLocked(promises);
-    if (queuedBytes_ >= maxSize_) {
+    const auto highWaterMark = highWaterMarkLocked();
+    if (queuedBytes_ >= highWaterMark) {
       if (future == nullptr) {
         blocked = true;
       } else {
         VLOG(3) << "[BACKPRESSURE-CPU] task="
                 << (task_ ? task_->taskId() : "n/a")
                 << " BLOCKED queuedBytes=" << queuedBytes_
-                << " maxSize=" << maxSize_
+                << " highWaterMark=" << highWaterMark
+                << " baseMaxSize=" << maxSize_
+                << " backpressureFanout=" << backpressureFanoutLocked()
                 << " waitingProducers=" << (promises_.size() + 1);
         promises_.emplace_back("UcxCpuRowOutputQueue::checkBlocked");
         *future = promises_.back().getSemiFuture();
@@ -565,8 +585,6 @@ void UcxCpuRowOutputQueue::updateOutputBuffers(
   }
 
   if (isFinished && task_) {
-    VLOG(1) << "[OUTPUT-DRAIN-CPU] task=" << task_->taskId()
-            << " event=all-output-consumed updateOutputBuffers";
     task_->setAllOutputConsumed();
   }
 }
@@ -598,12 +616,6 @@ void UcxCpuRowOutputQueue::deleteResults(int destination) {
     finishedBufferStats_[destination] = queue->stats().toOutputBufferStats();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
-    VLOG(1) << "[OUTPUT-DRAIN-CPU] task=" << (task_ ? task_->taskId() : "n/a")
-            << " destination=" << destination
-            << " event=delete-results bytes=" << bytes
-            << " payloads=" << payloads << " isFinished=" << isFinished
-            << " queuedBytes=" << queuedBytes_
-            << " queuedPayloads=" << queuedPayloads_;
     updateStatsWithFreedLocked(bytes, payloads, promises);
   }
 
@@ -613,8 +625,6 @@ void UcxCpuRowOutputQueue::deleteResults(int destination) {
   }
 
   if (isFinished && task_) {
-    VLOG(1) << "[OUTPUT-DRAIN-CPU] task=" << task_->taskId()
-            << " event=all-output-consumed deleteResults";
     task_->setAllOutputConsumed();
   }
 }
@@ -798,11 +808,14 @@ void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char* reason) {
 
 void UcxCpuRowOutputQueue::maybeUnblockProducersLocked(
     std::vector<ContinuePromise>& promises) {
-  if (queuedBytes_ <= continueSize_ && !promises_.empty()) {
+  const auto lowWaterMark = lowWaterMarkLocked();
+  if (queuedBytes_ <= lowWaterMark && !promises_.empty()) {
     VLOG(3) << "[BACKPRESSURE-CPU] task=" << (task_ ? task_->taskId() : "n/a")
             << " UNBLOCKING " << promises_.size() << " producers"
             << " queuedBytes=" << queuedBytes_
-            << " continueSize=" << continueSize_;
+            << " lowWaterMark=" << lowWaterMark
+            << " baseContinueSize=" << continueSize_
+            << " backpressureFanout=" << backpressureFanoutLocked();
     promises = std::move(promises_);
   }
 }
@@ -821,6 +834,34 @@ int64_t UcxCpuRowOutputQueue::getAverageQueueTimeMsLocked() const {
     return totalQueuedBytesMs_ / totalBytesSent_;
   }
   return 0;
+}
+
+int64_t UcxCpuRowOutputQueue::backpressureFanoutLocked() const {
+  if (kind_ != core::PartitionedOutputNode::Kind::kBroadcast) {
+    return 1;
+  }
+
+  // Broadcast enqueues the same shared payload into each destination queue.
+  // queuedBytes_ is still tracked per destination so dequeue/delete accounting
+  // stays symmetric, but backpressure should be applied to physical retained
+  // payload bytes, not to the fanout-inflated logical byte count.
+  uint64_t fanout = 0;
+  for (const auto& queue : queues_) {
+    if (queue != nullptr) {
+      ++fanout;
+    }
+  }
+  return static_cast<int64_t>(std::max<uint64_t>(fanout, 1));
+}
+
+int64_t UcxCpuRowOutputQueue::highWaterMarkLocked() const {
+  return saturatingMultiplyToInt64(
+      maxSize_, static_cast<uint64_t>(backpressureFanoutLocked()));
+}
+
+int64_t UcxCpuRowOutputQueue::lowWaterMarkLocked() const {
+  return saturatingMultiplyToInt64(
+      continueSize_, static_cast<uint64_t>(backpressureFanoutLocked()));
 }
 
 std::string UcxCpuRowOutputQueue::toString() {

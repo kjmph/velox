@@ -30,8 +30,9 @@ class UcxPartitionedOutput : public exec::Operator,
                              public cudf_velox::NvtxHelper {
  public:
   // Default minimum rows to accumulate before flushing. Matches HTTP
-  // PartitionedOutput's ~10,000 row target. Overridable via
-  // QueryConfig::kUcxPartitionedOutputBatchRows.
+  // PartitionedOutput's ~10,000 row target. The cudf exchange system property
+  // provides the cluster default; QueryConfig::kUcxPartitionedOutputBatchRows
+  // can override it per query.
   static constexpr int64_t kDefaultTargetRowsPerChunk = 10'000;
 
   UcxPartitionedOutput(

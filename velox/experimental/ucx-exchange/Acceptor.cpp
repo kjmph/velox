@@ -65,7 +65,7 @@ void Acceptor::cStyleAMCallback(
   // when multiple Docker containers share the same host IP address.
   bool isIntraNodeTransfer =
       cudf_velox::CudfConfig::getInstance().intraNodeExchange &&
-      (handshakePtr->workerId == communicator->getWorkerId());
+      handshakePtr->workerId == communicator->getWorkerId();
 
   // Disable intra-node when the task is not yet initialized (placeholder
   // queue from sinks connecting before initializeTask) or when the task

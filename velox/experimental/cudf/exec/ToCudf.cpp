@@ -151,9 +151,8 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
 
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
-      replaceOp.push_back(
-          std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+      replaceOp.push_back(std::make_unique<CudfFromVelox>(
+          id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.
@@ -205,9 +204,8 @@ bool CompileState::compile(bool allowCpuFallback) {
 
     if (thisOpProps.producesGpuOutput and
         (nextOperatorIsNotGpu or isLastOperatorOfTask) and planNode) {
-      replaceOp.push_back(
-          std::make_unique<CudfToVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
+      replaceOp.push_back(std::make_unique<CudfToVelox>(
+          id, planNode->outputType(), ctx, planNode->id() + "-to-velox"));
     }
 
     if (debugEnabled) {
@@ -253,16 +251,16 @@ bool CompileState::compile(bool allowCpuFallback) {
 
   if (debugEnabled) {
     // Print before/after together for easy comparison.
-    LOG(INFO) << "Operators " << "before adapting for cuDF"
-              << ": count [" << beforeOperators.size() << "]";
+    LOG(INFO) << "Operators " << "before adapting for cuDF" << ": count ["
+              << beforeOperators.size() << "]";
     for (const auto& [id, desc] : beforeOperators) {
       LOG(INFO) << "  Operator: ID " << id << ": " << desc;
     }
     LOG(INFO) << "allowCpuFallback = " << allowCpuFallback;
 
     operators = driver_.operators();
-    LOG(INFO) << "Operators " << "after adapting for cuDF"
-              << ": count [" << operators.size() << "]";
+    LOG(INFO) << "Operators " << "after adapting for cuDF" << ": count ["
+              << operators.size() << "]";
     for (const auto& op : operators) {
       LOG(INFO) << "  Operator: ID " << op->operatorId() << ": "
                 << op->toString();
@@ -392,6 +390,28 @@ void CudfConfig::initialize(
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
+  }
+  if (config.find(kCudfExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kCudfExchange]);
+  }
+  if (config.find(kCudfExchangeServerPort) != config.end()) {
+    exchangeServerPort = folly::to<int32_t>(config[kCudfExchangeServerPort]);
+  }
+  if (config.find(kCudfIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kCudfIntraNodeExchange]);
+  }
+  if (config.find(kCudfPartitionedOutputBatchRows) != config.end()) {
+    partitionedOutputBatchRows =
+        folly::to<int64_t>(config[kCudfPartitionedOutputBatchRows]);
+  }
+  if (config.find(kCudfExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kCudfExchangeLogLevel]);
+  }
+  if (config.find(kCudfUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kCudfUcxxBlockingPolling]);
+  }
+  if (config.find(kCudfUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kCudfUcxxErrorHandling]);
   }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];

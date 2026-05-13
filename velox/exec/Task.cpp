@@ -41,6 +41,9 @@
 #include "velox/exec/Task.h"
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
 #include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
+#ifdef VELOX_ENABLE_CUDF
+#include "velox/experimental/ucx-exchange/UcxCudfOutputQueueManagerBridge.h"
+#endif
 #endif
 
 using facebook::velox::common::testutil::TestValue;
@@ -1204,9 +1207,8 @@ void Task::initializePartitionOutput() {
     // Mirror the OutputBufferManager initialization for the CPU-row UCX
     // queue manager so UcxCpuRowPartitionedOutput has a queue to enqueue
     // into. The IBM ibm-research-preview branch does the same for the
-    // cudf path (gated on cudf.exchange); for the CPU path we always
-    // initialize when the library is compiled in. The queue is just a
-    // map entry, harmless if our DriverAdapter never fires.
+    // cudf path; initializing both maps is harmless if the DriverAdapters
+    // never fire.
     {
       auto cpuQueueMgr = facebook::velox::ucx_exchange::
           UcxCpuRowOutputQueueManager::getInstanceRef();
@@ -1216,6 +1218,15 @@ void Task::initializePartitionOutput() {
           partitionedOutputNode->numPartitions(),
           numOutputDrivers);
     }
+#ifdef VELOX_ENABLE_CUDF
+    {
+      facebook::velox::ucx_exchange::initializeCudfUcxOutputQueueManagerTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
+#endif
 #endif
   }
 }
@@ -2228,6 +2239,12 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
         UcxCpuRowOutputQueueManager::getInstanceRef();
     cpuQueueMgr->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
   }
+#ifdef VELOX_ENABLE_CUDF
+  {
+    facebook::velox::ucx_exchange::updateCudfUcxOutputBuffers(
+        taskId_, numBuffers, noMoreBuffers);
+  }
+#endif
 #endif
   return result;
 }
@@ -2742,6 +2759,20 @@ void Task::maybeRemoveFromOutputBufferManager() {
       }
       cpuQueueMgr->removeTask(taskId_);
     }
+#ifdef VELOX_ENABLE_CUDF
+    {
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats =
+            facebook::velox::ucx_exchange::cudfUcxOutputQueueStats(taskId_);
+        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      facebook::velox::ucx_exchange::removeCudfUcxOutputQueueManagerTask(
+          taskId_);
+    }
+#endif
 #endif
   }
 }

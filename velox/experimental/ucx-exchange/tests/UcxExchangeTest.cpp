@@ -50,6 +50,25 @@ using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
 
+namespace {
+
+class ScopedCudfIntraNodeExchange {
+ public:
+  explicit ScopedCudfIntraNodeExchange(bool enabled)
+      : original_(cudf_velox::CudfConfig::getInstance().intraNodeExchange) {
+    cudf_velox::CudfConfig::getInstance().intraNodeExchange = enabled;
+  }
+
+  ~ScopedCudfIntraNodeExchange() {
+    cudf_velox::CudfConfig::getInstance().intraNodeExchange = original_;
+  }
+
+ private:
+  bool original_;
+};
+
+} // namespace
+
 struct ExchangeTestParams {
   int numSrcDrivers;
   int numDstDrivers;
@@ -918,9 +937,7 @@ TEST_P(UcxExchangeTest, broadcastIntraNodeFallback) {
   }
 
   // Enable intra-node exchange so the Acceptor's broadcast guard is exercised.
-  auto& config = cudf_velox::CudfConfig::getInstance();
-  const bool origIntraNode = config.intraNodeExchange;
-  config.intraNodeExchange = true;
+  ScopedCudfIntraNodeExchange intraNodeExchange(true);
 
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "broadcastSrc";
@@ -982,9 +999,7 @@ TEST_P(UcxExchangeTest, broadcastIntraNodeFallback) {
         << "Sink " << i << " row count mismatch";
   }
 
-  // Cleanup.
   queueManager_->removeTask(srcTaskId);
-  config.intraNodeExchange = origIntraNode;
 }
 
 // Regression test for broadcast + intra-node placeholder race condition.
@@ -1007,9 +1022,7 @@ TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
   }
 
   // Enable intra-node exchange so the race condition can manifest.
-  auto& config = cudf_velox::CudfConfig::getInstance();
-  const bool origIntraNode = config.intraNodeExchange;
-  config.intraNodeExchange = true;
+  ScopedCudfIntraNodeExchange intraNodeExchange(true);
 
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "broadcastPlaceholderSrc";
@@ -1079,7 +1092,6 @@ TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
 
   // Cleanup.
   queueManager_->removeTask(srcTaskId);
-  config.intraNodeExchange = origIntraNode;
 }
 
 // Test that UcxPartitionedOutput's batch accumulation correctly merges many
@@ -1399,9 +1411,7 @@ TEST_P(UcxExchangeTest, deferredRequestCleanupOnTaskAbort) {
   }
 
   // Ensure intra-node is disabled so we exercise the UCXX path (tagRecv).
-  auto& config = cudf_velox::CudfConfig::getInstance();
-  const bool origIntraNode = config.intraNodeExchange;
-  config.intraNodeExchange = false;
+  ScopedCudfIntraNodeExchange intraNodeExchange(false);
 
   const std::string taskPrefix = getUniqueTaskPrefix();
   const std::string srcTaskId = taskPrefix + "srcActiveTransfer";
@@ -1472,8 +1482,6 @@ TEST_P(UcxExchangeTest, deferredRequestCleanupOnTaskAbort) {
 
   // If we reach here without crashing, the deferred cleanup is working.
   VLOG(0) << "deferredRequestCleanupOnTaskAbort: completed without crash";
-
-  config.intraNodeExchange = origIntraNode;
 }
 
 std::shared_ptr<UcxOutputQueueManager> UcxExchangeTest::queueManager_;

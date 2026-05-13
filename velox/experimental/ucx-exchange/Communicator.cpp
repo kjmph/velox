@@ -82,6 +82,17 @@ bool readBoolEnv(const char* name, bool defaultValue) {
                << "; expected 0 or 1";
   return defaultValue;
 }
+
+bool readBoolEnv(
+    const char* primaryName,
+    const char* fallbackName,
+    bool defaultValue) {
+  if (const char* env = std::getenv(primaryName);
+      env != nullptr && *env != '\0') {
+    return readBoolEnv(primaryName, defaultValue);
+  }
+  return readBoolEnv(fallbackName, defaultValue);
+}
 #endif
 
 // Number of progress threads (primary + auxiliaries). Configurable via
@@ -94,18 +105,13 @@ int progressThreadCount() {
 }
 } // namespace
 
-#ifdef VELOX_ENABLE_CUDF
-using namespace facebook::velox::cudf_velox;
-#endif
-
 namespace facebook::velox::ucx_exchange {
 
 namespace {
-// Config knobs that the cudf path reads from CudfConfig. CPU-only
-// builds use these defaults so the foundational Communicator code can
-// run without a CudfConfig dependency. The CPU log level can be
-// overridden via the VELOX_UCX_LOG_LEVEL env var (set to e.g. 2 for
-// state-machine traces).
+// Config knobs used by both the cudf and CPU-row exchange paths. cudf builds
+// use CudfConfig so existing config.properties continue to control UCX
+// exchange. CPU-only builds do not compile CudfConfig, so keep env overrides
+// for low-level transport diagnostics there.
 struct UcxConfigView {
 #ifdef VELOX_ENABLE_CUDF
   static int exchangeLogLevel() {
@@ -122,10 +128,11 @@ struct UcxConfigView {
     return readIntEnv("VELOX_UCX_LOG_LEVEL", 0, 0, 10);
   }
   static bool ucxxBlockingPolling() {
-    return false;
+    return readBoolEnv("VELOX_UCX_BLOCKING_POLLING", false);
   }
   static bool ucxxErrorHandling() {
-    return readBoolEnv("VELOX_UCX_CPU_ERROR_HANDLING", true);
+    return readBoolEnv(
+        "VELOX_UCX_ERROR_HANDLING", "VELOX_UCX_CPU_ERROR_HANDLING", true);
   }
 #endif
 };

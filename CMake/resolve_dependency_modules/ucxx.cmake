@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Standalone fetch of ucxx for CPU-only builds.
+# Standalone fetch of ucxx for UCX exchange builds.
 #
-# In cudf builds, ucxx is pulled in transitively by cudf.cmake's
-# FetchContent_MakeAvailable(cudf). When cudf is off but
-# VELOX_ENABLE_UCX_EXCHANGE is on, we still need
-# the `ucxx::ucxx` target, so this module fetches just rapids-cmake +
-# ucxx and skips the heavy rmm/cudf chain. Versions are matched against
-# the cuDF 26.06 dependency set (ucxx 0.45.01, rapids-cmake 26.06).
+# Some cudf builds pull ucxx transitively, but UCX exchange always needs the
+# `ucxx::ucxx` target. This module fetches just rapids-cmake + ucxx and skips
+# the heavy rmm/cudf chain. Versions are matched against the cuDF 26.06
+# dependency set (ucxx 0.45.01, rapids-cmake 26.06).
 
 include_guard(GLOBAL)
 

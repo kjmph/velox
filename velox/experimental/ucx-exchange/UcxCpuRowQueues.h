@@ -256,6 +256,9 @@ class UcxCpuRowOutputQueue
   void maybeUnblockProducersLocked(std::vector<ContinuePromise>& promises);
   void updateTotalQueuedBytesMsLocked();
   int64_t getAverageQueueTimeMsLocked() const;
+  int64_t backpressureFanoutLocked() const;
+  int64_t highWaterMarkLocked() const;
+  int64_t lowWaterMarkLocked() const;
 
   void noMoreDrivers();
   void checkIfDone(bool oneDriverFinished);

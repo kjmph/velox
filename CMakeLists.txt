@@ -525,10 +525,9 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   endif()
 endif()
 
-# Standalone ucxx fetch for CPU UCX-row exchange. The cudf path above
-# already pulls ucxx in transitively, so we only run this when
-# VELOX_ENABLE_UCX_EXCHANGE is on but cudf is off.
-if(VELOX_ENABLE_UCX_EXCHANGE AND NOT VELOX_ENABLE_CUDF)
+# UCX exchange links ucxx::ucxx. Some cudf configurations create this target
+# transitively, but bundled cudf builds do not, so fetch ucxx when needed.
+if(VELOX_ENABLE_UCX_EXCHANGE AND NOT TARGET ucxx::ucxx)
   velox_set_source(ucxx)
   velox_resolve_dependency(ucxx)
 endif()

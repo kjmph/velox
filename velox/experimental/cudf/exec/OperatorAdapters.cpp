@@ -35,6 +35,7 @@
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/memory/Memory.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
@@ -52,8 +53,65 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
+#include "velox/type/TypeUtil.h"
+
+#include <sstream>
 
 namespace facebook::velox::cudf_velox {
+
+namespace {
+
+std::string adapterRowTypeDebugString(const RowTypePtr& rowType) {
+  std::ostringstream out;
+  out << "[";
+  for (auto i = 0UL; i < rowType->size(); ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    out << rowType->nameOf(i) << ":" << rowType->childAt(i)->toString();
+  }
+  out << "]";
+  return out.str();
+}
+
+bool canCompileCudfExpressions(
+    std::vector<core::TypedExprPtr> typedExprs,
+    const RowTypePtr& inputType,
+    exec::DriverCtx* ctx,
+    const std::string& context,
+    const core::PlanNodeId& planNodeId) {
+  if (typedExprs.empty()) {
+    return true;
+  }
+
+  auto precompilePool =
+      memory::memoryManager()->addLeafPool("", /*threadSafe*/ false);
+  core::ExecCtx precompileCtx(
+      precompilePool.get(), ctx->task->queryCtx().get());
+  bool lazyDereference = false;
+  auto exprSet = exec::makeExprSetFromFlag(
+      std::move(typedExprs), &precompileCtx, lazyDereference);
+
+  for (const auto& expr : exprSet->exprs()) {
+    try {
+      auto compiled = createCudfExpression(expr, inputType);
+      (void)compiled;
+    } catch (const std::exception& e) {
+      LOG_FALLBACK(
+          "{} cannot be compiled by cuDF, PlanNode id: {}, expr: {}, inputType: {}, error: {}",
+          context,
+          planNodeId,
+          expr->toString(),
+          adapterRowTypeDebugString(inputType),
+          e.what());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+} // namespace
 
 /// OperatorAdapterRegistry Implementation
 OperatorAdapterRegistry& OperatorAdapterRegistry::getInstance() {
@@ -189,6 +247,19 @@ class FilterProjectAdapter : public OperatorAdapter {
       }
     }
 
+    const auto inputType = projectPlanNode
+        ? projectPlanNode->sources()[0]->outputType()
+        : filterNode->sources()[0]->outputType();
+    if (filterNode &&
+        !canCompileCudfExpressions(
+            {filterNode->filter()},
+            inputType,
+            ctx,
+            "FilterProject filter",
+            planNode->id())) {
+      return false;
+    }
+
     // Check projects separately
     if (projectPlanNode) {
       if (!canBeEvaluatedByCudf(
@@ -196,6 +267,14 @@ class FilterProjectAdapter : public OperatorAdapter {
         LOG_FALLBACK(
             "FilterProject projections cannot be evaluated by cuDF, PlanNode id: {}",
             planNode->id());
+        return false;
+      }
+      if (!canCompileCudfExpressions(
+              projectPlanNode->projections(),
+              inputType,
+              ctx,
+              "FilterProject projection",
+              planNode->id())) {
         return false;
       }
     }
@@ -221,9 +300,8 @@ class FilterProjectAdapter : public OperatorAdapter {
     auto filterPlanNode = filterProjectOp->filterNode();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfFilterProject>(
-            operatorId, ctx, filterPlanNode, projectPlanNode));
+    result.push_back(std::make_unique<CudfFilterProject>(
+        operatorId, ctx, filterPlanNode, projectPlanNode));
     return result;
   }
 };
@@ -289,9 +367,8 @@ class AggregationAdapter : public OperatorAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     if (CudfConfig::getInstance().concatOptimizationEnabled) {
-      result.push_back(
-          std::make_unique<CudfBatchConcat>(
-              operatorId, ctx, aggregationPlanNode));
+      result.push_back(std::make_unique<CudfBatchConcat>(
+          operatorId, ctx, aggregationPlanNode));
     }
     if (isGlobal) {
       result.push_back(
@@ -360,6 +437,18 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
         LOG_FALLBACK(
             "HashJoin join filter cannot be evaluated by cuDF, PlanNode id: {}",
             planNode->id());
+        return false;
+      }
+      std::vector<RowTypePtr> filterRowTypes{
+          joinPlanNode->sources()[0]->outputType(),
+          joinPlanNode->sources()[1]->outputType()};
+      const auto filterInputType = type::concatRowTypes(filterRowTypes);
+      if (!canCompileCudfExpressions(
+              {joinPlanNode->filter()},
+              filterInputType,
+              ctx,
+              "HashJoin filter",
+              planNode->id())) {
         return false;
       }
     }
@@ -595,9 +684,8 @@ class LocalPartitionAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfLocalPartition>(
-            operatorId, ctx, localPartitionPlanNode));
+    result.push_back(std::make_unique<CudfLocalPartition>(
+        operatorId, ctx, localPartitionPlanNode));
     return result;
   }
 
@@ -643,6 +731,82 @@ class LocalExchangeAdapter : public OperatorAdapter {
   }
 };
 
+/// CudfUcxExchangeAdapter - Keeps the UCX exchange source operator. The
+/// CudfUcx DriverAdapter installs this before this adapter runs.
+class CudfUcxExchangeAdapter : public OperatorAdapter {
+ public:
+  CudfUcxExchangeAdapter() : OperatorAdapter("CudfUcxExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->operatorType() == "UcxExchange";
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// CudfUcxPartitionedOutputAdapter - Keeps the UCX partitioned output sink.
+class CudfUcxPartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  CudfUcxPartitionedOutputAdapter()
+      : OperatorAdapter("CudfUcxPartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->operatorType() == "cudfPartitionedOutput";
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
 /// AssignUniqueIdAdapter - Replaces with CudfAssignUniqueId
 class AssignUniqueIdAdapter : public OperatorAdapter {
  public:
@@ -677,13 +841,12 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfAssignUniqueId>(
-            operatorId,
-            ctx,
-            assignUniqueIdPlanNode,
-            assignUniqueIdPlanNode->taskUniqueId(),
-            assignUniqueIdPlanNode->uniqueIdCounter()));
+    result.push_back(std::make_unique<CudfAssignUniqueId>(
+        operatorId,
+        ctx,
+        assignUniqueIdPlanNode,
+        assignUniqueIdPlanNode->taskUniqueId(),
+        assignUniqueIdPlanNode->uniqueIdCounter()));
     return result;
   }
 };
@@ -762,9 +925,8 @@ class MarkDistinctAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfMarkDistinct>(
-            operatorId, ctx, markDistinctPlanNode));
+    result.push_back(std::make_unique<CudfMarkDistinct>(
+        operatorId, ctx, markDistinctPlanNode));
     return result;
   }
 };
@@ -803,9 +965,8 @@ class EnforceSingleRowAdapter : public OperatorAdapter {
         std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfEnforceSingleRow>(
-            operatorId, ctx, enforceSingleRowPlanNode));
+    result.push_back(std::make_unique<CudfEnforceSingleRow>(
+        operatorId, ctx, enforceSingleRowPlanNode));
     return result;
   }
 };
@@ -868,6 +1029,8 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LimitAdapter>());
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<CudfUcxExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<CudfUcxPartitionedOutputAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
   registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
   registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());

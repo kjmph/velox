@@ -30,6 +30,7 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <thread>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -95,13 +96,11 @@ bool readBoolEnv(
 }
 #endif
 
-// Number of progress threads (primary + auxiliaries). Configurable via
-// VELOX_UCX_NUM_PROGRESS_THREADS; default 4. The CPU-row exchange posts
-// UCX completions back into per-element state-event queues, so multiple
-// progress threads can advance UCX without concurrently mutating the
-// same source/server state machine.
-int progressThreadCount() {
-  return readIntEnv("VELOX_UCX_NUM_PROGRESS_THREADS", 4, 1, 64);
+int maxWorkItemsPerDrain() {
+  static const int value =
+      readIntEnv(
+          "VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN", 64, 1, 1 << 20);
+  return value;
 }
 } // namespace
 
@@ -251,15 +250,14 @@ Communicator::~Communicator() {
   // Note: worker_->flush() was removed - it only applies to RMA (Remote Memory
   // Access) operations like ucp_put/ucp_get, which this code doesn't use.
   // This code only uses tag send/recv and active messages.
-  worker_->progressWorkerEvent(100);
   worker_.reset();
   context_.reset();
   VLOG(3) << "Communicator destructed";
 }
 
 /// @brief Run doesn't return until stop() is called.
-/// All operations of the communicator will be carried out in the thread
-/// that calls run.
+/// The thread that calls run owns communicator state dispatch. UCX worker
+/// progress is owned by the dedicated progress thread started by run().
 void Communicator::run() {
   VLOG(3) << "Using error handling mode: " << UcxConfigView::ucxxErrorHandling()
           << std::endl;
@@ -275,21 +273,26 @@ void Communicator::run() {
       cudaStatus == cudaSuccess,
       "Failed to initialize CUDA context: {}",
       cudaGetErrorString(cudaStatus));
+  int cudaDevice = 0;
+  cudaStatus = cudaGetDevice(&cudaDevice);
+  VELOX_CHECK(
+      cudaStatus == cudaSuccess,
+      "Failed to get CUDA device: {} ({})",
+      static_cast<int>(cudaStatus),
+      cudaGetErrorString(cudaStatus));
 #endif
 
   // create the UCXX context, worker, listener-context etc.
   if (UcxConfigView::ucxxBlockingPolling()) {
     context_ = ucxx::createContext({}, ucxx::Context::defaultFeatureFlags);
   } else {
-    context_ = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_AM);
+    // Keep wakeup enabled so external signals can interrupt a blocking worker
+    // and so ucxx can wake the progress thread when needed.
+    context_ = ucxx::createContext(
+        {}, UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_WAKEUP);
   }
 
-  worker_ = context_->createWorker();
-
-  if (UcxConfigView::ucxxBlockingPolling()) {
-    // Communicator is using blocking progress mode.
-    worker_->initBlockingProgressMode();
-  }
+  worker_ = context_->createWorker(false);
 
   listener_ = worker_->createListener(
       port_, Communicator::cStyleListenerCallback, this);
@@ -309,33 +312,36 @@ void Communicator::run() {
   worker_->registerAmReceiverCallback(
       cpuInfo, &UcxCpuRowAcceptor::cStyleAMCallback);
 
-  // Spawn auxiliary progress threads. The thread that called run() is
-  // primary and owns CommElement::process() / state-machine dispatch. Aux
-  // threads only progress UCX so callbacks fire promptly; callback handlers
-  // enqueue state events back to the primary-owned work queue.
-  const int numProgressThreads = progressThreadCount();
-  LOG(INFO) << "Communicator spawning " << (numProgressThreads - 1)
-            << " auxiliary progress threads (total=" << numProgressThreads
-            << ")";
-  auxThreads_.reserve(std::max(0, numProgressThreads - 1));
-  for (int i = 1; i < numProgressThreads; ++i) {
-    auxThreads_.emplace_back([this, i]() {
-      while (running_.load(std::memory_order_acquire)) {
-        try {
-          worker_->progress();
-          std::this_thread::yield();
-        } catch (const std::exception& e) {
-          LOG(ERROR) << "Aux progress thread " << i << " caught: " << e.what();
-        }
-      }
-      VLOG(3) << "Aux progress thread " << i << " exiting";
-    });
-  }
+  // The thread that called run() owns CommElement::process() /
+  // state-machine dispatch. The UCXX progress thread owns worker progress and
+  // callback execution so callbacks have one producer thread.
+  const bool blockingMode = UcxConfigView::ucxxBlockingPolling();
+  LOG(INFO) << "Communicator starting one UCXX progress thread "
+            << "(maxWorkItemsPerDrain=" << maxWorkItemsPerDrain() << ")";
+#ifdef VELOX_ENABLE_CUDF
+  worker_->setProgressThreadStartCallback(
+      [](void* arg) {
+        const int device = *static_cast<int*>(arg);
+        auto cudaStatus = cudaSetDevice(device);
+        VELOX_CHECK(
+            cudaStatus == cudaSuccess,
+            "Failed to set CUDA device on UCXX progress thread: {} ({})",
+            static_cast<int>(cudaStatus),
+            cudaGetErrorString(cudaStatus));
+        cudaStatus = cudaFree(0);
+        VELOX_CHECK(
+            cudaStatus == cudaSuccess,
+            "Failed to initialize CUDA context on UCXX progress thread: {} ({})",
+            static_cast<int>(cudaStatus),
+            cudaGetErrorString(cudaStatus));
+      },
+      &cudaDevice);
+#endif
+  worker_->startProgressThread(!blockingMode, blockingMode ? 0 : 1);
 
   promise_.setValue();
 
   VLOG(3) << "Communicator running.";
-  const bool blockingMode = UcxConfigView::ucxxBlockingPolling();
   while (running_) {
     try {
       // Periodic heartbeat for diagnostic logging.
@@ -406,15 +412,15 @@ void Communicator::run() {
         removeEndpointRef(ep);
       }
 
-      // Drain primary-thread work and progress UCX. Auxiliary threads only
-      // call worker_->progress().
-      drainWorkAndProgress();
+      // Drain primary-thread work. The UCXX progress thread is the only
+      // thread that progresses the worker.
+      drainWorkQueue();
 
       // Clean up deferred requests that UCX has fully processed.
       // These are cancelled requests whose GPU buffers needed to stay
       // alive until UCX finished any in-flight operations on them.
-      // Only the primary thread touches this list (aux threads only
-      // append to it via deferRequestCleanup, under the mutex).
+      // The communicator thread sweeps this list; UCX callbacks append to it
+      // via deferRequestCleanup(), under the mutex.
       {
         std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
         if (!deferredRequests_.empty()) {
@@ -426,16 +432,7 @@ void Communicator::run() {
               deferredRequests_.end());
         }
       }
-
-      // All queues are drained. Now wait for UCXX network events.
-      // In blocking mode, this will block until a UCXX event arrives
-      // or worker_->signal() is called (from addToWorkQueue,
-      // deferEndpointCleanup, or stop).
-      if (blockingMode) {
-        worker_->progressWorkerEvent(0);
-      } else {
-        worker_->progress();
-      }
+      std::this_thread::yield();
     } catch (ucxx::IOError& e) {
       LOG(ERROR) << "In Communicator main loop UCXX Exception: " << e.what();
       throw;
@@ -443,27 +440,24 @@ void Communicator::run() {
   }
   VLOG(3) << "Communicator stopping.";
 
-  // Join auxiliary progress threads. They exit when running_ flips
-  // to false (set by stop()) and get a moment to finish their
-  // current iteration. Joining here (not in stop()) keeps the cleanup
-  // on the original primary thread.
-  for (auto& t : auxThreads_) {
-    if (t.joinable()) {
-      t.join();
-    }
+  if (worker_) {
+    worker_->stopProgressThread();
   }
-  auxThreads_.clear();
 }
 
 /// @brief Stops the communicator, called from an outside thread.
 void Communicator::stop() {
   running_.store(false);
   signalWorker();
-  // Only log fields that are safe to read from an outside thread.
-  // endpoints_ is only accessed from the Communicator thread, so reading
-  // it here would be a data race.
+  size_t elementsSize;
+  {
+    std::lock_guard<std::mutex> lock(elemMutex_);
+    elementsSize = elements_.size();
+  }
+  // endpoints_ is only accessed from the Communicator thread, so reading it
+  // here would be a data race.
   VLOG(3) << "In Communicator::stop "
-          << " elements_.size(): " << elements_.size()
+          << " elements_.size(): " << elementsSize
           << " workQueue_.size(): " << workQueue_.size();
 }
 
@@ -612,7 +606,10 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
 
 std::string Communicator::getWorkerAddress() const {
   VELOX_CHECK_NOT_NULL(worker_, "Communicator worker is not initialized");
-  auto address = worker_->getAddress();
+  std::shared_ptr<ucxx::Address> address;
+  const bool success = worker_->registerGenericPre(
+      [&]() { address = worker_->getAddress(); }, 3000000000);
+  VELOX_CHECK(success, "Timed out reading UCX worker address");
   VELOX_CHECK_NOT_NULL(address, "Communicator worker address is null");
   return address->getString();
 }
@@ -623,10 +620,9 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
           << Communicator::getInstance()->port_;
 
   // Close the endpoint if it's still alive.
-  // NOTE: This calls closeBlocking() which progresses the worker internally,
-  // which can fire listenerCallback() re-entrantly, hence the recursive mutex.
-  // This method must NOT be called from within a UCX callback.
-  // Use deferEndpointCleanup() from callbacks instead.
+  // With the UCXX progress thread running, closeBlocking() schedules close
+  // work on that thread and waits for completion. Do not call it from a UCX
+  // callback; callbacks defer cleanup to this communicator loop instead.
   if (ep->endpoint_ && ep->endpoint_->isAlive()) {
     VLOG(3) << "In Communicator::removeEndpointRef call closeBlocking";
     ep->endpoint_->closeBlocking();
@@ -657,13 +653,20 @@ void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
   }
 }
 
-void Communicator::drainWorkAndProgress() {
-  // Primary-thread work dispatch. Aux threads progress UCX only; they do
-  // not run CommElement::process(). Keep the try-lock path because close()
-  // can still race from driver / endpoint-cleanup paths.
+void Communicator::drainWorkQueue() {
+  // Primary-thread work dispatch. The UCXX progress thread does not run
+  // CommElement::process(). Keep the try-lock path because close() can
+  // still race from driver / endpoint-cleanup paths.
   std::vector<std::shared_ptr<CommElement>> deferred;
   bool anyProcessed = false;
-  while (auto comms = workQueue_.pop()) {
+  int poppedItems = 0;
+  while (poppedItems < maxWorkItemsPerDrain()) {
+    auto comms = workQueue_.pop();
+    if (!comms) {
+      break;
+    }
+    ++poppedItems;
+
     std::unique_lock<std::recursive_mutex> lock(
         comms->processMutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
@@ -677,9 +680,6 @@ void Communicator::drainWorkAndProgress() {
   for (auto& c : deferred) {
     workQueue_.push(std::move(c));
   }
-  // Always progress UCX. Without this, callbacks never fire and the
-  // lock-holder may not complete.
-  worker_->progress();
   // If the only thing we did this round was push deferred items back,
   // yield rather than spin; the lock-holder's progress (or another
   // thread's progress) needs CPU time to make forward motion.

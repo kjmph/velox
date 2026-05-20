@@ -64,8 +64,7 @@ class CommElement {
 
   /// Queue a state-machine event from an arbitrary thread. UCX callbacks
   /// use this to hand completion work back to process(), preserving the
-  /// single-owner state-machine invariant while still allowing multiple
-  /// UCX progress threads.
+  /// single-owner state-machine invariant.
   void enqueueStateEvent(std::shared_ptr<CommElement> self, StateEvent event);
 
   /// Runs pending events. Must be called by process() while processMutex_

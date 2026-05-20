@@ -26,7 +26,6 @@
 #include <set>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
@@ -154,8 +153,8 @@ class Communicator {
   /// @brief Defers cleanup of a cancelled UCXX request to the main loop.
   /// The request (and the GPU buffers it references via its arg) will be
   /// held alive until UCX has fully processed the cancellation.
-  /// Thread-safe: close paths may call this from driver threads or
-  /// communicator progress threads.
+  /// Thread-safe: close paths may call this from driver threads or the UCX
+  /// progress thread.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
 
   /// Returns the URL of the coordinator.
@@ -210,7 +209,7 @@ class Communicator {
   std::shared_ptr<ucxx::Listener> listener_;
   uint16_t port_;
   std::string coordinatorURL_;
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
   Acceptor acceptor_;
   ContinuePromise promise_{"Communicator::run"};
 
@@ -248,9 +247,8 @@ class Communicator {
   // Cross-host and unknown peers stay on endpoints_.
   std::map<std::string, std::shared_ptr<EndpointRef>> workerAddressEndpoints_;
 
-  // Signals the UCXX worker to wake up from a blocking
-  // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
-  // or if not in blocking progress mode.
+  // Signals the UCXX worker to wake up from blocking progress mode.
+  // Thread-safe. No-op if worker_ is null or if not in blocking progress mode.
   void signalWorker();
 
   // A random unique identifier for this Communicator instance (process).
@@ -264,27 +262,21 @@ class Communicator {
   uint32_t hostIdHash_{0};
 
   // Queue of endpoints that need cleanup, populated by callbacks.
-  // UCX callbacks cannot call progress functions (like closeBlocking),
-  // so they defer cleanup to the main loop via this queue.
+  // UCX callbacks cannot block on endpoint cleanup or iterate communicator
+  // state, so they defer cleanup to the main loop via this queue.
   WorkQueue<EndpointRef> deferredEndpointCleanup_;
 
   // Cancelled UCXX requests whose GPU buffers may still be referenced by
   // UCX internals. Held alive here until isCompleted() returns true,
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
-  // are not freed prematurely. With multiple progress threads,
-  // deferRequestCleanup() can be called from any of them, so we guard
-  // both push and the per-iteration sweep with this mutex.
+  // are not freed prematurely. UCX callbacks run on the progress thread,
+  // while the communicator thread sweeps this list, so both paths share
+  // this mutex.
   std::mutex deferredRequestsMutex_;
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
 
-  // Auxiliary progress threads. The thread that called run() is the
-  // primary; it owns heartbeat / deferred cleanup / CommElement process()
-  // dispatch. Auxiliary threads only call worker_->progress() so UCX
-  // callbacks fire without concurrently advancing source/server state
-  // machines.
-  std::vector<std::thread> auxThreads_;
-  // Primary-thread work dispatch plus UCX progress.
-  void drainWorkAndProgress();
+  // Primary-thread work dispatch.
+  void drainWorkQueue();
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{

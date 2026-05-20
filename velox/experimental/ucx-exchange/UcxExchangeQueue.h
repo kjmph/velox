@@ -133,6 +133,7 @@ class UcxExchangeQueue {
  private:
   std::vector<ContinuePromise> closeLocked() {
     queue_.clear();
+    totalBytes_ = 0;
     return clearAllPromisesLocked();
   }
 

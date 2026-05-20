@@ -162,6 +162,7 @@ void UcxExchangeQueue::setError(std::string_view error) {
     // NOTE: clear the serialized page queue as we won't consume from an
     // errored queue.
     queue_.clear();
+    totalBytes_ = 0;
     promises = clearAllPromisesLocked();
   }
   clearPromises(promises);

@@ -387,9 +387,17 @@ void CudfConfig::initialize(
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
   }
+  if (config.find(kCudfFinalAggregationBatchSizeMinThreshold) != config.end()) {
+    finalAggregationBatchSizeMinThreshold =
+        folly::to<int32_t>(config[kCudfFinalAggregationBatchSizeMinThreshold]);
+  }
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
+  }
+  if (config.find(kCudfDistinctHashJoinEnabled) != config.end()) {
+    distinctHashJoinEnabled =
+        folly::to<bool>(config[kCudfDistinctHashJoinEnabled]);
   }
   if (config.find(kCudfExchange) != config.end()) {
     exchange = folly::to<bool>(config[kCudfExchange]);

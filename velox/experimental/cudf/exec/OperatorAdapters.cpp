@@ -366,9 +366,20 @@ class AggregationAdapter : public OperatorAdapter {
     bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+    const auto& cudfConfig = CudfConfig::getInstance();
+    if (cudfConfig.concatOptimizationEnabled) {
+      VELOX_CHECK_GT(cudfConfig.batchSizeMinThreshold, 0);
+      auto targetRows = static_cast<size_t>(cudfConfig.batchSizeMinThreshold);
+      if (!isGlobal && !isDistinct &&
+          aggregationPlanNode->step() == core::AggregationNode::Step::kFinal &&
+          cudfConfig.finalAggregationBatchSizeMinThreshold.has_value()) {
+        VELOX_CHECK_GT(
+            cudfConfig.finalAggregationBatchSizeMinThreshold.value(), 0);
+        targetRows = static_cast<size_t>(
+            cudfConfig.finalAggregationBatchSizeMinThreshold.value());
+      }
       result.push_back(std::make_unique<CudfBatchConcat>(
-          operatorId, ctx, aggregationPlanNode));
+          operatorId, ctx, aggregationPlanNode, targetRows));
     }
     if (isGlobal) {
       result.push_back(

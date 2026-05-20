@@ -27,11 +27,14 @@
 #   CUDA_VERSION from the env
 # * VELOX_UCX_VERSION="1.19.0": Which version of ucx to install, will pick up
 #   UCX_VERSION from the env
+# * VELOX_UCX_LOCAL_SOURCE="": Optional local UCX source tree to install
+#   instead of downloading UCX_VERSION. Picks up UCX_LOCAL_SOURCE from the env.
 
 set -efx -o pipefail
 
 VELOX_CUDA_VERSION=${CUDA_VERSION:-"12.9"}
 VELOX_UCX_VERSION=${UCX_VERSION:-"1.19.0"}
+VELOX_UCX_LOCAL_SOURCE=${UCX_LOCAL_SOURCE:-""}
 SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
 source "$SCRIPT_DIR"/setup-centos9.sh
 
@@ -40,7 +43,12 @@ function install_ucx {
   local UCX_REPO_NAME="openucx/ucx"
   local NEEDS_AUTOGEN=false
 
-  if [ "${VELOX_UCX_VERSION}" == "master" ]; then
+  if [ -n "${VELOX_UCX_LOCAL_SOURCE}" ] && [ -f "${VELOX_UCX_LOCAL_SOURCE}/autogen.sh" ]; then
+    rm -rf "${DEPENDENCY_DIR}"/ucx
+    mkdir -p "${DEPENDENCY_DIR}"/ucx
+    cp -a "${VELOX_UCX_LOCAL_SOURCE}"/. "${DEPENDENCY_DIR}"/ucx/
+    NEEDS_AUTOGEN=true
+  elif [ "${VELOX_UCX_VERSION}" == "master" ]; then
     github_checkout "${UCX_REPO_NAME}" "${VELOX_UCX_VERSION}"
     NEEDS_AUTOGEN=true
   else

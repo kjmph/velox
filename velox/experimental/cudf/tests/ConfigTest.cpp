@@ -28,6 +28,9 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfBatchSizeMinThreshold, "50000000"},
+      {CudfConfig::kCudfFinalAggregationBatchSizeMinThreshold, "150000000"},
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "false"},
       {CudfConfig::kCudfExchange, "true"},
       {CudfConfig::kCudfExchangeServerPort, "12345"}};
 
@@ -39,6 +42,10 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_EQ(config.batchSizeMinThreshold, 50000000);
+  ASSERT_TRUE(config.finalAggregationBatchSizeMinThreshold.has_value());
+  ASSERT_EQ(config.finalAggregationBatchSizeMinThreshold.value(), 150000000);
+  ASSERT_EQ(config.distinctHashJoinEnabled, false);
   ASSERT_EQ(config.exchange, true);
   ASSERT_EQ(config.exchangeServerPort, 12345);
 }

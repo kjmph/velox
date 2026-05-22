@@ -15,7 +15,9 @@
  */
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
-#include <atomic>
+#include <sstream>
+
+#include <glog/logging.h>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -178,7 +180,7 @@ bool UcxOutputQueue::initialize(
     queues_.emplace_back(std::make_unique<UcxDestinationQueue>());
   }
   // Publish the initialized flag last with release semantics. Lock-free
-  // readers (canUseIntraNode → isInitialized) use an acquire load, so
+  // readers (canUseIntraNode -> isInitialized) use an acquire load, so
   // all writes above (kind_, task_, queues_, etc.) are guaranteed visible
   // once they observe initialized_ == true.
   initialized_.store(true, std::memory_order_release);
@@ -294,14 +296,12 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         if (bytes >= 0L) {
           auto self = weakSelf.lock();
           if (!self) {
-            // Queue was destroyed by removeTask(), safe to skip stats update.
             return;
           }
           std::lock_guard<std::mutex> l(self->mutex_);
           self->updateStatsWithFreedLocked(bytes, 1L, promises);
         }
-        // outside of lock:
-        // wake up any producers that are waiting for queue to become less full.
+        // Wake up any producers that are waiting for queue to become less full.
         for (auto& promise : promises) {
           promise.setValue();
         }
@@ -323,7 +323,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
             << " dest=" << destination
             << " server waiting for data (callback installed)";
   }
-  // wake up any producers that are waiting for queue to become less full.
+  // Wake up any producers that are waiting for queue to become less full.
   for (auto& promise : promises) {
     promise.setValue();
   }

@@ -89,8 +89,14 @@ class UcxExchangeServer
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
+  /// Handles data becoming available from the output queue.
+  void onDataAvailable(std::shared_ptr<cudf::packed_columns> data);
+
+  /// Error handler after a metadata send fails.
+  void metadataSendFailed(ucs_status_t status, const std::string& taskId);
+
   /// @brief Completion handler after data has been sent.
-  void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
+  void sendComplete(ucs_status_t status);
 
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
@@ -117,10 +123,8 @@ class UcxExchangeServer
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
-  /// Protects dataPtr_. Must be recursive because sendData() holds the lock
-  /// when calling tagSend(), and for small messages UCX completes inline via
-  /// its fast-completion path, firing the sendComplete() callback on the same
-  /// thread while the lock is still held.
+  /// Protects dataPtr_ across queue callbacks, state-machine dispatch, and
+  /// close/error cleanup paths.
   std::recursive_mutex dataMutex_;
   std::atomic<bool> closed_{false};
 

@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 #include "velox/common/process/ThreadDebugInfo.h"
-#include "velox/experimental/cudf/CudfConfig.h"
 
 #include <folly/Unit.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include "velox/experimental/cudf/CudfConfig.h"
 
 DEFINE_int32(
     exchange_log_level,

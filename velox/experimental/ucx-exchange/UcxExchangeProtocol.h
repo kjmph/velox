@@ -81,12 +81,33 @@ struct HandshakeMsg {
   uint64_t workerId{0};
 };
 
+constexpr uint32_t kCpuRowHandshakeMagic = 0x43505558; // "CPUX"
+constexpr uint16_t kCpuRowHandshakeVersion = 1;
+
+/// CPU-row handshake envelope. The legacy HandshakeMsg remains unchanged for
+/// the GPU exchange path; CPU adds the source UCX worker address after this
+/// header so the producer can create a worker-address endpoint back to the
+/// source. Unlike UCX listener endpoints, worker-address endpoints let UCX
+/// select intra-node transports such as posix, sysv, or cma.
+struct CpuRowHandshakeHeader {
+  uint32_t magic{kCpuRowHandshakeMagic};
+  uint16_t version{kCpuRowHandshakeVersion};
+  uint16_t headerSize{sizeof(CpuRowHandshakeHeader)};
+  HandshakeMsg handshake;
+  uint32_t sourceWorkerAddressBytes{0};
+  /// Stable hash of the source same-host transport identity. Zero means
+  /// unknown. CPU-row exchange uses this to disable UCX endpoint error
+  /// handling only for compatible same-host data endpoints, allowing UCX to
+  /// select posix/sysv/cma locally while preserving error handling for
+  /// cross-host endpoints.
+  uint32_t sourceHostIdHash{0};
+};
+
 /// @brief Response sent from server to source after handshake.
-/// Informs the source whether intra-node transfer optimization is available,
-/// allowing the source to bypass UCXX for all subsequent data transfers.
+/// The GPU exchange path uses this to report same-process intra-node transfer
+/// availability. The CPU row exchange always transfers through UCX.
 struct HandshakeResponse {
-  /// True if server and source are on the same node (same Communicator).
-  /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
+  /// True if the GPU exchange source should use IntraNodeTransferRegistry.
   bool isIntraNodeTransfer{false};
   /// Padding for alignment
   uint8_t padding[7]{};

@@ -752,6 +752,82 @@ class LocalExchangeAdapter : public OperatorAdapter {
   }
 };
 
+/// CudfUcxExchangeAdapter - Keeps the UCX exchange source operator. The
+/// CudfUcx DriverAdapter installs this before this adapter runs.
+class CudfUcxExchangeAdapter : public OperatorAdapter {
+ public:
+  CudfUcxExchangeAdapter() : OperatorAdapter("CudfUcxExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->operatorType() == "UcxExchange";
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// CudfUcxPartitionedOutputAdapter - Keeps the UCX partitioned output sink.
+class CudfUcxPartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  CudfUcxPartitionedOutputAdapter()
+      : OperatorAdapter("CudfUcxPartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return op->operatorType() == "cudfPartitionedOutput";
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
 /// AssignUniqueIdAdapter - Replaces with CudfAssignUniqueId
 class AssignUniqueIdAdapter : public OperatorAdapter {
  public:
@@ -1020,6 +1096,8 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LimitAdapter>());
   registry.registerAdapter(std::make_unique<LocalPartitionAdapter>());
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<CudfUcxExchangeAdapter>());
+  registry.registerAdapter(std::make_unique<CudfUcxPartitionedOutputAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
   registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
   registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());

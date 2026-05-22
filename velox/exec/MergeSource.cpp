@@ -17,6 +17,7 @@
 #include "velox/exec/MergeSource.h"
 
 #include <boost/circular_buffer.hpp>
+#include <mutex>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Merge.h"
 #include "velox/vector/VectorStream.h"
@@ -25,6 +26,16 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
+
+std::mutex& mergeExchangeSourceFactoryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+MergeSource::MergeExchangeSourceFactory& mergeExchangeSourceFactory() {
+  static MergeSource::MergeExchangeSourceFactory factory;
+  return factory;
+}
 
 namespace {
 class ScopedPromiseNotification {
@@ -327,9 +338,29 @@ std::shared_ptr<MergeSource> MergeSource::createMergeExchangeSource(
     int destination,
     int64_t maxQueuedBytes,
     memory::MemoryPool* pool,
-    folly::Executor* executor) {
+    folly::Executor* executor,
+    bool useUcxExchange) {
+  if (useUcxExchange) {
+    MergeExchangeSourceFactory factory;
+    {
+      std::lock_guard<std::mutex> lock(mergeExchangeSourceFactoryMutex());
+      factory = mergeExchangeSourceFactory();
+    }
+    if (factory) {
+      auto source = factory(mergeExchange, taskId, destination);
+      if (source) {
+        return source;
+      }
+    }
+  }
   return std::make_shared<MergeExchangeSource>(
       mergeExchange, taskId, destination, maxQueuedBytes, pool, executor);
+}
+
+void MergeSource::registerMergeExchangeSourceFactory(
+    MergeExchangeSourceFactory factory) {
+  std::lock_guard<std::mutex> lock(mergeExchangeSourceFactoryMutex());
+  mergeExchangeSourceFactory() = std::move(factory);
 }
 
 BlockingReason MergeJoinSource::next(

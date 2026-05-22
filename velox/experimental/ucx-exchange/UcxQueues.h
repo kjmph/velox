@@ -17,9 +17,12 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <atomic>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 #include "velox/core/PlanNode.h"
 #include "velox/exec/OutputBuffer.h" // for the Stats structure
@@ -44,7 +47,7 @@ struct UcxDataAvailable {
 
   void notify() {
     if (callback) {
-      callback(std::move(data), remainingBytes);
+      callback(std::move(data), std::move(remainingBytes));
     }
   }
 };
@@ -313,7 +316,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // promises when buffer reached capacity and blocked further enqueueing.
   std::vector<ContinuePromise> promises_;
 
-  // actual data in 'queues_'
+  // Bytes retained by destination queues.
   int64_t queuedBytes_{0};
   int64_t queuedPackedColumns_{0};
 
@@ -324,10 +327,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // Time since last change in queuedBytes_. Used to compute total time data
   // is queued. Ignored if queuedBytes_ is zero.
-  uint64_t queueStartMs_;
+  uint64_t queueStartMs_{0};
 
   // Total time data is queued as bytes * time.
-  double totalQueuedBytesMs_;
+  double totalQueuedBytesMs_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

@@ -397,6 +397,28 @@ void CudfConfig::initialize(
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
   }
+  if (config.find(kCudfExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kCudfExchange]);
+  }
+  if (config.find(kCudfExchangeServerPort) != config.end()) {
+    exchangeServerPort = folly::to<int32_t>(config[kCudfExchangeServerPort]);
+  }
+  if (config.find(kCudfIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kCudfIntraNodeExchange]);
+  }
+  if (config.find(kCudfPartitionedOutputBatchRows) != config.end()) {
+    partitionedOutputBatchRows =
+        folly::to<int64_t>(config[kCudfPartitionedOutputBatchRows]);
+  }
+  if (config.find(kCudfExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kCudfExchangeLogLevel]);
+  }
+  if (config.find(kCudfUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kCudfUcxxBlockingPolling]);
+  }
+  if (config.find(kCudfUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kCudfUcxxErrorHandling]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

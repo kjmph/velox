@@ -16,11 +16,17 @@
 #pragma once
 
 #include <ucxx/api.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -54,6 +60,10 @@ class Communicator {
  public:
   const ucxx::AmReceiverCallbackOwnerType kAmCallbackOwner = "velox";
   const ucxx::AmReceiverCallbackIdType kAmCallbackId = 123;
+  // Separate callback id for the CPU-row exchange's handshake. Lets the
+  // CPU-row Acceptor coexist with the cudf Acceptor on the same listener
+  // without sharing dispatch state.
+  const ucxx::AmReceiverCallbackIdType kAmCpuCallbackId = 124;
 
   /// @brief Method to initialize the communicator and get a reference to it.
   /// @param port The port to listen on.
@@ -103,6 +113,30 @@ class Communicator {
       std::shared_ptr<CommElement> commElement,
       HostPort hostPort);
 
+  /// Returns true if the peer has the same non-zero transport identity.
+  [[nodiscard]] bool hasSameHostTransportIdentity(
+      uint32_t peerHostIdHash) const;
+
+  /// Creates a same-host endpoint from a serialized UCX worker address. This
+  /// avoids the listener/client-server connection-manager path for local data
+  /// traffic, allowing UCX to select same-host transports (posix/sysv/cma).
+  /// Cross-host or unknown peers should use the listener/bootstrap endpoint.
+  [[nodiscard]] std::shared_ptr<EndpointRef>
+  createSameHostEndpointRefFromWorkerAddress(
+      std::string_view workerAddress,
+      std::string peerIp = "",
+      uint32_t peerHostIdHash = 0);
+
+  /// Returns this process' serialized UCX worker address.
+  [[nodiscard]] std::string getWorkerAddress() const;
+
+  /// Returns a stable same-host transport identity hash. Equal non-zero values
+  /// mean two Communicators are expected to share the host/namespace setup
+  /// needed by UCX same-host transports; zero means unknown.
+  [[nodiscard]] uint32_t getHostIdHash() const {
+    return hostIdHash_;
+  }
+
   /// @brief Removes an endpoint from the communicator. This is required when
   /// the endpoint has become stale since the other side has disappeared.
   /// NOTE: This should NOT be called from within a UCX callback. Use
@@ -119,7 +153,8 @@ class Communicator {
   /// @brief Defers cleanup of a cancelled UCXX request to the main loop.
   /// The request (and the GPU buffers it references via its arg) will be
   /// held alive until UCX has fully processed the cancellation.
-  /// Must only be called from the Communicator thread.
+  /// Thread-safe: close paths may call this from driver threads or the UCX
+  /// progress thread.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
 
   /// Returns the URL of the coordinator.
@@ -174,7 +209,7 @@ class Communicator {
   std::shared_ptr<ucxx::Listener> listener_;
   uint16_t port_;
   std::string coordinatorURL_;
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
   Acceptor acceptor_;
   ContinuePromise promise_{"Communicator::run"};
 
@@ -202,15 +237,18 @@ class Communicator {
 
   // Protects endpoints_. Must be recursive because removeEndpointRef() holds
   // the lock and calls closeBlocking(), which progresses the worker and can
-  // fire listenerCallback() re-entrantly — that callback also locks this mutex.
+  // fire listenerCallback() re-entrantly. That callback also locks this mutex.
   std::recursive_mutex endpointsMutex_;
 
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;
 
-  // Signals the UCXX worker to wake up from a blocking
-  // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
-  // or if not in blocking progress mode.
+  // Same-host CPU data endpoints keyed by serialized UCX worker address.
+  // Cross-host and unknown peers stay on endpoints_.
+  std::map<std::string, std::shared_ptr<EndpointRef>> workerAddressEndpoints_;
+
+  // Signals the UCXX worker to wake up from blocking progress mode.
+  // Thread-safe. No-op if worker_ is null or if not in blocking progress mode.
   void signalWorker();
 
   // A random unique identifier for this Communicator instance (process).
@@ -218,21 +256,33 @@ class Communicator {
   // if a connecting source is in the same process (intra-node transfer).
   uint64_t workerId_{0};
 
+  // Stable same-host transport identity hash. This differs from workerId_:
+  // all workers with the same host/namespace setup should have the same
+  // hostIdHash_.
+  uint32_t hostIdHash_{0};
+
   // Queue of endpoints that need cleanup, populated by callbacks.
-  // UCX callbacks cannot call progress functions (like closeBlocking),
-  // so they defer cleanup to the main loop via this queue.
+  // UCX callbacks cannot block on endpoint cleanup or iterate communicator
+  // state, so they defer cleanup to the main loop via this queue.
   WorkQueue<EndpointRef> deferredEndpointCleanup_;
 
   // Cancelled UCXX requests whose GPU buffers may still be referenced by
   // UCX internals. Held alive here until isCompleted() returns true,
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
-  // are not freed prematurely.
+  // are not freed prematurely. UCX callbacks run on the progress thread,
+  // while the communicator thread sweeps this list, so both paths share
+  // this mutex.
+  std::mutex deferredRequestsMutex_;
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
+
+  // Primary-thread work dispatch.
+  void drainWorkQueue();
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{
       std::chrono::steady_clock::now()};
-  uint64_t workItemsProcessed_{0};
+  // Atomic so heartbeat can reset with a single exchange().
+  std::atomic<uint64_t> workItemsProcessed_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

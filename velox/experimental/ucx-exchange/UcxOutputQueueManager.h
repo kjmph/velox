@@ -80,8 +80,8 @@ class UcxOutputQueueManager {
   /// @brief Indicates that no more data will be coming for this task.
   void noMoreData(std::string_view taskId);
 
-  /// @returns true if noMoreData has been called and all the accumulated data
-  /// have been fetched and acknowledged.
+  /// @returns true if noMoreData has been called and all accumulated data has
+  /// been fetched.
   bool isFinished(std::string_view taskId);
 
   /// @brief
@@ -104,7 +104,7 @@ class UcxOutputQueueManager {
   /// Returns true if the given task can use intra-node transfer.
   /// Returns false if the task is not yet initialized (placeholder queue
   /// from early sink connections) or if the task uses broadcast mode
-  /// (broadcast shares packed_columns across destinations — the intra-node
+  /// (broadcast shares packed_columns across destinations - the intra-node
   /// source's destructive move would corrupt data for other servers).
   bool canUseIntraNode(std::string_view taskId);
 

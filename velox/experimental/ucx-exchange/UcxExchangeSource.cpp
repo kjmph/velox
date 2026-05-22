@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <thread>
-
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
@@ -23,6 +21,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
+#include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 using namespace facebook::velox::exec;
 namespace facebook::velox::ucx_exchange {
@@ -55,6 +54,14 @@ VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     UcxExchangeSource,
     ReceiverState,
     receiverStateNames)
+
+int32_t UcxExchangeSource::backpressureHighWaterMark() {
+  return kDefaultBackpressureHighWaterMark;
+}
+
+int32_t UcxExchangeSource::backpressureLowWaterMark() {
+  return kDefaultBackpressureLowWaterMark;
+}
 
 void UcxExchangeSource::setState(ReceiverState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
@@ -106,6 +113,8 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
 }
 
 void UcxExchangeSource::process() {
+  drainStateEvents();
+
   if (closed_) {
     // Driver thread called closed
     cleanUp();
@@ -147,14 +156,15 @@ void UcxExchangeSource::process() {
       // This creates natural backpressure: the server's tagSend for data
       // will block at rendezvous until we post a matching tagRecv. For
       // intra-node: the server's publish future won't resolve until we poll.
-      int32_t queueSize = queue_->size();
-      if (queueSize > kBackpressureHighWaterMark) {
+      if (receiveQueueExceedsHighWater()) {
         if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
+          std::lock_guard<std::mutex> l(queue_->mutex());
           VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-                  << "] pausing, queueSize=" << queueSize
-                  << " > highWater=" << kBackpressureHighWaterMark;
+                  << "] pausing before metadata receive"
+                  << " queueSize=" << queue_->size()
+                  << " highWater=" << backpressureHighWaterMark();
         }
-        // Go dormant — do NOT re-enqueue into work queue.
+        // Go dormant; do not re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
         break;
       }
@@ -245,7 +255,7 @@ void UcxExchangeSource::close() {
   // Guarantee the end marker is delivered before transitioning to Done.
   deliverEndMarker();
 
-  // Let the Communicator progress thread do the actual clean-up.
+  // Let the communicator thread do the actual clean-up.
   setState(ReceiverState::Done);
   communicator_->addToWorkQueue(getSelfPtr());
 }
@@ -254,8 +264,14 @@ void UcxExchangeSource::resumeFromBackpressure() {
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(
           expected, false, std::memory_order_acq_rel)) {
+    int32_t queueSize;
+    {
+      std::lock_guard<std::mutex> l(queue_->mutex());
+      queueSize = queue_->size();
+    }
     VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-            << "] resumed by consumer, queueSize=" << queue_->size();
+            << "] resumed by consumer"
+            << " queueSize=" << queueSize;
     communicator_->addToWorkQueue(getSelfPtr());
   }
 }
@@ -374,7 +390,10 @@ void UcxExchangeSource::sendHandshake() {
       false,
       [weak](ucs_status_t status, std::shared_ptr<void> arg) {
         if (auto self = weak.lock()) {
-          self->onHandshake(status, arg);
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onHandshake(status, std::move(arg));
+              });
         }
       },
       handshakeReq);
@@ -383,7 +402,7 @@ void UcxExchangeSource::sendHandshake() {
 void UcxExchangeSource::onHandshake(
     ucs_status_t status,
     std::shared_ptr<void> /*arg*/) {
-  // arg holds the HandshakeMsg that was sent — it is unused here because this
+  // arg holds the HandshakeMsg that was sent. It is unused here because this
   // is a send completion callback (the outgoing data has already been
   // transmitted). The parameter exists only because UCXX uses it as a lifetime
   // handle; letting it go out of scope releases the send buffer.
@@ -445,7 +464,10 @@ void UcxExchangeSource::getMetadata() {
       false,
       [weak](ucs_status_t status, std::shared_ptr<void> arg) {
         if (auto self = weak.lock()) {
-          self->onMetadata(status, arg);
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onMetadata(status, std::move(arg));
+              });
         }
       },
       metadataReq);
@@ -507,63 +529,74 @@ void UcxExchangeSource::onMetadata(
       return;
     }
 
-    // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX
-    // Get a stream from the global stream pool
-    auto stream =
-        facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-    // Store the stream in the DataAndMetadata struct so it can be used later
-    // in onData() when creating the PackedTableWithStream.
-    ptr->stream = stream;
-    try {
-      ptr->dataBuf = std::make_unique<rmm::device_buffer>(
-          ptr->metadata.dataSizeBytes, stream,
-          cudf::get_current_device_resource_ref());
-    } catch (const rmm::bad_alloc& e) {
-      VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
-      queue_->setError("Failed to alloc GPU memory"); // Let the operator know
-                                                      // via the queue
-      deliverEndMarker();
-      setState(ReceiverState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
-      return;
-    }
-
-    // sync after allocating.
-    stream.synchronize();
-
-    VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
-            << " bytes of device memory";
-
-    // Initiate the transfer of the actual data from GPU-2-GPU
-    uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
-    VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
-            << " using tag: " << std::hex << dataTag << std::dec;
-
-    if (!setStateIf(
-            ReceiverState::WaitingForMetadata, ReceiverState::WaitingForData)) {
-      VLOG(1) << toString() << " onMetadata Invalid previous state ";
-      return;
-    }
-    // Use weak_ptr to prevent use-after-free if close() is called during
-    // callback
-    std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-    if (request_) {
-      completedRequests_.push_back(std::move(request_));
-    }
-    request_ = endpointRef_->endpoint_->tagRecv(
-        ptr->dataBuf->data(),
-        ptr->metadata.dataSizeBytes,
-        ucxx::Tag{dataTag},
-        ucxx::TagMaskFull,
-        false,
-        [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-          if (auto self = weak.lock()) {
-            self->onData(status, arg);
-          }
-        },
-        ptr // DataAndMetadata
-    );
+    startDataReceive(std::move(ptr));
   }
+}
+
+void UcxExchangeSource::startDataReceive(
+    std::shared_ptr<DataAndMetadata> ptr) {
+  VELOX_CHECK_NOT_NULL(ptr);
+  if (closed_.load(std::memory_order_acquire)) {
+    deliverEndMarker();
+    return;
+  }
+
+  // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX.
+  auto stream =
+      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+  ptr->stream = stream;
+  try {
+    ptr->dataBuf = std::make_unique<rmm::device_buffer>(
+        ptr->metadata.dataSizeBytes,
+        stream,
+        cudf::get_current_device_resource_ref());
+  } catch (const rmm::bad_alloc& e) {
+    VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
+    queue_->setError("Failed to alloc GPU memory");
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+
+  // UCX receives into this raw pointer on a UCX-owned CUDA stream. The
+  // allocation comes from an async RMM pool on `stream`, so make the allocation
+  // complete on the host before handing the pointer to UCX.
+  stream.synchronize();
+
+  VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
+          << " bytes of device memory";
+
+  uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
+  VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
+          << " using tag: " << std::hex << dataTag << std::dec;
+
+  if (!setStateIf(
+          ReceiverState::WaitingForMetadata, ReceiverState::WaitingForData)) {
+    VLOG(1) << toString() << " startDataReceive invalid previous state "
+            << toName(getState());
+    return;
+  }
+
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  if (request_) {
+    completedRequests_.push_back(std::move(request_));
+  }
+  request_ = endpointRef_->endpoint_->tagRecv(
+      ptr->dataBuf->data(),
+      ptr->metadata.dataSizeBytes,
+      ucxx::Tag{dataTag},
+      ucxx::TagMaskFull,
+      false,
+      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onData(status, std::move(arg));
+              });
+        }
+      },
+      ptr);
 }
 
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
@@ -644,7 +677,10 @@ void UcxExchangeSource::receiveHandshakeResponse() {
       false,
       [weak](ucs_status_t status, std::shared_ptr<void> arg) {
         if (auto self = weak.lock()) {
-          self->onHandshakeResponse(status, arg);
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onHandshakeResponse(status, std::move(arg));
+              });
         }
       },
       responseBuffer);
@@ -814,6 +850,11 @@ bool UcxExchangeSource::setStateIf(
           << toString() << " seq=" << sequenceNumber_ << "] "
           << toName(expected) << " -> " << toName(desired);
   return true;
+}
+
+bool UcxExchangeSource::receiveQueueExceedsHighWater() {
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  return queue_->size() >= backpressureHighWaterMark();
 }
 
 } // namespace facebook::velox::ucx_exchange

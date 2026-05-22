@@ -786,7 +786,8 @@ MergeExchange::MergeExchange(
               driverCtx->queryConfig().shuffleCompressionKind()),
           mergeExchangeNode->serdeKind(),
           std::nullopt,
-          driverCtx->queryConfig().minShuffleCompressionPageSizeBytes())) {}
+          driverCtx->queryConfig().minShuffleCompressionPageSizeBytes())),
+      transportType_(mergeExchangeNode->transportType()) {}
 
 BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
   if (operatorCtx_->driverCtx()->driverId != 0) {
@@ -844,7 +845,8 @@ BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
                 operatorCtx_->task()->destination(),
                 maxQueuedBytesPerSource,
                 pool,
-                operatorCtx_->task()->queryCtx()->executor()));
+                operatorCtx_->task()->queryCtx()->executor(),
+                transportType_ == core::ExchangeNode::TransportType::kUcx));
       }
     }
     // TODO Delay this call until all input data has been processed.

@@ -108,7 +108,7 @@ void UcxOutputQueueManager::getData(
     auto it = queues.find(taskIdStr);
     if (it == queues.end()) {
       // Check if the task was already removed. If so, don't re-create a
-      // placeholder — the task is dead and any server calling getData() is a
+      // placeholder - the task is dead and any server calling getData() is a
       // stale leftover. Re-creating would produce an undersized queue that
       // crashes when deleteResults() is called for other destinations.
       if (removedTasks_.withLock(
@@ -137,7 +137,7 @@ void UcxOutputQueueManager::getData(
   }
   // outside of lock. Queue must exist.
   // get the data or install the notify callback.
-  outputQueue->getData(destination, notify);
+  outputQueue->getData(destination, std::move(notify));
 }
 
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {

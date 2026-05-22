@@ -18,6 +18,7 @@
 
 #include <cudf/types.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -49,6 +50,18 @@ struct CudfConfig {
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  static constexpr const char* kCudfExchange{"cudf.exchange"};
+  static constexpr const char* kCudfExchangeServerPort{
+      "cudf.exchange.server.port"};
+  static constexpr const char* kCudfIntraNodeExchange{
+      "cudf.intra_node_exchange"};
+  static constexpr const char* kCudfPartitionedOutputBatchRows{
+      "cudf.partitioned_output_batch_rows"};
+  static constexpr const char* kCudfExchangeLogLevel{"cudf.exchange_log_level"};
+  static constexpr const char* kCudfUcxxBlockingPolling{
+      "cudf.ucxx_blocking_polling"};
+  static constexpr const char* kCudfUcxxErrorHandling{
+      "cudf.ucxx_error_handling"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
@@ -123,6 +136,28 @@ struct CudfConfig {
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
   std::optional<int32_t> batchSizeMaxThreshold;
+
+  /// Whether remote exchanges should use the cuDF UCX exchange operators.
+  bool exchange{false};
+
+  /// Port used by the cuDF UCX exchange communicator.
+  int32_t exchangeServerPort{30050};
+
+  /// Whether same-process UCX exchange should bypass UCX data transfer.
+  bool intraNodeExchange{true};
+
+  /// Minimum rows to accumulate before flushing cudf partitioned output.
+  int64_t partitionedOutputBatchRows{10'000};
+
+  /// Verbosity for ucx-exchange VLOG modules.
+  int32_t exchangeLogLevel{0};
+
+  /// Whether UCXX should use blocking progress mode.
+  bool ucxxBlockingPolling{false};
+
+  /// Whether UCXX endpoints should use error handling callbacks.
+  bool ucxxErrorHandling{true};
+
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

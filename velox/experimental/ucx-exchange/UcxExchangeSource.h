@@ -32,9 +32,6 @@
 
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
-#include <rmm/mr/pool_memory_resource.hpp>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -113,8 +110,11 @@ class UcxExchangeSource
   void resumeFromBackpressure();
 
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
-  static constexpr int32_t kBackpressureHighWaterMark = 32;
-  static constexpr int32_t kBackpressureLowWaterMark = 16;
+  static constexpr int32_t kDefaultBackpressureHighWaterMark = 32;
+  static constexpr int32_t kDefaultBackpressureLowWaterMark = 16;
+
+  static int32_t backpressureHighWaterMark();
+  static int32_t backpressureLowWaterMark();
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
@@ -194,6 +194,9 @@ class UcxExchangeSource
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// Starts the data receive for metadata already received from the sender.
+  void startDataReceive(std::shared_ptr<DataAndMetadata> dataAndMetadata);
+
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg
@@ -242,6 +245,8 @@ class UcxExchangeSource
   /// @return Returns true if state was changed, false otherwise.
   bool setStateIf(ReceiverState expected, ReceiverState desired);
 
+  bool receiveQueueExceedsHighWater();
+
   // The connection parameters
   const std::string host_;
   uint16_t port_;
@@ -279,9 +284,9 @@ class UcxExchangeSource
   /// When true, intra-node transfer optimizations bypass UCXX transfers.
   bool isIntraNodeTransfer_{false};
 
-  // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
+  // Backpressure: when the queue exceeds the high-water threshold, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
-  // when the queue drains to kBackpressureLowWaterMark.
+  // when the queue drains to the low-water threshold.
   std::atomic<bool> backpressureActive_{false};
 
   // Some metrics/counters:

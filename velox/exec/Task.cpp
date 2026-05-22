@@ -39,6 +39,12 @@
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+#include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
+#ifdef VELOX_ENABLE_CUDF
+#include "velox/experimental/ucx-exchange/UcxCudfOutputQueueManagerBridge.h"
+#endif
+#endif
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -1197,6 +1203,28 @@ void Task::initializePartitionOutput() {
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
         numOutputDrivers);
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+    // Mirror the OutputBufferManager initialization for UCX queue managers.
+    // Initializing both maps is harmless if the DriverAdapters never fire.
+    {
+      auto cpuQueueMgr = facebook::velox::ucx_exchange::
+          UcxCpuRowOutputQueueManager::getInstanceRef();
+      cpuQueueMgr->initializeTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
+#ifdef VELOX_ENABLE_CUDF
+    {
+      facebook::velox::ucx_exchange::initializeCudfUcxOutputQueueManagerTask(
+          shared_from_this(),
+          partitionedOutputNode->kind(),
+          partitionedOutputNode->numPartitions(),
+          numOutputDrivers);
+    }
+#endif
+#endif
   }
 }
 
@@ -2201,7 +2229,22 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
   }
-  return bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  auto result =
+      bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  {
+    auto cpuQueueMgr = facebook::velox::ucx_exchange::
+        UcxCpuRowOutputQueueManager::getInstanceRef();
+    cpuQueueMgr->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  }
+#ifdef VELOX_ENABLE_CUDF
+  {
+    facebook::velox::ucx_exchange::updateCudfUcxOutputBuffers(
+        taskId_, numBuffers, noMoreBuffers);
+  }
+#endif
+#endif
+  return result;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2704,6 +2747,36 @@ void Task::maybeRemoveFromOutputBufferManager() {
       }
       bufferManager->removeTask(taskId_);
     }
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+    {
+      auto cpuQueueMgr = facebook::velox::ucx_exchange::
+          UcxCpuRowOutputQueueManager::getInstanceRef();
+      // Don't overwrite stats from the standard bufferManager; only
+      // capture if not already set.
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats = cpuQueueMgr->stats(taskId_);
+        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      cpuQueueMgr->removeTask(taskId_);
+    }
+#ifdef VELOX_ENABLE_CUDF
+    {
+      {
+        std::lock_guard<std::timed_mutex> l(mutex_);
+        auto optStats =
+            facebook::velox::ucx_exchange::cudfUcxOutputQueueStats(taskId_);
+        if (!taskStats_.outputBufferStats.has_value() && optStats.has_value()) {
+          taskStats_.outputBufferStats = optStats;
+        }
+      }
+      facebook::velox::ucx_exchange::removeCudfUcxOutputQueueManagerTask(
+          taskId_);
+    }
+#endif
+#endif
   }
 }
 

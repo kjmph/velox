@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "velox/core/ExchangeTransportType.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Exchange.h"
@@ -154,8 +155,8 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
           std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
               planNode);
       if (!partitionedOutputNode ||
-          partitionedOutputNode->transportType() !=
-              core::PartitionedOutputNode::TransportType::kUcx) {
+          ctx->task->queryCtx()->outputTransportType(op->planNodeId()) !=
+              core::ExchangeTransportType::kUcx) {
         continue;
       }
 
@@ -177,8 +178,8 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       auto exchangeNode =
           std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
       if (!exchangeNode ||
-          exchangeNode->transportType() !=
-              core::ExchangeNode::TransportType::kUcx) {
+          ctx->task->queryCtx()->inputTransportType(op->planNodeId()) !=
+              core::ExchangeTransportType::kUcx) {
         continue;
       }
 

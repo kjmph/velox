@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
 
 using namespace facebook::velox::exec;

@@ -30,12 +30,14 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/ByteStream.h"
+#include "velox/core/ExchangeTransportType.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/Merge.h"
 #include "velox/exec/MergeSource.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/SerializedPage.h"
+#include "velox/exec/Task.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchange.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeClient.h"
@@ -98,6 +100,16 @@ struct CpuUcxConfig {
 const CpuUcxConfig& cpuUcxConfig() {
   static const CpuUcxConfig instance{readEnabledFromEnv(), readPortFromEnv()};
   return instance;
+}
+
+std::string_view transportName(core::ExchangeTransportType type) {
+  switch (type) {
+    case core::ExchangeTransportType::kHttp:
+      return "HTTP";
+    case core::ExchangeTransportType::kUcx:
+      return "UCX";
+  }
+  return "UNKNOWN";
 }
 
 // Communicator is a singleton; the adapter lazy-starts it on first driver that
@@ -298,12 +310,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
 
-      if (poNode->transportType() !=
-          core::PartitionedOutputNode::TransportType::kUcx) {
+      auto transportType =
+          ctx->task->queryCtx()->outputTransportType(planNodeId);
+      if (transportType != core::ExchangeTransportType::kUcx) {
         VLOG(1) << "[CPU-UCX] keeping standard PartitionedOutput at index " << i
                 << " (planNodeId=" << planNodeId << ", taskId=" << op->taskId()
-                << ", transport="
-                << core::PartitionedOutputNode::toName(poNode->transportType())
+                << ", transport=" << transportName(transportType)
                 << ")";
         continue;
       }
@@ -329,12 +341,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
 
-      if (exchangeNode->transportType() !=
-          core::ExchangeNode::TransportType::kUcx) {
+      auto transportType =
+          ctx->task->queryCtx()->inputTransportType(planNodeId);
+      if (transportType != core::ExchangeTransportType::kUcx) {
         VLOG(1) << "[CPU-UCX] keeping standard Exchange at index " << i
                 << " (planNodeId=" << planNodeId << ", taskId=" << op->taskId()
-                << ", transport="
-                << core::ExchangeNode::toName(exchangeNode->transportType())
+                << ", transport=" << transportName(transportType)
                 << ")";
         continue;
       }

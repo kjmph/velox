@@ -368,8 +368,7 @@ core::PlanNodePtr getTraceNode(
         partitionedOutputNode->outputType(),
         "Presto",
         std::make_shared<DummySourceNode>(
-            partitionedOutputNode->sources().front()->outputType()),
-        partitionedOutputNode->transportType());
+            partitionedOutputNode->sources().front()->outputType()));
   }
 
   if (const auto* indexLookupJoinNode =
@@ -463,15 +462,11 @@ core::PlanNodePtr getTraceNode(
           mergeExchangeNode->outputType(),
           mergeExchangeNode->sortingKeys(),
           mergeExchangeNode->sortingOrders(),
-          mergeExchangeNode->serdeKind(),
-          mergeExchangeNode->transportType());
+          mergeExchangeNode->serdeKind());
     }
     // Regular ExchangeNode
     return std::make_shared<core::ExchangeNode>(
-        nodeId,
-        exchangeNode->outputType(),
-        exchangeNode->serdeKind(),
-        exchangeNode->transportType());
+        nodeId, exchangeNode->outputType(), exchangeNode->serdeKind());
   }
 
   for (const auto& factory : traceNodeRegistry()) {

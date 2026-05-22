@@ -21,7 +21,7 @@
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
 #include <memory>
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"

@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"

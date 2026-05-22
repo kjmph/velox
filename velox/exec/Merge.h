@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/common/base/TreeOfLosers.h"
+#include "velox/core/ExchangeTransportType.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/MergeSource.h"
 #include "velox/exec/Spill.h"
@@ -398,7 +399,7 @@ class MergeExchange : public Merge {
  private:
   VectorSerde* const serde_;
   const std::unique_ptr<VectorSerde::Options> serdeOptions_;
-  const core::ExchangeNode::TransportType transportType_;
+  const core::ExchangeTransportType transportType_;
   bool noMoreSplits_ = false;
   // Task Ids from all the splits we took to process so far.
   std::vector<std::string> remoteSourceTaskIds_;

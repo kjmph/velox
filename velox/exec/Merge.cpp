@@ -18,6 +18,7 @@
 #include <folly/Traits.h>
 #include <exception>
 #include "velox/common/testutil/TestValue.h"
+#include "velox/core/QueryCtx.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
@@ -787,7 +788,9 @@ MergeExchange::MergeExchange(
           mergeExchangeNode->serdeKind(),
           std::nullopt,
           driverCtx->queryConfig().minShuffleCompressionPageSizeBytes())),
-      transportType_(mergeExchangeNode->transportType()) {}
+      transportType_(
+          driverCtx->task->queryCtx()->inputTransportType(
+              mergeExchangeNode->id())) {}
 
 BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
   if (operatorCtx_->driverCtx()->driverId != 0) {
@@ -846,7 +849,7 @@ BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
                 maxQueuedBytesPerSource,
                 pool,
                 operatorCtx_->task()->queryCtx()->executor(),
-                transportType_ == core::ExchangeNode::TransportType::kUcx));
+                transportType_ == core::ExchangeTransportType::kUcx));
       }
     }
     // TODO Delay this call until all input data has been processed.

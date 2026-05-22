@@ -18,7 +18,7 @@
 #include <ucxx/api.h>
 #include <map>
 #include <set>
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"

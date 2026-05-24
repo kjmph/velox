@@ -69,6 +69,11 @@ class UcxDestinationQueue {
     int64_t bytesQueued{0};
     int64_t packedColumnsQueued{0};
 
+    // What has left this destination queue but is still retained by a server
+    // send or intra-node handoff.
+    int64_t bytesInFlight{0};
+    int64_t packedColumnsInFlight{0};
+
     // what has been dequeued
     int64_t bytesSent{0};
     int64_t packedColumnsSent{0};
@@ -109,6 +114,12 @@ class UcxDestinationQueue {
 
   /// Returns the stats of this buffer.
   Stats stats() const;
+
+  /// Returns bytes queued or in-flight for this destination.
+  int64_t transferBytes() const;
+
+  /// Marks bytes for this destination as no longer in-flight.
+  void releaseInFlight(int64_t bytes, int64_t numPackedCols);
 
   std::string toString();
 
@@ -201,7 +212,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// producer-side reserved bytes so the active producer can pause while
   /// holding a materialized partitioned table without deadlocking on its own
   /// reservation.
-  bool checkTransferCapacity(int64_t maxBytes, ContinueFuture* future);
+  bool checkTransferCapacity(
+      int destination,
+      int64_t maxBytes,
+      ContinueFuture* future);
 
   /// @brief Reserves producer-side bytes before GPU output materialization.
   /// Returns true and populates 'future' if accepting this reservation would
@@ -212,7 +226,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   void releaseOutputReservation(int64_t bytes);
 
   /// @brief Releases bytes retained by an in-flight exchange transfer.
-  void releaseInFlightBytes(int64_t bytes, int64_t numPackedCols);
+  void releaseInFlightBytes(
+      int destination,
+      int64_t bytes,
+      int64_t numPackedCols);
 
   /// @brief Returns the data for the given destination through the callback
   /// function. If data is available, notify will be called immediately. If
@@ -288,7 +305,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   int64_t retainedPackedColumnsLocked() const;
 
-  int64_t transferBytesLocked() const;
+  int64_t transferBytesLocked(int destination) const;
 
   // internal function that is called when all drivers are done.
   void noMoreDrivers();

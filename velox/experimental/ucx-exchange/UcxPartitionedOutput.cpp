@@ -48,6 +48,13 @@ uint64_t multiplySaturated(uint64_t value, uint64_t multiplier) {
   return value * multiplier;
 }
 
+uint64_t addSaturated(uint64_t left, uint64_t right) {
+  if (right > std::numeric_limits<uint64_t>::max() - left) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return left + right;
+}
+
 uint64_t divideCeil(uint64_t value, uint64_t divisor) {
   VELOX_CHECK_GT(divisor, 0);
   return value / divisor + (value % divisor == 0 ? 0 : 1);
@@ -427,6 +434,10 @@ void UcxPartitionedOutput::hashPartition(
       std::move(partitionOffsets),
       outputReservationBytes_,
       stream,
+      0,
+      {},
+      {},
+      {},
       0});
 }
 
@@ -454,6 +465,10 @@ void UcxPartitionedOutput::equalPartition(
       std::move(offsets),
       outputReservationBytes_,
       stream,
+      0,
+      {},
+      {},
+      {},
       0});
 }
 
@@ -520,83 +535,146 @@ uint64_t UcxPartitionedOutput::transferWindowBytes(
   return std::max<uint64_t>(initialPayloadBytes_, averagePartitionBytes);
 }
 
+void UcxPartitionedOutput::initializePartitionDrainState(
+    PendingPartitionedBatch& batch) const {
+  if (!batch.nextRows.empty()) {
+    return;
+  }
+
+  VELOX_CHECK_EQ(
+      batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
+
+  const auto transferWindow = transferWindowBytes(batch);
+  batch.nextRows.resize(numPartitions_);
+  batch.nextPayloadBytes.resize(numPartitions_, 0);
+  batch.drainDeficits.resize(numPartitions_, 0);
+  batch.remainingPartitions = 0;
+  batch.nextPartition = 0;
+
+  for (size_t partition = 0; partition < numPartitions_; ++partition) {
+    const auto start = batch.offsets[partition];
+    const auto end = batch.offsets[partition + 1];
+    VELOX_CHECK_LE(start, end);
+
+    batch.nextRows[partition] = start;
+    if (start == end) {
+      continue;
+    }
+
+    batch.nextPayloadBytes[partition] =
+        shouldSplitPayload(batch, start, end) ? initialPayloadBytes_
+                                              : transferWindow;
+    ++batch.remainingPartitions;
+  }
+}
+
 bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
   VELOX_CHECK(pendingPartitionedBatch_.has_value());
   VELOX_CHECK_GT(outputReservationBytes_, 0);
 
   auto queueManager = sharedQueueManager();
   auto& batch = pendingPartitionedBatch_.value();
+  initializePartitionDrainState(batch);
 
   VELOX_CHECK_EQ(
       batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
 
-  while (batch.nextPartition < numPartitions_) {
-    const auto partition = batch.nextPartition;
-    const auto start = batch.offsets[partition];
-    const auto end = batch.offsets[partition + 1];
-    VELOX_CHECK_LE(start, end);
-    if (start == end) {
-      ++batch.nextPartition;
+  const auto transferWindow = transferWindowBytes(batch);
+  while (batch.remainingPartitions > 0) {
+    int waitPartition = -1;
+    bool madeProgress = false;
+
+    for (size_t visited = 0; visited < numPartitions_; ++visited) {
+      const auto partition = batch.nextPartition;
+      batch.nextPartition = (batch.nextPartition + 1) % numPartitions_;
+
+      if (batch.nextRows[partition] >= batch.offsets[partition + 1]) {
+        continue;
+      }
+
+      batch.drainDeficits[partition] = std::min<uint64_t>(
+          transferWindow,
+          addSaturated(batch.drainDeficits[partition], transferWindow));
+
+      while (batch.nextRows[partition] < batch.offsets[partition + 1]) {
+        if (queueManager->checkTransferCapacity(
+                this->taskId(), partition, transferWindow, nullptr)) {
+          if (waitPartition < 0) {
+            waitPartition = partition;
+          }
+          break;
+        }
+
+        if (batch.drainDeficits[partition] <
+            batch.nextPayloadBytes[partition]) {
+          break;
+        }
+
+        madeProgress = true;
+        const auto start = batch.offsets[partition];
+        const auto end = batch.offsets[partition + 1];
+        VELOX_CHECK_LE(start, end);
+        VELOX_CHECK_LT(batch.nextRows[partition], end);
+
+        const auto chunkStart = batch.nextRows[partition];
+        const auto rowsPerChunk = rowsForPayloadTarget(
+            batch, chunkStart, end, batch.nextPayloadBytes[partition]);
+        VELOX_CHECK_GT(rowsPerChunk, 0);
+        const auto chunkEnd =
+            std::min<cudf::size_type>(end, chunkStart + rowsPerChunk);
+        std::vector<cudf::size_type> sliceOffsets{chunkStart, chunkEnd};
+        auto tableSlices = cudf::slice(batch.tableView, sliceOffsets);
+        VELOX_CHECK_EQ(tableSlices.size(), 1);
+
+        auto packedCols = cudf::pack(
+            tableSlices[0],
+            batch.stream,
+            cudf::get_current_device_resource_ref());
+
+        // UCXX/UCX is not stream-aware, so the packed payload must be complete
+        // before exposing its raw device pointer to the exchange server.
+        batch.stream.synchronize();
+
+        auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+            std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+        const auto packedBytes = packedColsPtr->gpu_data->size();
+
+        queueManager->enqueue(
+            this->taskId(),
+            partition,
+            std::move(packedColsPtr),
+            chunkEnd - chunkStart);
+
+        if (packedBytes >= batch.drainDeficits[partition]) {
+          batch.drainDeficits[partition] = 0;
+        } else {
+          batch.drainDeficits[partition] -= packedBytes;
+        }
+
+        batch.nextRows[partition] = chunkEnd;
+        if (chunkEnd == end) {
+          --batch.remainingPartitions;
+          batch.nextPayloadBytes[partition] = 0;
+          batch.drainDeficits[partition] = 0;
+          break;
+        }
+
+        batch.nextPayloadBytes[partition] = std::min<uint64_t>(
+            transferWindow,
+            multiplySaturated(batch.nextPayloadBytes[partition], 2));
+      }
+    }
+
+    if (madeProgress) {
       continue;
     }
 
-    const auto transferWindow = transferWindowBytes(batch);
-    if (batch.nextRow == 0) {
-      batch.nextRow = start;
-      batch.nextPayloadBytes =
-          shouldSplitPayload(batch, start, end) ? initialPayloadBytes_
-                                                : transferWindow;
+    VELOX_CHECK_GE(waitPartition, 0);
+    if (queueManager->checkTransferCapacity(
+            this->taskId(), waitPartition, transferWindow, &future_)) {
+      blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+      return false;
     }
-
-    while (batch.nextRow < end) {
-      if (queueManager->checkTransferCapacity(
-              this->taskId(), transferWindow, &future_)) {
-        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
-        return false;
-      }
-
-      const auto chunkStart = batch.nextRow;
-      const auto rowsPerChunk =
-          rowsForPayloadTarget(batch, chunkStart, end, batch.nextPayloadBytes);
-      VELOX_CHECK_GT(rowsPerChunk, 0);
-      const auto chunkEnd =
-          std::min<cudf::size_type>(end, chunkStart + rowsPerChunk);
-      std::vector<cudf::size_type> sliceOffsets{chunkStart, chunkEnd};
-      auto tableSlices = cudf::slice(batch.tableView, sliceOffsets);
-      VELOX_CHECK_EQ(tableSlices.size(), 1);
-
-      auto packedCols = cudf::pack(
-          tableSlices[0],
-          batch.stream,
-          cudf::get_current_device_resource_ref());
-
-      // UCXX/UCX is not stream-aware, so the packed payload must be complete
-      // before exposing its raw device pointer to the exchange server.
-      batch.stream.synchronize();
-
-      auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
-
-      queueManager->enqueue(
-          this->taskId(),
-          partition,
-          std::move(packedColsPtr),
-          chunkEnd - chunkStart);
-
-      batch.nextRow = chunkEnd;
-      batch.nextPayloadBytes = std::min<uint64_t>(
-          transferWindow, multiplySaturated(batch.nextPayloadBytes, 2));
-
-      if (queueManager->checkTransferCapacity(
-              this->taskId(), transferWindow, &future_)) {
-        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
-        return false;
-      }
-    }
-
-    ++batch.nextPartition;
-    batch.nextRow = 0;
-    batch.nextPayloadBytes = 0;
   }
 
   pendingPartitionedBatch_.reset();

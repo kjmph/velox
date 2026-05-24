@@ -97,12 +97,16 @@ class UcxPartitionedOutput : public exec::Operator,
     std::vector<cudf::size_type> offsets;
     int64_t estimatedBytes{0};
     rmm::cuda_stream_view stream;
-    int nextPartition{0};
-    cudf::size_type nextRow{0};
-    uint64_t nextPayloadBytes{0};
+    size_t nextPartition{0};
+    std::vector<cudf::size_type> nextRows;
+    std::vector<uint64_t> nextPayloadBytes;
+    std::vector<uint64_t> drainDeficits;
+    size_t remainingPartitions{0};
   };
 
   bool drainPendingPartitionedBatch();
+
+  void initializePartitionDrainState(PendingPartitionedBatch& batch) const;
 
   cudf::size_type rowsForPayloadTarget(
       const PendingPartitionedBatch& batch,

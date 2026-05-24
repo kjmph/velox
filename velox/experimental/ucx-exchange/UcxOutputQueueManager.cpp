@@ -83,9 +83,11 @@ bool UcxOutputQueueManager::checkBlocked(
 
 bool UcxOutputQueueManager::checkTransferCapacity(
     std::string_view taskId,
+    int destination,
     int64_t maxBytes,
     ContinueFuture* future) {
-  return getQueue(taskId)->checkTransferCapacity(maxBytes, future);
+  return getQueue(taskId)->checkTransferCapacity(
+      destination, maxBytes, future);
 }
 
 bool UcxOutputQueueManager::reserveOutputBytes(
@@ -105,10 +107,11 @@ void UcxOutputQueueManager::releaseOutputReservation(
 
 void UcxOutputQueueManager::releaseInFlightBytes(
     std::string_view taskId,
+    int destination,
     int64_t bytes,
     int64_t numPackedCols) {
   if (auto queue = getQueueIfExists(taskId)) {
-    queue->releaseInFlightBytes(bytes, numPackedCols);
+    queue->releaseInFlightBytes(destination, bytes, numPackedCols);
   }
 }
 

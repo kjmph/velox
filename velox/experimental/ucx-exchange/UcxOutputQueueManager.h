@@ -81,6 +81,7 @@ class UcxOutputQueueManager {
   /// @brief Checks active producer queued/in-flight transfer bytes.
   bool checkTransferCapacity(
       std::string_view taskId,
+      int destination,
       int64_t maxBytes,
       ContinueFuture* future);
 
@@ -96,6 +97,7 @@ class UcxOutputQueueManager {
   /// @brief Releases bytes retained by an in-flight exchange transfer.
   void releaseInFlightBytes(
       std::string_view taskId,
+      int destination,
       int64_t bytes,
       int64_t numPackedCols);
 

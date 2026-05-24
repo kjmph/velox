@@ -65,6 +65,7 @@ struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
   std::shared_ptr<UcxOutputQueueManager> queueMgr;
   std::string taskId;
+  int destination{0};
   int64_t bytes{0};
   std::atomic<bool> released{false};
 };
@@ -427,6 +428,7 @@ void UcxExchangeServer::sendData() {
       dataCtx->data = dataPtr_;
       dataCtx->queueMgr = queueMgr_;
       dataCtx->taskId = partitionKey_.taskId;
+      dataCtx->destination = partitionKey_.destination;
       dataCtx->bytes = bytes_;
 
       std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
@@ -446,7 +448,8 @@ void UcxExchangeServer::sendData() {
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             if (!ctx->released.exchange(true)) {
               ctx->data.reset();
-              ctx->queueMgr->releaseInFlightBytes(ctx->taskId, ctx->bytes, 1L);
+              ctx->queueMgr->releaseInFlightBytes(
+                  ctx->taskId, ctx->destination, ctx->bytes, 1L);
             }
 
             if (auto self = weakData.lock()) {
@@ -556,7 +559,8 @@ void UcxExchangeServer::releaseIntraNodeInFlightBytes() {
   if (!intraNodeBytesInFlight_) {
     return;
   }
-  queueMgr_->releaseInFlightBytes(partitionKey_.taskId, bytes_, 1L);
+  queueMgr_->releaseInFlightBytes(
+      partitionKey_.taskId, partitionKey_.destination, bytes_, 1L);
   intraNodeBytesInFlight_ = false;
 }
 

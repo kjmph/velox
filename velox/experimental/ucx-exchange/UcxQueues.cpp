@@ -43,6 +43,8 @@ void UcxDestinationQueue::Stats::recordDequeue(
 
     bytesSent += size;
     packedColumnsSent++;
+    bytesInFlight += size;
+    packedColumnsInFlight++;
   }
 }
 
@@ -130,6 +132,20 @@ void UcxDestinationQueue::finish() {
 
 UcxDestinationQueue::Stats UcxDestinationQueue::stats() const {
   return stats_;
+}
+
+int64_t UcxDestinationQueue::transferBytes() const {
+  return stats_.bytesQueued + stats_.bytesInFlight;
+}
+
+void UcxDestinationQueue::releaseInFlight(
+    int64_t bytes,
+    int64_t numPackedCols) {
+  stats_.bytesInFlight -= bytes;
+  stats_.packedColumnsInFlight -= numPackedCols;
+
+  VELOX_CHECK_GE(stats_.bytesInFlight, 0);
+  VELOX_CHECK_GE(stats_.packedColumnsInFlight, 0);
 }
 
 std::string UcxDestinationQueue::toString() {
@@ -265,11 +281,12 @@ bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
 }
 
 bool UcxOutputQueue::checkTransferCapacity(
+    int destination,
     int64_t maxBytes,
     ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_GT(maxBytes, 0);
-  const auto transferBytes = transferBytesLocked();
+  const auto transferBytes = transferBytesLocked(destination);
   if (transferBytes >= maxBytes && future) {
     transferPromises_.emplace_back("UcxOutputQueue::checkTransferCapacity");
     *future = transferPromises_.back().getSemiFuture();
@@ -315,12 +332,17 @@ void UcxOutputQueue::releaseOutputReservation(int64_t bytes) {
 }
 
 void UcxOutputQueue::releaseInFlightBytes(
+    int destination,
     int64_t bytes,
     int64_t numPackedCols) {
   std::vector<ContinuePromise> promises;
   std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    if (destination >= 0 && destination < queues_.size() &&
+        queues_[destination] != nullptr) {
+      queues_[destination]->releaseInFlight(bytes, numPackedCols);
+    }
     updateStatsWithSendCompleteLocked(bytes, numPackedCols, promises);
     transferPromises = std::move(transferPromises_);
   }
@@ -734,8 +756,11 @@ int64_t UcxOutputQueue::retainedPackedColumnsLocked() const {
   return queuedPackedColumns_ + inFlightPackedColumns_;
 }
 
-int64_t UcxOutputQueue::transferBytesLocked() const {
-  return queuedBytes_ + inFlightBytes_;
+int64_t UcxOutputQueue::transferBytesLocked(int destination) const {
+  VELOX_CHECK_GE(destination, 0);
+  VELOX_CHECK_LT(destination, queues_.size());
+  auto* queue = queues_[destination].get();
+  return queue == nullptr ? 0 : queue->transferBytes();
 }
 
 } // namespace facebook::velox::ucx_exchange

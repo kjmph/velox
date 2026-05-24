@@ -24,6 +24,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -37,6 +38,8 @@ namespace facebook::velox::cudf_velox {
 // GPU data.
 class CudfVector : public RowVector {
  public:
+  using ReleaseCallback = std::function<void()>;
+
   /// Constructs a CudfVector from an owned cudf::table.
   CudfVector(
       velox::memory::MemoryPool* pool,
@@ -53,7 +56,10 @@ class CudfVector : public RowVector {
       TypePtr type,
       vector_size_t size,
       std::unique_ptr<cudf::packed_table>&& packedTable,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      ReleaseCallback releaseCallback = nullptr);
+
+  ~CudfVector() override;
 
   rmm::cuda_stream_view stream() const {
     return stream_;
@@ -76,6 +82,8 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
+  void runReleaseCallback();
+
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<
@@ -89,6 +97,7 @@ class CudfVector : public RowVector {
 
   rmm::cuda_stream_view stream_;
   uint64_t flatSize_;
+  ReleaseCallback releaseCallback_;
 };
 
 using CudfVectorPtr = std::shared_ptr<CudfVector>;

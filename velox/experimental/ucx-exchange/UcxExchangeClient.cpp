@@ -136,14 +136,18 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       }
     }
 
-    // Collect sources that need resuming while holding the lock.
+    // Collect sources that need resuming while holding the lock. Resume only
+    // when this consumer is asking for more data and none was immediately
+    // available; otherwise we can post the next UCX receive while the just
+    // dequeued packed table is still live in the operator.
     // We call resumeFromBackpressure() outside the lock to avoid a
     // lock-ordering hazard: it acquires WorkQueue::mutex_ via
     // addToWorkQueue(), and holding queue_->mutex_ here would impose
     // queue_->mutex_ -> WorkQueue::mutex_ ordering.
     const bool queueBelowLowWater =
+        queue_->receiveBytesBelowLowWaterLocked() &&
         queue_->size() <= UcxExchangeSource::backpressureLowWaterMark();
-    if (data != nullptr && queueBelowLowWater) {
+    if (data == nullptr && queueBelowLowWater) {
       sourcesToResume.assign(sources_.begin(), sources_.end());
     }
   }
@@ -156,6 +160,24 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
     stalePromise.setValue();
   }
   return data;
+}
+
+void UcxExchangeClient::releaseInFlightReceiveBytes(uint64_t bytes) {
+  std::vector<std::shared_ptr<UcxExchangeSource>> sourcesToResume;
+  {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    queue_->releaseInFlightReceiveBytesLocked(bytes);
+    const bool queueBelowLowWater =
+        queue_->receiveBytesBelowLowWaterLocked() &&
+        queue_->size() <= UcxExchangeSource::backpressureLowWaterMark();
+    if (!closed_ && queueBelowLowWater) {
+      sourcesToResume.assign(sources_.begin(), sources_.end());
+    }
+  }
+
+  for (auto& source : sourcesToResume) {
+    source->resumeFromBackpressure();
+  }
 }
 
 UcxExchangeClient::~UcxExchangeClient() {

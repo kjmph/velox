@@ -129,7 +129,10 @@ std::shared_ptr<UcxExchangeClient> getOrCreateExchangeClient(
   }
 
   auto client = std::make_shared<UcxExchangeClient>(
-      op->taskId(), ctx->task->destination(), factory.numDrivers);
+      op->taskId(),
+      ctx->task->destination(),
+      factory.numDrivers,
+      ctx->task->queryCtx()->queryConfig().maxOutputBufferSize());
   clientMap[key] = client;
   return client;
 }

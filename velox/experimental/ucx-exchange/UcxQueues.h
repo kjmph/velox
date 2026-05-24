@@ -190,10 +190,29 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       int32_t numRows);
 
   /// @brief Checks if the queue is over capacity and returns a future if so.
-  /// This should be called after enqueueing all partitions for a batch.
+  /// Producers call this before accepting more input and after enqueueing a
+  /// batch.
   /// @param future Output parameter - populated with a future if blocked.
   /// @return True if blocked (queue over capacity), false otherwise.
   bool checkBlocked(ContinueFuture* future);
+
+  /// @brief Checks if queued/in-flight transfer bytes exceed the active
+  /// producer's drain window. Unlike checkBlocked(), this intentionally ignores
+  /// producer-side reserved bytes so the active producer can pause while
+  /// holding a materialized partitioned table without deadlocking on its own
+  /// reservation.
+  bool checkTransferCapacity(int64_t maxBytes, ContinueFuture* future);
+
+  /// @brief Reserves producer-side bytes before GPU output materialization.
+  /// Returns true and populates 'future' if accepting this reservation would
+  /// exceed the retained-byte budget.
+  bool reserveOutputBytes(int64_t bytes, ContinueFuture* future);
+
+  /// @brief Releases a producer-side byte reservation.
+  void releaseOutputReservation(int64_t bytes);
+
+  /// @brief Releases bytes retained by an in-flight exchange transfer.
+  void releaseInFlightBytes(int64_t bytes, int64_t numPackedCols);
 
   /// @brief Returns the data for the given destination through the callback
   /// function. If data is available, notify will be called immediately. If
@@ -241,7 +260,12 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // Methods that update the statistics.
   void updateStatsWithEnqueuedLocked(int64_t bytes, int64_t rows);
 
-  // updates the counters and returns promises if the queuedBytes_ counter falls
+  // Moves queued bytes into the in-flight transfer accounting. The data has
+  // left a destination queue, but UCX or the intra-node transfer registry still
+  // owns a reference to the packed columns.
+  void updateStatsWithDequeuedLocked(int64_t bytes, int64_t numPackedCols);
+
+  // updates the counters and returns promises if retained output bytes fall
   // below the continueSize_ low water mark. These promises then need to be
   // realized outside the lock.
   void updateStatsWithFreedLocked(
@@ -249,9 +273,22 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       int64_t numPackedCols,
       std::vector<ContinuePromise>& promises);
 
+  void updateStatsWithSendCompleteLocked(
+      int64_t bytes,
+      int64_t numPackedCols,
+      std::vector<ContinuePromise>& promises);
+
   void updateTotalQueuedBytesMsLocked();
 
   int64_t getAverageQueueTimeMsLocked() const;
+
+  void maybeContinueProducersLocked(std::vector<ContinuePromise>& promises);
+
+  int64_t retainedBytesLocked() const;
+
+  int64_t retainedPackedColumnsLocked() const;
+
+  int64_t transferBytesLocked() const;
 
   // internal function that is called when all drivers are done.
   void noMoreDrivers();
@@ -316,9 +353,23 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // promises when buffer reached capacity and blocked further enqueueing.
   std::vector<ContinuePromise> promises_;
 
+  // Promises for the active producer waiting for queued/in-flight UCX transfer
+  // bytes to drop. Kept separate from promises_ because producer-side
+  // reservations remain held while a partitioned batch is partially drained.
+  std::vector<ContinuePromise> transferPromises_;
+
+  // Bytes reserved by producers before GPU materialization is visible in the
+  // destination queues.
+  int64_t reservedBytes_{0};
+
   // Bytes retained by destination queues.
   int64_t queuedBytes_{0};
   int64_t queuedPackedColumns_{0};
+
+  // Bytes already dequeued by servers but still retained by UCX sends or the
+  // intra-node transfer registry.
+  int64_t inFlightBytes_{0};
+  int64_t inFlightPackedColumns_{0};
 
   // The total number of bytes/rows/packedColumns sent via this output queue.
   int64_t totalBytesSent_{0};

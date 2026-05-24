@@ -42,6 +42,8 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::ReadyToReceive, "ReadyToReceive"},
           {UcxExchangeSource::ReceiverState::WaitingForMetadata,
            "WaitingForMetadata"},
+          {UcxExchangeSource::ReceiverState::WaitingForReceiveCredit,
+           "WaitingForReceiveCredit"},
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
            "WaitingForIntraNodeData"},
@@ -158,13 +160,7 @@ void UcxExchangeSource::process() {
       // will block at rendezvous until we post a matching tagRecv. For
       // intra-node: the server's publish future won't resolve until we poll.
       if (receiveQueueExceedsHighWater()) {
-        if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
-          std::lock_guard<std::mutex> l(queue_->mutex());
-          VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-                  << "] pausing before metadata receive"
-                  << " queueSize=" << queue_->size()
-                  << " highWater=" << backpressureHighWaterMark();
-        }
+        backpressureActive_.store(true, std::memory_order_release);
         // Go dormant; do not re-enqueue into work queue.
         // UcxExchangeClient::next() will call resumeFromBackpressure().
         break;
@@ -185,6 +181,11 @@ void UcxExchangeSource::process() {
     } break;
     case ReceiverState::WaitingForMetadata:
       // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
+      break;
+    case ReceiverState::WaitingForReceiveCredit:
+      if (pendingDataReceive_) {
+        startDataReceive(std::move(pendingDataReceive_));
+      }
       break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
@@ -264,15 +265,7 @@ void UcxExchangeSource::close() {
 void UcxExchangeSource::resumeFromBackpressure() {
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(
-          expected, false, std::memory_order_acq_rel)) {
-    int32_t queueSize;
-    {
-      std::lock_guard<std::mutex> l(queue_->mutex());
-      queueSize = queue_->size();
-    }
-    VLOG(1) << "[BACKPRESSURE] [ExSrc " << toString()
-            << "] resumed by consumer"
-            << " queueSize=" << queueSize;
+      expected, false, std::memory_order_acq_rel)) {
     communicator_->addToWorkQueue(getSelfPtr());
   }
 }
@@ -324,11 +317,16 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::getSelfPtr() {
   return ptr;
 }
 
-void UcxExchangeSource::enqueue(PackedTableWithStreamPtr data) {
+void UcxExchangeSource::enqueue(
+    PackedTableWithStreamPtr data,
+    uint64_t reservedReceiveBytes) {
   std::vector<velox::ContinuePromise> queuePromises;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
 
+    if (reservedReceiveBytes > 0) {
+      queue_->releaseReceiveBytesLocked(reservedReceiveBytes);
+    }
     queue_->enqueueLocked(std::move(data), queuePromises);
   }
   // wake up consumers of the UcxExchangeQueue
@@ -515,6 +513,11 @@ void UcxExchangeSource::onMetadata(
     ptr->metadata =
         std::move(MetadataMsg::deserializeMetadataMsg(metadataMsg->data()));
 
+    VELOX_CHECK_GE(
+        ptr->metadata.dataSizeBytes,
+        0,
+        "UCX metadata data size is negative");
+
     VLOG(3) << toString()
             << " Datasize bytes == " << ptr->metadata.dataSizeBytes;
 
@@ -534,11 +537,64 @@ void UcxExchangeSource::onMetadata(
   }
 }
 
+bool UcxExchangeSource::tryReserveReceiveBytes(
+    std::shared_ptr<DataAndMetadata> ptr) {
+  VELOX_CHECK_NOT_NULL(ptr);
+  {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    const auto dataSizeBytes =
+        static_cast<uint64_t>(ptr->metadata.dataSizeBytes);
+    if (queue_->tryReserveReceiveBytesLocked(dataSizeBytes)) {
+      ptr->receiveBytesReserved = true;
+      return true;
+    }
+
+    pendingDataReceive_ = ptr;
+    backpressureActive_.store(true, std::memory_order_release);
+  }
+
+  const auto state = getState();
+  if (state == ReceiverState::WaitingForMetadata) {
+    setStateIf(
+        ReceiverState::WaitingForMetadata,
+        ReceiverState::WaitingForReceiveCredit);
+  } else {
+    VELOX_CHECK(
+        state == ReceiverState::WaitingForReceiveCredit,
+        "Unexpected state {} while waiting for receive credit",
+        toName(state));
+  }
+  return false;
+}
+
+void UcxExchangeSource::releaseReceiveBytes(
+    std::shared_ptr<DataAndMetadata> ptr) {
+  if (!ptr || !ptr->receiveBytesReserved) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  queue_->releaseReceiveBytesLocked(
+      static_cast<uint64_t>(ptr->metadata.dataSizeBytes));
+  ptr->receiveBytesReserved = false;
+}
+
 void UcxExchangeSource::startDataReceive(
     std::shared_ptr<DataAndMetadata> ptr) {
   VELOX_CHECK_NOT_NULL(ptr);
   if (closed_.load(std::memory_order_acquire)) {
     deliverEndMarker();
+    return;
+  }
+
+  const auto expectedState = getState();
+  VELOX_CHECK(
+      expectedState == ReceiverState::WaitingForMetadata ||
+          expectedState == ReceiverState::WaitingForReceiveCredit,
+      "Unexpected state {} before starting UCX data receive",
+      toName(expectedState));
+
+  if (!tryReserveReceiveBytes(ptr)) {
     return;
   }
 
@@ -552,6 +608,7 @@ void UcxExchangeSource::startDataReceive(
         stream,
         cudf::get_current_device_resource_ref());
   } catch (const rmm::bad_alloc& e) {
+    releaseReceiveBytes(ptr);
     VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
@@ -572,8 +629,8 @@ void UcxExchangeSource::startDataReceive(
   VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
           << " using tag: " << std::hex << dataTag << std::dec;
 
-  if (!setStateIf(
-          ReceiverState::WaitingForMetadata, ReceiverState::WaitingForData)) {
+  if (!setStateIf(expectedState, ReceiverState::WaitingForData)) {
+    releaseReceiveBytes(ptr);
     VLOG(1) << toString() << " startDataReceive invalid previous state "
             << toName(getState());
     return;
@@ -604,6 +661,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onData called after close, ignoring";
+    releaseReceiveBytes(std::static_pointer_cast<DataAndMetadata>(arg));
     deliverEndMarker();
     return;
   }
@@ -611,11 +669,14 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
   if (getState() != ReceiverState::WaitingForData) {
     VLOG(2) << toString() << " onData called in state " << toName(getState())
             << ", ignoring (possible UCXX replay)";
+    releaseReceiveBytes(std::static_pointer_cast<DataAndMetadata>(arg));
     return;
   }
   VLOG(3) << toString() << " + onData " << ucs_status_string(status);
 
   if (status != UCS_OK) {
+    auto ptr = std::static_pointer_cast<DataAndMetadata>(arg);
+    releaseReceiveBytes(ptr);
     std::string errorMsg = fmt::format(
         "Failed to receive data from host {}:{}, task {}: {}",
         host_,
@@ -634,6 +695,10 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     std::shared_ptr<DataAndMetadata> ptr =
         std::static_pointer_cast<DataAndMetadata>(arg);
+    const uint64_t reservedReceiveBytes = ptr->receiveBytesReserved
+        ? static_cast<uint64_t>(ptr->metadata.dataSizeBytes)
+        : 0;
+    ptr->receiveBytesReserved = false;
 
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
@@ -651,7 +716,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     auto data = std::make_unique<PackedTableWithStream>(
         std::move(packedTable), ptr->stream);
 
-    enqueue(std::move(data));
+    enqueue(std::move(data), reservedReceiveBytes);
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
   communicator_->addToWorkQueue(getSelfPtr());
@@ -855,7 +920,8 @@ bool UcxExchangeSource::setStateIf(
 
 bool UcxExchangeSource::receiveQueueExceedsHighWater() {
   std::lock_guard<std::mutex> l(queue_->mutex());
-  return queue_->size() >= backpressureHighWaterMark();
+  return queue_->receiveBytesAtHighWaterLocked() ||
+      queue_->size() >= backpressureHighWaterMark();
 }
 
 } // namespace facebook::velox::ucx_exchange

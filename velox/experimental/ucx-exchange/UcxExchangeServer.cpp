@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+#include <atomic>
 #include <glog/logging.h>
 #include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -62,6 +63,10 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  std::shared_ptr<UcxOutputQueueManager> queueMgr;
+  std::string taskId;
+  int64_t bytes{0};
+  std::atomic<bool> released{false};
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -307,6 +312,7 @@ void UcxExchangeServer::sendData() {
               key, dataPtr_, /*atEnd=*/false);
       dataPtr_.reset();
       intraNodeAtEndPublished_ = false;
+      intraNodeBytesInFlight_ = true;
 
       // Transition to WaitingForIntraNodeRetrieve state
       setState(ServerState::WaitingForIntraNodeRetrieve);
@@ -419,6 +425,9 @@ void UcxExchangeServer::sendData() {
       // queuing the state transition back to the communicator thread.
       auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
+      dataCtx->queueMgr = queueMgr_;
+      dataCtx->taskId = partitionKey_.taskId;
+      dataCtx->bytes = bytes_;
 
       std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
       if (dataRequest_) {
@@ -435,7 +444,10 @@ void UcxExchangeServer::sendData() {
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
-            ctx->data.reset();
+            if (!ctx->released.exchange(true)) {
+              ctx->data.reset();
+              ctx->queueMgr->releaseInFlightBytes(ctx->taskId, ctx->bytes, 1L);
+            }
 
             if (auto self = weakData.lock()) {
               self->enqueueStateEvent(
@@ -525,6 +537,8 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
   VLOG(3) << "@" << partitionKey_.taskId
           << " Intra-node transfer complete for sequence " << sequenceNumber_;
 
+  releaseIntraNodeInFlightBytes();
+
   if (intraNodeAtEndPublished_) {
     // This was the final atEnd marker, we're done
     VLOG(3) << "@" << partitionKey_.taskId
@@ -536,6 +550,14 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
     setState(ServerState::ReadyToTransfer);
   }
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeServer::releaseIntraNodeInFlightBytes() {
+  if (!intraNodeBytesInFlight_) {
+    return;
+  }
+  queueMgr_->releaseInFlightBytes(partitionKey_.taskId, bytes_, 1L);
+  intraNodeBytesInFlight_ = false;
 }
 
 } // namespace facebook::velox::ucx_exchange

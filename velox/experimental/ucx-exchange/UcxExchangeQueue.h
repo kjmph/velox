@@ -47,8 +47,12 @@ using PackedTableWithStreamPtr = std::unique_ptr<PackedTableWithStream>;
 
 class UcxExchangeQueue {
  public:
-  explicit UcxExchangeQueue(int32_t numberOfConsumers)
-      : numberOfConsumers_{numberOfConsumers} {
+  explicit UcxExchangeQueue(
+      int32_t numberOfConsumers,
+      uint64_t receiveHighWaterBytes = 0)
+      : numberOfConsumers_{numberOfConsumers},
+        receiveHighWaterBytes_{receiveHighWaterBytes},
+        receiveLowWaterBytes_{(receiveHighWaterBytes * kContinuePct) / 100} {
     VELOX_CHECK_GE(numberOfConsumers, 1);
   }
 
@@ -105,7 +109,35 @@ class UcxExchangeQueue {
     return totalBytes_;
   }
 
-  /// Returns the maximum value of total bytes.
+  uint64_t retainedReceiveBytesLocked() const {
+    return totalBytes_ + reservedBytes_ + inFlightBytes_;
+  }
+
+  uint64_t receiveHighWaterBytes() const {
+    return receiveHighWaterBytes_;
+  }
+
+  uint64_t receiveLowWaterBytes() const {
+    return receiveLowWaterBytes_;
+  }
+
+  bool receiveBytesAtHighWaterLocked() const {
+    return receiveHighWaterBytes_ > 0 &&
+        retainedReceiveBytesLocked() >= receiveHighWaterBytes_;
+  }
+
+  bool receiveBytesBelowLowWaterLocked() const {
+    return receiveHighWaterBytes_ == 0 ||
+        retainedReceiveBytesLocked() <= receiveLowWaterBytes_;
+  }
+
+  bool tryReserveReceiveBytesLocked(uint64_t bytes);
+
+  void releaseReceiveBytesLocked(uint64_t bytes);
+
+  void releaseInFlightReceiveBytesLocked(uint64_t bytes);
+
+  /// Returns the maximum retained receive bytes.
   uint64_t peakBytes() const {
     return peakBytes_;
   }
@@ -134,6 +166,7 @@ class UcxExchangeQueue {
   std::vector<ContinuePromise> closeLocked() {
     queue_.clear();
     totalBytes_ = 0;
+    reservedBytes_ = 0;
     return clearAllPromisesLocked();
   }
 
@@ -177,6 +210,8 @@ class UcxExchangeQueue {
     }
   }
 
+  static constexpr uint32_t kContinuePct{70};
+
   const int32_t numberOfConsumers_;
 
   int numCompleted_{0};
@@ -194,12 +229,20 @@ class UcxExchangeQueue {
   std::string error_;
   // Total size of packed tables in queue.
   int64_t totalBytes_{0};
+  // Bytes reserved for posted or pending UCX receives not yet enqueued.
+  int64_t reservedBytes_{0};
+  // Bytes dequeued by an Exchange operator but still retained by downstream
+  // CudfVectors that own the packed table.
+  int64_t inFlightBytes_{0};
+  int64_t inFlightTables_{0};
+  const uint64_t receiveHighWaterBytes_{0};
+  const uint64_t receiveLowWaterBytes_{0};
   // Number of packed tables received.
   int64_t receivedTables_{0};
   // Total size of packed tables received. Used to calculate an average
   // expected size.
   int64_t receivedBytes_{0};
-  // Maximum value of totalBytes_.
+  // Maximum value of retained receive bytes.
   int64_t peakBytes_{0};
   // Peak queue size (number of items). Used for high-water-mark alerts.
   int64_t peakSize_{0};

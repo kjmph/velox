@@ -71,11 +71,33 @@ class UcxOutputQueueManager {
       int32_t numRows);
 
   /// @brief Checks if the queue for a task is over capacity.
-  /// Should be called after enqueueing all partitions for a batch.
+  /// Producers call this before accepting more input and after enqueueing a
+  /// batch.
   /// @param taskId The unique task Id.
   /// @param future Output parameter - populated with a future if blocked.
   /// @return True if blocked (queue over capacity), false otherwise.
   bool checkBlocked(std::string_view taskId, ContinueFuture* future);
+
+  /// @brief Checks active producer queued/in-flight transfer bytes.
+  bool checkTransferCapacity(
+      std::string_view taskId,
+      int64_t maxBytes,
+      ContinueFuture* future);
+
+  /// @brief Reserves bytes for producer-side GPU output materialization.
+  bool reserveOutputBytes(
+      std::string_view taskId,
+      int64_t bytes,
+      ContinueFuture* future);
+
+  /// @brief Releases bytes reserved for output materialization.
+  void releaseOutputReservation(std::string_view taskId, int64_t bytes);
+
+  /// @brief Releases bytes retained by an in-flight exchange transfer.
+  void releaseInFlightBytes(
+      std::string_view taskId,
+      int64_t bytes,
+      int64_t numPackedCols);
 
   /// @brief Indicates that no more data will be coming for this task.
   void noMoreData(std::string_view taskId);

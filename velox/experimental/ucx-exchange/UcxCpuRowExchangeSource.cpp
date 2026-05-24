@@ -242,11 +242,7 @@ void UcxCpuRowExchangeSource::process() {
       int32_t queueSize = queue_->size();
       const int32_t highWater = backpressureHighWaterMark();
       if (queueSize > highWater) {
-        if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
-          VLOG(1) << "[BACKPRESSURE-CPU] [ExSrc " << toString()
-                  << "] pausing, queueSize=" << queueSize
-                  << " > highWater=" << highWater;
-        }
+        backpressureActive_.store(true, std::memory_order_release);
         break;
       }
 
@@ -335,9 +331,7 @@ void UcxCpuRowExchangeSource::close() {
 void UcxCpuRowExchangeSource::resumeFromBackpressure() {
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(
-          expected, false, std::memory_order_acq_rel)) {
-    VLOG(1) << "[BACKPRESSURE-CPU] [ExSrc " << toString()
-            << "] resumed by consumer, queueSize=" << queue_->size();
+      expected, false, std::memory_order_acq_rel)) {
     communicator_->addToWorkQueue(getSelfPtr());
   }
 }
@@ -602,11 +596,7 @@ void UcxCpuRowExchangeSource::postReceiveWindow() {
     int32_t queueSize = queue_->size();
     const int32_t highWater = backpressureHighWaterMark();
     if (queueSize > highWater) {
-      if (!backpressureActive_.exchange(true, std::memory_order_acq_rel)) {
-        VLOG(1) << "[BACKPRESSURE-CPU] [ExSrc " << toString()
-                << "] pausing, queueSize=" << queueSize
-                << " > highWater=" << highWater;
-      }
+      backpressureActive_.store(true, std::memory_order_release);
       break;
     }
 

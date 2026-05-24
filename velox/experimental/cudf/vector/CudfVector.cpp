@@ -25,6 +25,8 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <exception>
+
 #if __has_include(<cudf/column/column_stream.hpp>)
 #include <cudf/column/column_stream.hpp>
 #define VELOX_CUDF_HAS_COLUMN_REBIND_STREAM 1
@@ -144,7 +146,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    rmm::cuda_stream_view stream)
+    rmm::cuda_stream_view stream,
+    ReleaseCallback releaseCallback)
     : RowVector(
           pool,
           std::move(type),
@@ -153,13 +156,40 @@ CudfVector::CudfVector(
           std::vector<VectorPtr>(),
           std::nullopt),
       tableStorage_{std::move(packedTable)},
-      stream_{stream} {
+      stream_{stream},
+      releaseCallback_{std::move(releaseCallback)} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
   // For packed table, flatSize is the size of the GPU data buffer
   flatSize_ = packedPtr->data.gpu_data->size();
+}
+
+CudfVector::~CudfVector() {
+  if (auto* tablePtr =
+          std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
+    tablePtr->reset();
+  } else {
+    auto& packedPtr =
+        std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
+    packedPtr.reset();
+  }
+  runReleaseCallback();
+}
+
+void CudfVector::runReleaseCallback() {
+  ReleaseCallback callback;
+  callback.swap(releaseCallback_);
+  if (!callback) {
+    return;
+  }
+
+  try {
+    callback();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "CudfVector release callback failed: " << e.what();
+  }
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {
@@ -179,6 +209,7 @@ std::unique_ptr<cudf::table> CudfVector::release() {
   stream_.synchronize();
   // Clear the packed table since we've materialized
   packedPtr.reset();
+  runReleaseCallback();
   return materializedTable;
 }
 

@@ -81,6 +81,37 @@ bool UcxOutputQueueManager::checkBlocked(
   return getQueue(taskId)->checkBlocked(future);
 }
 
+bool UcxOutputQueueManager::checkTransferCapacity(
+    std::string_view taskId,
+    int64_t maxBytes,
+    ContinueFuture* future) {
+  return getQueue(taskId)->checkTransferCapacity(maxBytes, future);
+}
+
+bool UcxOutputQueueManager::reserveOutputBytes(
+    std::string_view taskId,
+    int64_t bytes,
+    ContinueFuture* future) {
+  return getQueue(taskId)->reserveOutputBytes(bytes, future);
+}
+
+void UcxOutputQueueManager::releaseOutputReservation(
+    std::string_view taskId,
+    int64_t bytes) {
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->releaseOutputReservation(bytes);
+  }
+}
+
+void UcxOutputQueueManager::releaseInFlightBytes(
+    std::string_view taskId,
+    int64_t bytes,
+    int64_t numPackedCols) {
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->releaseInFlightBytes(bytes, numPackedCols);
+  }
+}
+
 void UcxOutputQueueManager::noMoreData(std::string_view taskId) {
   getQueue(taskId)->noMoreData();
 }
@@ -113,16 +144,11 @@ void UcxOutputQueueManager::getData(
       // crashes when deleteResults() is called for other destinations.
       if (removedTasks_.withLock(
               [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
-        VLOG(2) << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
-                << " getData ignored (task already removed)";
         taskRemoved = true;
         return;
       }
       // create the queue structures such that the notify callback can be
       // stored. It will be later initialized once the task is being created.
-      VLOG(2)
-          << "[QUEUE-MGR] task=" << taskId << " dest=" << destination
-          << " creating placeholder queue (server arrived before task init)";
       outputQueue = std::make_shared<UcxOutputQueue>(nullptr, destination, 0);
       queues[taskIdStr] = outputQueue;
     } else {
@@ -167,8 +193,6 @@ void UcxOutputQueueManager::removeTask(std::string_view taskId) {
             [&](auto& removed) { removed.insert(taskIdStr); });
         return taskQueue;
       });
-  VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
-          << " queueExists=" << (queue != nullptr);
   if (queue != nullptr) {
     queue->terminate();
   }

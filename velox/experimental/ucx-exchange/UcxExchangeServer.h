@@ -102,6 +102,8 @@ class UcxExchangeServer
   /// data.
   void onIntraNodeRetrieveComplete();
 
+  void releaseIntraNodeInFlightBytes();
+
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
   /// @param newState the new state of the UcxExchangeServer.
@@ -153,7 +155,8 @@ class UcxExchangeServer
   std::vector<std::shared_ptr<ucxx::Request>> completedRequests_;
 
   std::chrono::time_point<std::chrono::high_resolution_clock> sendStart_;
-  std::size_t bytes_;
+  std::size_t bytes_{0};
+  bool intraNodeBytesInFlight_{false};
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
 };

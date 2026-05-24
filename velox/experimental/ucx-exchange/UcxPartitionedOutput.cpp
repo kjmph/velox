@@ -20,8 +20,8 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/CudfConfig.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include <cudf/concatenate.hpp>
@@ -30,9 +30,29 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
 
+#include <algorithm>
+#include <limits>
+
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+uint64_t multiplySaturated(uint64_t value, uint64_t multiplier) {
+  if (value == 0) {
+    return 0;
+  }
+  if (multiplier > std::numeric_limits<uint64_t>::max() / value) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return value * multiplier;
+}
+
+uint64_t divideCeil(uint64_t value, uint64_t divisor) {
+  VELOX_CHECK_GT(divisor, 0);
+  return value / divisor + (value % divisor == 0 ? 0 : 1);
+}
+} // namespace
 
 // Computes a mapping from names in n2 to names in n1
 // and returns that mapping in remap.
@@ -74,7 +94,9 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
           core::QueryConfig::kUcxPartitionedOutputBatchRows,
-          CudfConfig::getInstance().partitionedOutputBatchRows)) {
+          CudfConfig::getInstance().partitionedOutputBatchRows)),
+      initialPayloadBytes_(
+          std::max<uint64_t>(ctx->queryConfig().maxOutputBufferSize(), 1)) {
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -101,21 +123,32 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
       !future_.valid() || future_.hasValue(),
       "addInput with outstanding future!");
 
+  const auto inputBytes = input->estimateFlatSize();
   // Record stats per-input (before buffering).
   {
     auto lockedStats = stats_.wlock();
-    lockedStats->addOutputVector(input->estimateFlatSize(), input->size());
+    lockedStats->addOutputVector(inputBytes, input->size());
   }
 
   pendingRows_ += cudfVector->getTableView().num_rows();
+  pendingBytes_ += inputBytes;
   pendingInputs_.push_back(std::move(cudfVector));
 
-  if (targetRowsPerChunk_ <= 0 || pendingRows_ >= targetRowsPerChunk_) {
+  if (shouldFlushPending()) {
+    if (!ensureOutputReservation(&future_)) {
+      blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+      return;
+    }
     flushPending();
   }
 }
 
 void UcxPartitionedOutput::flushPending() {
+  if (pendingPartitionedBatch_) {
+    drainPendingPartitionedBatch();
+    return;
+  }
+
   if (pendingInputs_.empty()) {
     return;
   }
@@ -156,6 +189,7 @@ void UcxPartitionedOutput::flushPending() {
 
       // Free input GPU memory before partitioning (peak = 2x -> 1x).
       pendingInputs_.clear();
+      pendingBytes_ = 0;
 
       tableView = mergedTable->view();
     }
@@ -165,9 +199,27 @@ void UcxPartitionedOutput::flushPending() {
     if (numPartitions_ > 1) {
       if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
         hashPartition(tableView, stream);
+        if (mergedTable == nullptr) {
+          std::vector<rmm::cuda_stream_view> inputStreams;
+          inputStreams.reserve(pendingInputs_.size());
+          for (const auto& input : pendingInputs_) {
+            inputStreams.push_back(input->stream());
+          }
+          orderCudfVectorDeallocationsAfterStream(
+              pendingInputs_, inputStreams, stream);
+        }
       } else {
-        equalPartition(tableView, stream);
+        std::vector<CudfVectorPtr> vectorOwners;
+        if (mergedTable == nullptr) {
+          vectorOwners = std::move(pendingInputs_);
+        }
+        equalPartition(
+            tableView, stream, std::move(mergedTable), std::move(vectorOwners));
       }
+      pendingInputs_.clear();
+      pendingRows_ = 0;
+      pendingBytes_ = 0;
+      drainPendingPartitionedBatch();
     } else {
       auto packedCols = cudf::pack(
           tableView, stream, cudf::get_current_device_resource_ref());
@@ -176,26 +228,27 @@ void UcxPartitionedOutput::flushPending() {
           std::move(packedCols.metadata), std::move(packedCols.gpu_data));
       queueManager->enqueue(
           this->taskId(), 0, std::move(packedColsPtr), tableView.num_rows());
-    }
 
-    // Check backpressure after enqueue.
-    auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
-    if (blocked) {
-      VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
-              << " is blocked, can no longer write to output!";
-    }
-    blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
-                              : exec::BlockingReason::kNotBlocked;
+      // Check backpressure after enqueue.
+      auto blocked = queueManager->checkBlocked(this->taskId(), &future_);
+      blockingReason_ = blocked ? exec::BlockingReason::kWaitForConsumer
+                                : exec::BlockingReason::kNotBlocked;
 
-    pendingInputs_.clear();
-    pendingRows_ = 0;
+      pendingInputs_.clear();
+      pendingRows_ = 0;
+      pendingBytes_ = 0;
+      releaseOutputReservation();
+    }
 
   } catch (const rmm::bad_alloc& e) {
     VLOG(1)
         << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
         << " caught memory alloc error, removing all memory in output queues";
     pendingInputs_.clear();
+    pendingPartitionedBatch_.reset();
     pendingRows_ = 0;
+    pendingBytes_ = 0;
+    releaseOutputReservation();
     for (int i = 0; i < numPartitions_; i++) {
       sharedQueueManager()->deleteResults(this->taskId(), i);
     }
@@ -209,6 +262,16 @@ exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
     blockingReason_ = exec::BlockingReason::kNotBlocked;
     return exec::BlockingReason::kWaitForConsumer;
   }
+  if (shouldDrainPending()) {
+    if (!pendingPartitionedBatch_ && !ensureOutputReservation(future)) {
+      return exec::BlockingReason::kWaitForConsumer;
+    }
+    return exec::BlockingReason::kNotBlocked;
+  }
+  if (!finished_ &&
+      sharedQueueManager()->checkBlocked(this->taskId(), future)) {
+    return exec::BlockingReason::kWaitForConsumer;
+  }
   return exec::BlockingReason::kNotBlocked;
 }
 
@@ -217,8 +280,17 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
   if (finished_) {
     return nullptr;
   }
+  if (shouldDrainPending()) {
+    if (!pendingPartitionedBatch_ && outputReservationBytes_ == 0) {
+      return nullptr;
+    }
+    flushPending();
+    if (shouldDrainPending() ||
+        blockingReason_ != exec::BlockingReason::kNotBlocked) {
+      return nullptr;
+    }
+  }
   if (noMoreInput_) {
-    flushPending(); // drain any remaining buffered inputs
     sharedQueueManager()->noMoreData(this->taskId());
     finished_ = true;
   }
@@ -235,6 +307,41 @@ UcxPartitionedOutput::sharedQueueManager() {
   VELOX_CHECK_NOT_NULL(
       shared_queueManager, "OutputQueueManager was already destructed");
   return shared_queueManager;
+}
+
+bool UcxPartitionedOutput::shouldFlushPending() const {
+  return !pendingInputs_.empty() &&
+      (targetRowsPerChunk_ <= 0 || pendingRows_ >= targetRowsPerChunk_);
+}
+
+bool UcxPartitionedOutput::shouldDrainPending() const {
+  return pendingPartitionedBatch_.has_value() || shouldFlushPending() ||
+      (noMoreInput_ && !pendingInputs_.empty());
+}
+
+bool UcxPartitionedOutput::ensureOutputReservation(ContinueFuture* future) {
+  if (outputReservationBytes_ > 0) {
+    return true;
+  }
+
+  auto queueManager = sharedQueueManager();
+  const auto reservationBytes = std::max<int64_t>(pendingBytes_, 1);
+  if (queueManager->reserveOutputBytes(
+          this->taskId(), reservationBytes, future)) {
+    return false;
+  }
+  outputReservationBytes_ = reservationBytes;
+  return true;
+}
+
+void UcxPartitionedOutput::releaseOutputReservation() {
+  if (outputReservationBytes_ == 0) {
+    return;
+  }
+  const auto reservationBytes = outputReservationBytes_;
+  outputReservationBytes_ = 0;
+  sharedQueueManager()->releaseOutputReservation(
+      this->taskId(), reservationBytes);
 }
 
 void UcxPartitionedOutput::initPartitionKeys(
@@ -312,60 +419,192 @@ void UcxPartitionedOutput::hashPartition(
   VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
 
-  // Erase first element since it's always 0 and we don't need it.
-  partitionOffsets.erase(partitionOffsets.begin());
-  partitionOffsets.pop_back();
-
-  splitAndEnqueue(partitionedTable->view(), partitionOffsets, stream);
+  auto partitionedView = partitionedTable->view();
+  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
+      std::move(partitionedTable),
+      {},
+      partitionedView,
+      std::move(partitionOffsets),
+      outputReservationBytes_,
+      stream,
+      0});
 }
 
 void UcxPartitionedOutput::equalPartition(
     cudf::table_view tableView,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<cudf::table> tableOwner,
+    std::vector<CudfVectorPtr> vectorOwners) {
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " Splitting into " << numPartitions_ << " chunks";
   std::vector<cudf::size_type> offsets;
   cudf::size_type size = tableView.num_rows();
+  offsets.reserve(numPartitions_ + 1);
+  offsets.push_back(0);
   for (int i = 1; i < numPartitions_; ++i) {
     cudf::size_type idx = size * i / numPartitions_;
     offsets.push_back(idx);
   }
-  splitAndEnqueue(tableView, offsets, stream);
+  offsets.push_back(size);
+
+  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
+      std::move(tableOwner),
+      std::move(vectorOwners),
+      tableView,
+      std::move(offsets),
+      outputReservationBytes_,
+      stream,
+      0});
 }
 
-void UcxPartitionedOutput::splitAndEnqueue(
-    cudf::table_view tableView,
-    std::vector<cudf::size_type> offsets,
-    rmm::cuda_stream_view stream) {
-  auto contiguousTables = cudf::contiguous_split(
-      tableView, offsets, stream, cudf::get_current_device_resource_ref());
+// Estimate a row chunk size that keeps each packed UCX payload under the given
+// byte target. The caller increases the target geometrically, so large
+// partitions do not become many tiny messages, while the first allocations stay
+// small enough to avoid an immediate memory spike.
+cudf::size_type UcxPartitionedOutput::rowsForPayloadTarget(
+    const PendingPartitionedBatch& batch,
+    cudf::size_type start,
+    cudf::size_type end,
+    uint64_t targetBytes) const {
+  const auto partitionRows = end - start;
+  if (partitionRows <= 0) {
+    return 0;
+  }
 
-  // Synchronize the stream to ensure CUDA operations complete before enqueuing.
-  // UCXX/UCX is not stream-aware, so without syncing, data could be sent before
-  // the GPU kernels have finished writing to the buffers.
-  stream.synchronize();
+  const auto totalRows = batch.tableView.num_rows();
+  if (totalRows <= 0 || batch.estimatedBytes <= 0 || targetBytes == 0) {
+    return partitionRows;
+  }
+
+  const auto estimatedPartitionBytes =
+      static_cast<long double>(batch.estimatedBytes) *
+      static_cast<long double>(partitionRows) /
+      static_cast<long double>(totalRows);
+  if (estimatedPartitionBytes <= static_cast<long double>(targetBytes)) {
+    return partitionRows;
+  }
+
+  const auto rows = static_cast<cudf::size_type>(
+      static_cast<long double>(partitionRows) *
+      static_cast<long double>(targetBytes) / estimatedPartitionBytes);
+  return std::max<cudf::size_type>(rows, 1);
+}
+
+bool UcxPartitionedOutput::shouldSplitPayload(
+    const PendingPartitionedBatch& batch,
+    cudf::size_type start,
+    cudf::size_type end) const {
+  const auto partitionRows = end - start;
+  const auto totalRows = batch.tableView.num_rows();
+  if (partitionRows <= 0 || totalRows <= 0 || batch.estimatedBytes <= 0) {
+    return false;
+  }
+
+  const auto estimatedPartitionBytes =
+      static_cast<long double>(batch.estimatedBytes) *
+      static_cast<long double>(partitionRows) /
+      static_cast<long double>(totalRows);
+  return estimatedPartitionBytes >
+      static_cast<long double>(transferWindowBytes(batch));
+}
+
+uint64_t UcxPartitionedOutput::transferWindowBytes(
+    const PendingPartitionedBatch& batch) const {
+  if (batch.estimatedBytes <= 0 || numPartitions_ == 0) {
+    return initialPayloadBytes_;
+  }
+
+  const auto averagePartitionBytes = divideCeil(
+      static_cast<uint64_t>(batch.estimatedBytes),
+      static_cast<uint64_t>(numPartitions_));
+  return std::max<uint64_t>(initialPayloadBytes_, averagePartitionBytes);
+}
+
+bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
+  VELOX_CHECK(pendingPartitionedBatch_.has_value());
+  VELOX_CHECK_GT(outputReservationBytes_, 0);
+
+  auto queueManager = sharedQueueManager();
+  auto& batch = pendingPartitionedBatch_.value();
 
   VELOX_CHECK_EQ(
-      offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
-  auto queueManager = sharedQueueManager();
-  for (int i = 0; i < numPartitions_; ++i) {
-    auto const& partitionTable = contiguousTables[i];
-    if (partitionTable.table.num_rows() == 0) {
-      // Skip empty partitions.
+      batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
+
+  while (batch.nextPartition < numPartitions_) {
+    const auto partition = batch.nextPartition;
+    const auto start = batch.offsets[partition];
+    const auto end = batch.offsets[partition + 1];
+    VELOX_CHECK_LE(start, end);
+    if (start == end) {
+      ++batch.nextPartition;
       continue;
     }
 
-    auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-        std::move(contiguousTables[i].data.metadata),
-        std::move(contiguousTables[i].data.gpu_data));
+    const auto transferWindow = transferWindowBytes(batch);
+    if (batch.nextRow == 0) {
+      batch.nextRow = start;
+      batch.nextPayloadBytes =
+          shouldSplitPayload(batch, start, end) ? initialPayloadBytes_
+                                                : transferWindow;
+    }
 
-    // enqueue partition data on Ucx Output Buffer
-    queueManager->enqueue(
-        this->taskId(),
-        i,
-        std::move(packedColsPtr),
-        partitionTable.table.num_rows());
+    while (batch.nextRow < end) {
+      if (queueManager->checkTransferCapacity(
+              this->taskId(), transferWindow, &future_)) {
+        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+        return false;
+      }
+
+      const auto chunkStart = batch.nextRow;
+      const auto rowsPerChunk =
+          rowsForPayloadTarget(batch, chunkStart, end, batch.nextPayloadBytes);
+      VELOX_CHECK_GT(rowsPerChunk, 0);
+      const auto chunkEnd =
+          std::min<cudf::size_type>(end, chunkStart + rowsPerChunk);
+      std::vector<cudf::size_type> sliceOffsets{chunkStart, chunkEnd};
+      auto tableSlices = cudf::slice(batch.tableView, sliceOffsets);
+      VELOX_CHECK_EQ(tableSlices.size(), 1);
+
+      auto packedCols = cudf::pack(
+          tableSlices[0],
+          batch.stream,
+          cudf::get_current_device_resource_ref());
+
+      // UCXX/UCX is not stream-aware, so the packed payload must be complete
+      // before exposing its raw device pointer to the exchange server.
+      batch.stream.synchronize();
+
+      auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+
+      queueManager->enqueue(
+          this->taskId(),
+          partition,
+          std::move(packedColsPtr),
+          chunkEnd - chunkStart);
+
+      batch.nextRow = chunkEnd;
+      batch.nextPayloadBytes = std::min<uint64_t>(
+          transferWindow, multiplySaturated(batch.nextPayloadBytes, 2));
+
+      if (queueManager->checkTransferCapacity(
+              this->taskId(), transferWindow, &future_)) {
+        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+        return false;
+      }
+    }
+
+    ++batch.nextPartition;
+    batch.nextRow = 0;
+    batch.nextPayloadBytes = 0;
   }
+
+  pendingPartitionedBatch_.reset();
+  pendingRows_ = 0;
+  pendingBytes_ = 0;
+  releaseOutputReservation();
+  blockingReason_ = exec::BlockingReason::kNotBlocked;
+  return true;
 }
 
 } // namespace facebook::velox::ucx_exchange

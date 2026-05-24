@@ -315,13 +315,6 @@ bool UcxCpuRowOutputQueue::checkBlocked(ContinueFuture* future) {
       if (future == nullptr) {
         blocked = true;
       } else {
-        VLOG(3) << "[BACKPRESSURE-CPU] task="
-                << (task_ ? task_->taskId() : "n/a")
-                << " BLOCKED queuedBytes=" << queuedBytes_
-                << " highWaterMark=" << highWaterMark
-                << " baseMaxSize=" << maxSize_
-                << " backpressureFanout=" << backpressureFanoutLocked()
-                << " waitingProducers=" << (promises_.size() + 1);
         promises_.emplace_back("UcxCpuRowOutputQueue::checkBlocked");
         *future = promises_.back().getSemiFuture();
         blocked = true;
@@ -779,7 +772,7 @@ void UcxCpuRowOutputQueue::acknowledgeDirectHandoffLocked(
   pendingDirectHandoffPayloads_ -= numPayloads;
 }
 
-void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char* reason) {
+void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char*) {
   int64_t actualBytes = pendingDirectHandoffBytes_;
   int64_t actualPayloads = pendingDirectHandoffPayloads_;
   for (const auto& queue : queues_) {
@@ -795,13 +788,6 @@ void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char* reason) {
   }
 
   updateTotalQueuedBytesMsLocked();
-  VLOG(3) << "[BACKPRESSURE-CPU] task=" << (task_ ? task_->taskId() : "n/a")
-          << " reconcile reason=" << reason << " queuedBytes=" << queuedBytes_
-          << " actualQueuedBytes=" << actualBytes
-          << " queuedPayloads=" << queuedPayloads_
-          << " actualQueuedPayloads=" << actualPayloads
-          << " pendingDirectHandoffBytes=" << pendingDirectHandoffBytes_
-          << " pendingDirectHandoffPayloads=" << pendingDirectHandoffPayloads_;
   queuedBytes_ = actualBytes;
   queuedPayloads_ = actualPayloads;
 }
@@ -810,12 +796,6 @@ void UcxCpuRowOutputQueue::maybeUnblockProducersLocked(
     std::vector<ContinuePromise>& promises) {
   const auto lowWaterMark = lowWaterMarkLocked();
   if (queuedBytes_ <= lowWaterMark && !promises_.empty()) {
-    VLOG(3) << "[BACKPRESSURE-CPU] task=" << (task_ ? task_->taskId() : "n/a")
-            << " UNBLOCKING " << promises_.size() << " producers"
-            << " queuedBytes=" << queuedBytes_
-            << " lowWaterMark=" << lowWaterMark
-            << " baseContinueSize=" << continueSize_
-            << " backpressureFanout=" << backpressureFanoutLocked();
     promises = std::move(promises_);
   }
 }

@@ -67,6 +67,7 @@ class UcxExchangeSource
     WaitingForHandshakeResponse,
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData,
     Done,
@@ -146,6 +147,7 @@ class UcxExchangeSource
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
+    bool receiveBytesReserved{false};
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -173,7 +175,7 @@ class UcxExchangeSource
   std::shared_ptr<UcxExchangeSource> getSelfPtr();
 
   // Put the received data into the exchange queue.
-  void enqueue(PackedTableWithStreamPtr data);
+  void enqueue(PackedTableWithStreamPtr data, uint64_t reservedReceiveBytes = 0);
 
   /// @brief Sets the endpoint for this receiver.
   void setEndpoint(std::shared_ptr<EndpointRef> endpointRef);
@@ -196,6 +198,10 @@ class UcxExchangeSource
 
   /// Starts the data receive for metadata already received from the sender.
   void startDataReceive(std::shared_ptr<DataAndMetadata> dataAndMetadata);
+
+  bool tryReserveReceiveBytes(std::shared_ptr<DataAndMetadata> dataAndMetadata);
+
+  void releaseReceiveBytes(std::shared_ptr<DataAndMetadata> dataAndMetadata);
 
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
@@ -288,6 +294,7 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to the low-water threshold.
   std::atomic<bool> backpressureActive_{false};
+  std::shared_ptr<DataAndMetadata> pendingDataReceive_;
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;

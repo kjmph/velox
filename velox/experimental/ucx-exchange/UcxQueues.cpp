@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
+#include <algorithm>
 #include <sstream>
 
 #include <glog/logging.h>
@@ -254,11 +255,8 @@ void UcxOutputQueue::enqueue(
 
 bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
-  if (queuedBytes_ >= maxSize_ && future) {
-    VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
-            << " BLOCKED queuedBytes=" << queuedBytes_
-            << " maxSize=" << maxSize_
-            << " waitingProducers=" << (promises_.size() + 1);
+  const auto retainedBytes = retainedBytesLocked();
+  if (retainedBytes >= maxSize_ && future) {
     promises_.emplace_back("UcxOutputQueue::checkBlocked");
     *future = promises_.back().getSemiFuture();
     return true;
@@ -266,9 +264,76 @@ bool UcxOutputQueue::checkBlocked(ContinueFuture* future) {
   return false;
 }
 
+bool UcxOutputQueue::checkTransferCapacity(
+    int64_t maxBytes,
+    ContinueFuture* future) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_GT(maxBytes, 0);
+  const auto transferBytes = transferBytesLocked();
+  if (transferBytes >= maxBytes && future) {
+    transferPromises_.emplace_back("UcxOutputQueue::checkTransferCapacity");
+    *future = transferPromises_.back().getSemiFuture();
+    return true;
+  }
+  return false;
+}
+
+bool UcxOutputQueue::reserveOutputBytes(int64_t bytes, ContinueFuture* future) {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK_GT(bytes, 0);
+  const auto reservationBytes = static_cast<uint64_t>(bytes);
+  if (maxSize_ > 0) {
+    const auto retainedBytes = static_cast<uint64_t>(retainedBytesLocked());
+    if (retainedBytes > 0 &&
+        (reservationBytes > maxSize_ ||
+         retainedBytes > maxSize_ - reservationBytes)) {
+      VELOX_CHECK_NOT_NULL(future);
+      promises_.emplace_back("UcxOutputQueue::reserveOutputBytes");
+      *future = promises_.back().getSemiFuture();
+      return true;
+    }
+  }
+
+  reservedBytes_ += bytes;
+  return false;
+}
+
+void UcxOutputQueue::releaseOutputReservation(int64_t bytes) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (reservedBytes_ < bytes) {
+      reservedBytes_ = 0;
+    } else {
+      reservedBytes_ -= bytes;
+    }
+    maybeContinueProducersLocked(promises);
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+}
+
+void UcxOutputQueue::releaseInFlightBytes(
+    int64_t bytes,
+    int64_t numPackedCols) {
+  std::vector<ContinuePromise> promises;
+  std::vector<ContinuePromise> transferPromises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    updateStatsWithSendCompleteLocked(bytes, numPackedCols, promises);
+    transferPromises = std::move(transferPromises_);
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
+  }
+  for (auto& promise : transferPromises) {
+    promise.setValue();
+  }
+}
+
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
   UcxDestinationQueue::Data data;
-  std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     // If the queue doesn't exist yet, create an empty queue to store
@@ -290,26 +355,21 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
       data = queue->getData([notify, weakSelf](
                                 std::shared_ptr<cudf::packed_columns> data,
                                 std::vector<int64_t> remainingBytes) {
-        std::vector<ContinuePromise> promises;
         int64_t bytes = data ? data->gpu_data->size() : -1L;
-        notify(std::move(data), std::move(remainingBytes));
         if (bytes >= 0L) {
           auto self = weakSelf.lock();
-          if (!self) {
-            return;
+          if (self) {
+            std::lock_guard<std::mutex> l(self->mutex_);
+            self->updateStatsWithDequeuedLocked(bytes, 1L);
           }
-          std::lock_guard<std::mutex> l(self->mutex_);
-          self->updateStatsWithFreedLocked(bytes, 1L, promises);
         }
-        // Wake up any producers that are waiting for queue to become less full.
-        for (auto& promise : promises) {
-          promise.setValue();
-        }
+        notify(std::move(data), std::move(remainingBytes));
       });
       if (data.data) {
         // This implies data.immediate and no notify upcall will be done.
-        // Need to update the stats here.
-        updateStatsWithFreedLocked(data.data->gpu_data->size(), 1L, promises);
+        // Need to update the stats here. The data is retained by the server
+        // until transfer completion.
+        updateStatsWithDequeuedLocked(data.data->gpu_data->size(), 1L);
       }
     } else {
       data = UcxDestinationQueue::Data{nullptr, {}, true};
@@ -322,10 +382,6 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
     VLOG(2) << "[QUEUE] task=" << (task_ ? task_->taskId() : "n/a")
             << " dest=" << destination
             << " server waiting for data (callback installed)";
-  }
-  // Wake up any producers that are waiting for queue to become less full.
-  for (auto& promise : promises) {
-    promise.setValue();
   }
 }
 
@@ -341,6 +397,7 @@ void UcxOutputQueue::noMoreDrivers() {
 
 void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
   std::vector<UcxDataAvailable> finished;
+  std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (oneDriverFinished) {
@@ -352,28 +409,22 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
         "Each driver should call noMoreData exactly once");
     atEnd_ = numFinished_ == numDrivers_;
     if (!atEnd_) {
-      return;
-    }
-    {
-      int64_t avgRows = totalPackedColumnsSent_ > 0
-          ? totalRowsSent_ / totalPackedColumnsSent_
-          : 0;
-      VLOG(1) << "[OUTPUT-STATS] task=" << (task_ ? task_->taskId() : "n/a")
-              << " totalRows=" << totalRowsSent_
-              << " chunks=" << totalPackedColumnsSent_
-              << " avgRowsPerChunk=" << avgRows
-              << " totalBytes=" << totalBytesSent_;
-    }
-    for (auto& queue : queues_) {
-      if (queue != nullptr) {
-        queue->enqueueBack(nullptr);
-        finished.push_back(queue->getAndClearNotify());
+      maybeContinueProducersLocked(promises);
+    } else {
+      for (auto& queue : queues_) {
+        if (queue != nullptr) {
+          queue->enqueueBack(nullptr);
+          finished.push_back(queue->getAndClearNotify());
+        }
       }
     }
   }
   // Notify outside of mutex.
   for (auto& notification : finished) {
     notification.notify();
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
   }
 }
 
@@ -484,6 +535,7 @@ void UcxOutputQueue::deleteResults(int destination) {
   bool isFinished;
   UcxDataAvailable dataAvailable;
   std::vector<ContinuePromise> promises;
+  std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (destination >= queues_.size()) {
@@ -506,12 +558,16 @@ void UcxOutputQueue::deleteResults(int destination) {
     isFinished = isFinishedLocked();
     // update UcxOutputQueue stats
     updateStatsWithFreedLocked(bytes, packedCols, promises);
+    transferPromises = std::move(transferPromises_);
   }
 
   // Outside of mutex.
   dataAvailable.notify();
   // wake up any producers that are waiting for queue to become less full.
   for (auto& promise : promises) {
+    promise.setValue();
+  }
+  for (auto& promise : transferPromises) {
     promise.setValue();
   }
 
@@ -523,6 +579,7 @@ void UcxOutputQueue::deleteResults(int destination) {
 void UcxOutputQueue::terminate() {
   std::vector<UcxDataAvailable> pendingCallbacks;
   std::vector<ContinuePromise> promises;
+  std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (task_ && task_->isRunning()) {
@@ -539,7 +596,9 @@ void UcxOutputQueue::terminate() {
       }
     }
     // Release any outstanding producer-side promises (blocked on queue-full).
+    reservedBytes_ = 0;
     promises = std::move(promises_);
+    transferPromises = std::move(transferPromises_);
   }
 
   // Fire callbacks outside of mutex to avoid potential deadlocks.
@@ -548,6 +607,9 @@ void UcxOutputQueue::terminate() {
   }
   // Unblock any blocked producers.
   for (auto& promise : promises) {
+    promise.setValue();
+  }
+  for (auto& promise : transferPromises) {
     promise.setValue();
   }
 }
@@ -563,8 +625,8 @@ exec::OutputBuffer::Stats UcxOutputQueue::stats() {
       noMoreQueues_,
       atEnd_,
       isFinishedLocked(),
-      queuedBytes_,
-      queuedPackedColumns_,
+      retainedBytesLocked(),
+      retainedPackedColumnsLocked(),
       totalBytesSent_,
       totalRowsSent_,
       totalPackedColumnsSent_,
@@ -587,6 +649,22 @@ void UcxOutputQueue::updateStatsWithEnqueuedLocked(
   totalPackedColumnsSent_++;
 }
 
+void UcxOutputQueue::updateStatsWithDequeuedLocked(
+    int64_t bytes,
+    int64_t numPackedCols) {
+  updateTotalQueuedBytesMsLocked();
+
+  queuedBytes_ -= bytes;
+  queuedPackedColumns_ -= numPackedCols;
+  inFlightBytes_ += bytes;
+  inFlightPackedColumns_ += numPackedCols;
+
+  VELOX_CHECK_GE(queuedBytes_, 0);
+  VELOX_CHECK_GE(queuedPackedColumns_, 0);
+  VELOX_CHECK_GE(inFlightBytes_, 0);
+  VELOX_CHECK_GE(inFlightPackedColumns_, 0);
+}
+
 void UcxOutputQueue::updateStatsWithFreedLocked(
     int64_t bytes,
     int64_t numPackedCols,
@@ -601,13 +679,20 @@ void UcxOutputQueue::updateStatsWithFreedLocked(
 
   // Check whether queue is below low-water mark and return outstanding
   // promises
-  if (queuedBytes_ <= continueSize_ && !promises_.empty()) {
-    VLOG(2) << "[BACKPRESSURE] task=" << (task_ ? task_->taskId() : "n/a")
-            << " UNBLOCKING " << promises_.size() << " producers"
-            << " queuedBytes=" << queuedBytes_
-            << " continueSize=" << continueSize_;
-    promises = std::move(promises_);
-  }
+  maybeContinueProducersLocked(promises);
+}
+
+void UcxOutputQueue::updateStatsWithSendCompleteLocked(
+    int64_t bytes,
+    int64_t numPackedCols,
+    std::vector<ContinuePromise>& promises) {
+  inFlightBytes_ -= bytes;
+  inFlightPackedColumns_ -= numPackedCols;
+
+  VELOX_CHECK_GE(inFlightBytes_, 0);
+  VELOX_CHECK_GE(inFlightPackedColumns_, 0);
+
+  maybeContinueProducersLocked(promises);
 }
 
 void UcxOutputQueue::updateTotalQueuedBytesMsLocked() {
@@ -626,6 +711,31 @@ int64_t UcxOutputQueue::getAverageQueueTimeMsLocked() const {
   }
 
   return 0;
+}
+
+void UcxOutputQueue::maybeContinueProducersLocked(
+    std::vector<ContinuePromise>& promises) {
+  const auto retainedBytes = retainedBytesLocked();
+  if (retainedBytes > continueSize_ || promises_.empty()) {
+    return;
+  }
+  const auto numProducersToUnblock = retainedBytes == 0 ? promises_.size() : 1;
+  for (size_t i = 0; i < numProducersToUnblock; ++i) {
+    promises.push_back(std::move(promises_[i]));
+  }
+  promises_.erase(promises_.begin(), promises_.begin() + numProducersToUnblock);
+}
+
+int64_t UcxOutputQueue::retainedBytesLocked() const {
+  return reservedBytes_ + queuedBytes_ + inFlightBytes_;
+}
+
+int64_t UcxOutputQueue::retainedPackedColumnsLocked() const {
+  return queuedPackedColumns_ + inFlightPackedColumns_;
+}
+
+int64_t UcxOutputQueue::transferBytesLocked() const {
+  return queuedBytes_ + inFlightBytes_;
 }
 
 } // namespace facebook::velox::ucx_exchange

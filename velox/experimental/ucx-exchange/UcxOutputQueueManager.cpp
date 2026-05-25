@@ -90,6 +90,12 @@ bool UcxOutputQueueManager::checkTransferCapacity(
       destination, maxBytes, future);
 }
 
+UcxDestinationTransferStats UcxOutputQueueManager::transferStats(
+    std::string_view taskId,
+    int destination) {
+  return getQueue(taskId)->transferStats(destination);
+}
+
 bool UcxOutputQueueManager::reserveOutputBytes(
     std::string_view taskId,
     int64_t bytes,

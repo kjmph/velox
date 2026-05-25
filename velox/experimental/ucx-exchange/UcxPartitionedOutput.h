@@ -119,7 +119,14 @@ class UcxPartitionedOutput : public exec::Operator,
       cudf::size_type start,
       cudf::size_type end) const;
 
-  uint64_t transferWindowBytes(const PendingPartitionedBatch& batch) const;
+  uint64_t baseTransferWindowBytes(const PendingPartitionedBatch& batch) const;
+
+  uint64_t maxTransferWindowBytes(const PendingPartitionedBatch& batch) const;
+
+  uint64_t transferWindowBytes(
+      const PendingPartitionedBatch& batch,
+      int destination,
+      const std::shared_ptr<UcxOutputQueueManager>& queueManager) const;
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;

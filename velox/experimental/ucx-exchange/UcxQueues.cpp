@@ -138,6 +138,10 @@ int64_t UcxDestinationQueue::transferBytes() const {
   return stats_.bytesQueued + stats_.bytesInFlight;
 }
 
+bool UcxDestinationQueue::waitingForData() const {
+  return notify_ != nullptr;
+}
+
 void UcxDestinationQueue::releaseInFlight(
     int64_t bytes,
     int64_t numPackedCols) {
@@ -295,6 +299,26 @@ bool UcxOutputQueue::checkTransferCapacity(
   return false;
 }
 
+UcxDestinationTransferStats UcxOutputQueue::transferStats(int destination) {
+  std::lock_guard<std::mutex> l(mutex_);
+  UcxDestinationTransferStats stats;
+  stats.retainedBytes = retainedBytesLocked();
+  stats.maxBytes = maxSize_;
+
+  VELOX_CHECK_GE(destination, 0);
+  VELOX_CHECK_LT(destination, queues_.size());
+  auto* queue = queues_[destination].get();
+  if (queue == nullptr) {
+    return stats;
+  }
+
+  const auto destinationStats = queue->stats();
+  stats.bytesQueued = destinationStats.bytesQueued;
+  stats.bytesInFlight = destinationStats.bytesInFlight;
+  stats.waitingForData = queue->waitingForData();
+  return stats;
+}
+
 bool UcxOutputQueue::reserveOutputBytes(int64_t bytes, ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_GT(bytes, 0);
@@ -317,6 +341,7 @@ bool UcxOutputQueue::reserveOutputBytes(int64_t bytes, ContinueFuture* future) {
 
 void UcxOutputQueue::releaseOutputReservation(int64_t bytes) {
   std::vector<ContinuePromise> promises;
+  std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (reservedBytes_ < bytes) {
@@ -325,8 +350,12 @@ void UcxOutputQueue::releaseOutputReservation(int64_t bytes) {
       reservedBytes_ -= bytes;
     }
     maybeContinueProducersLocked(promises);
+    transferPromises = std::move(transferPromises_);
   }
   for (auto& promise : promises) {
+    promise.setValue();
+  }
+  for (auto& promise : transferPromises) {
     promise.setValue();
   }
 }
@@ -356,6 +385,7 @@ void UcxOutputQueue::releaseInFlightBytes(
 
 void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
   UcxDestinationQueue::Data data;
+  std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     // If the queue doesn't exist yet, create an empty queue to store
@@ -381,8 +411,15 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         if (bytes >= 0L) {
           auto self = weakSelf.lock();
           if (self) {
-            std::lock_guard<std::mutex> l(self->mutex_);
-            self->updateStatsWithDequeuedLocked(bytes, 1L);
+            std::vector<ContinuePromise> transferPromises;
+            {
+              std::lock_guard<std::mutex> l(self->mutex_);
+              self->updateStatsWithDequeuedLocked(bytes, 1L);
+              transferPromises = std::move(self->transferPromises_);
+            }
+            for (auto& promise : transferPromises) {
+              promise.setValue();
+            }
           }
         }
         notify(std::move(data), std::move(remainingBytes));
@@ -392,10 +429,14 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         // Need to update the stats here. The data is retained by the server
         // until transfer completion.
         updateStatsWithDequeuedLocked(data.data->gpu_data->size(), 1L);
+        transferPromises = std::move(transferPromises_);
       }
     } else {
       data = UcxDestinationQueue::Data{nullptr, {}, true};
     }
+  }
+  for (auto& promise : transferPromises) {
+    promise.setValue();
   }
   // outside lock: If we have data, then return it immediately.
   if (data.immediate) {

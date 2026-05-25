@@ -31,6 +31,8 @@
 #include <cudf/partitioning.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <limits>
 
 using namespace facebook::velox::cudf_velox;
@@ -58,6 +60,33 @@ uint64_t addSaturated(uint64_t left, uint64_t right) {
 uint64_t divideCeil(uint64_t value, uint64_t divisor) {
   VELOX_CHECK_GT(divisor, 0);
   return value / divisor + (value % divisor == 0 ? 0 : 1);
+}
+
+uint64_t readUint64Env(
+    const char* name,
+    uint64_t defaultValue,
+    uint64_t minValue,
+    uint64_t maxValue) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') {
+    return defaultValue;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const auto parsed = std::strtoull(env, &end, 10);
+  if (end == env || *end != '\0' || errno != 0) {
+    VLOG(1) << "Ignoring invalid " << name << "=" << env;
+    return defaultValue;
+  }
+  return std::clamp<uint64_t>(
+      static_cast<uint64_t>(parsed), minValue, maxValue);
+}
+
+uint64_t transferWindowMultiplier() {
+  static const uint64_t value = readUint64Env(
+      "VELOX_UCX_GPU_TRANSFER_WINDOW_MULTIPLIER", 1, 1, 64);
+  return value;
 }
 } // namespace
 
@@ -520,10 +549,10 @@ bool UcxPartitionedOutput::shouldSplitPayload(
       static_cast<long double>(partitionRows) /
       static_cast<long double>(totalRows);
   return estimatedPartitionBytes >
-      static_cast<long double>(transferWindowBytes(batch));
+      static_cast<long double>(maxTransferWindowBytes(batch));
 }
 
-uint64_t UcxPartitionedOutput::transferWindowBytes(
+uint64_t UcxPartitionedOutput::baseTransferWindowBytes(
     const PendingPartitionedBatch& batch) const {
   if (batch.estimatedBytes <= 0 || numPartitions_ == 0) {
     return initialPayloadBytes_;
@@ -535,6 +564,42 @@ uint64_t UcxPartitionedOutput::transferWindowBytes(
   return std::max<uint64_t>(initialPayloadBytes_, averagePartitionBytes);
 }
 
+uint64_t UcxPartitionedOutput::maxTransferWindowBytes(
+    const PendingPartitionedBatch& batch) const {
+  return std::min<uint64_t>(
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+      multiplySaturated(
+          baseTransferWindowBytes(batch), transferWindowMultiplier()));
+}
+
+uint64_t UcxPartitionedOutput::transferWindowBytes(
+    const PendingPartitionedBatch& batch,
+    int destination,
+    const std::shared_ptr<UcxOutputQueueManager>& queueManager) const {
+  const auto baseWindow = baseTransferWindowBytes(batch);
+  const auto maxWindow = maxTransferWindowBytes(batch);
+  if (maxWindow <= baseWindow) {
+    return baseWindow;
+  }
+
+  const auto stats = queueManager->transferStats(this->taskId(), destination);
+  const auto queuedBytes =
+      static_cast<uint64_t>(std::max<int64_t>(stats.bytesQueued, 0));
+  const auto retainedBytes =
+      static_cast<uint64_t>(std::max<int64_t>(stats.retainedBytes, 0));
+  const auto maxBytes =
+      static_cast<uint64_t>(std::max<int64_t>(stats.maxBytes, 0));
+  if (maxBytes > 0 && retainedBytes >= maxBytes - (maxBytes / 10)) {
+    return baseWindow;
+  }
+
+  if (stats.waitingForData || queuedBytes < baseWindow) {
+    return maxWindow;
+  }
+
+  return baseWindow;
+}
+
 void UcxPartitionedOutput::initializePartitionDrainState(
     PendingPartitionedBatch& batch) const {
   if (!batch.nextRows.empty()) {
@@ -544,7 +609,7 @@ void UcxPartitionedOutput::initializePartitionDrainState(
   VELOX_CHECK_EQ(
       batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
 
-  const auto transferWindow = transferWindowBytes(batch);
+  const auto transferWindow = maxTransferWindowBytes(batch);
   batch.nextRows.resize(numPartitions_);
   batch.nextPayloadBytes.resize(numPartitions_, 0);
   batch.drainDeficits.resize(numPartitions_, 0);
@@ -579,7 +644,6 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
   VELOX_CHECK_EQ(
       batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
 
-  const auto transferWindow = transferWindowBytes(batch);
   while (batch.remainingPartitions > 0) {
     int waitPartition = -1;
     bool madeProgress = false;
@@ -592,9 +656,13 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
         continue;
       }
 
+      const auto transferWindow =
+          transferWindowBytes(batch, partition, queueManager);
       batch.drainDeficits[partition] = std::min<uint64_t>(
           transferWindow,
           addSaturated(batch.drainDeficits[partition], transferWindow));
+      batch.nextPayloadBytes[partition] =
+          std::min<uint64_t>(batch.nextPayloadBytes[partition], transferWindow);
 
       while (batch.nextRows[partition] < batch.offsets[partition + 1]) {
         if (queueManager->checkTransferCapacity(
@@ -670,6 +738,8 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
     }
 
     VELOX_CHECK_GE(waitPartition, 0);
+    const auto transferWindow =
+        transferWindowBytes(batch, waitPartition, queueManager);
     if (queueManager->checkTransferCapacity(
             this->taskId(), waitPartition, transferWindow, &future_)) {
       blockingReason_ = exec::BlockingReason::kWaitForConsumer;

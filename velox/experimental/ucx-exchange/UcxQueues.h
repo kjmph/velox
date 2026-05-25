@@ -40,6 +40,14 @@ using UcxDataAvailableCallback = std::function<void(
     std::shared_ptr<cudf::packed_columns> data,
     std::vector<int64_t> remainingBytes)>;
 
+struct UcxDestinationTransferStats {
+  int64_t bytesQueued{0};
+  int64_t bytesInFlight{0};
+  int64_t retainedBytes{0};
+  int64_t maxBytes{0};
+  bool waitingForData{false};
+};
+
 struct UcxDataAvailable {
   UcxDataAvailableCallback callback{nullptr};
   std::shared_ptr<cudf::packed_columns> data;
@@ -117,6 +125,10 @@ class UcxDestinationQueue {
 
   /// Returns bytes queued or in-flight for this destination.
   int64_t transferBytes() const;
+
+  /// Returns true when a server has asked for data and is waiting for the next
+  /// enqueue to satisfy that request.
+  bool waitingForData() const;
 
   /// Marks bytes for this destination as no longer in-flight.
   void releaseInFlight(int64_t bytes, int64_t numPackedCols);
@@ -216,6 +228,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       int destination,
       int64_t maxBytes,
       ContinueFuture* future);
+
+  /// Returns transfer pressure for one destination. The snapshot is used by
+  /// producers to tune their admission window without exposing the queue lock.
+  UcxDestinationTransferStats transferStats(int destination);
 
   /// @brief Reserves producer-side bytes before GPU output materialization.
   /// Returns true and populates 'future' if accepting this reservation would

@@ -85,6 +85,11 @@ class UcxOutputQueueManager {
       int64_t maxBytes,
       ContinueFuture* future);
 
+  /// @brief Returns queued/in-flight pressure for a single destination.
+  UcxDestinationTransferStats transferStats(
+      std::string_view taskId,
+      int destination);
+
   /// @brief Reserves bytes for producer-side GPU output materialization.
   bool reserveOutputBytes(
       std::string_view taskId,

@@ -85,7 +85,7 @@ uint64_t readUint64Env(
 
 uint64_t transferWindowMultiplier() {
   static const uint64_t value = readUint64Env(
-      "VELOX_UCX_GPU_TRANSFER_WINDOW_MULTIPLIER", 1, 1, 64);
+      "VELOX_UCX_GPU_TRANSFER_WINDOW_MULTIPLIER", 4, 1, 64);
   return value;
 }
 } // namespace
@@ -572,11 +572,19 @@ uint64_t UcxPartitionedOutput::maxTransferWindowBytes(
           baseTransferWindowBytes(batch), transferWindowMultiplier()));
 }
 
+uint64_t UcxPartitionedOutput::normalTransferWindowBytes(
+    const PendingPartitionedBatch& batch) const {
+  return std::min<uint64_t>(
+      maxTransferWindowBytes(batch),
+      multiplySaturated(baseTransferWindowBytes(batch), 2));
+}
+
 uint64_t UcxPartitionedOutput::transferWindowBytes(
     const PendingPartitionedBatch& batch,
     int destination,
     const std::shared_ptr<UcxOutputQueueManager>& queueManager) const {
   const auto baseWindow = baseTransferWindowBytes(batch);
+  const auto normalWindow = normalTransferWindowBytes(batch);
   const auto maxWindow = maxTransferWindowBytes(batch);
   if (maxWindow <= baseWindow) {
     return baseWindow;
@@ -585,6 +593,9 @@ uint64_t UcxPartitionedOutput::transferWindowBytes(
   const auto stats = queueManager->transferStats(this->taskId(), destination);
   const auto queuedBytes =
       static_cast<uint64_t>(std::max<int64_t>(stats.bytesQueued, 0));
+  const auto inFlightBytes =
+      static_cast<uint64_t>(std::max<int64_t>(stats.bytesInFlight, 0));
+  const auto transferBytes = addSaturated(queuedBytes, inFlightBytes);
   const auto retainedBytes =
       static_cast<uint64_t>(std::max<int64_t>(stats.retainedBytes, 0));
   const auto maxBytes =
@@ -593,11 +604,11 @@ uint64_t UcxPartitionedOutput::transferWindowBytes(
     return baseWindow;
   }
 
-  if (stats.waitingForData || queuedBytes < baseWindow) {
+  if (stats.waitingForData && queuedBytes == 0) {
     return maxWindow;
   }
 
-  return baseWindow;
+  return transferBytes < normalWindow ? normalWindow : baseWindow;
 }
 
 void UcxPartitionedOutput::initializePartitionDrainState(
@@ -609,7 +620,7 @@ void UcxPartitionedOutput::initializePartitionDrainState(
   VELOX_CHECK_EQ(
       batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
 
-  const auto transferWindow = maxTransferWindowBytes(batch);
+  const auto transferWindow = normalTransferWindowBytes(batch);
   batch.nextRows.resize(numPartitions_);
   batch.nextPayloadBytes.resize(numPartitions_, 0);
   batch.drainDeficits.resize(numPartitions_, 0);

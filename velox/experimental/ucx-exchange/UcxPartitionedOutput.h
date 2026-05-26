@@ -121,6 +121,9 @@ class UcxPartitionedOutput : public exec::Operator,
 
   uint64_t baseTransferWindowBytes(const PendingPartitionedBatch& batch) const;
 
+  uint64_t normalTransferWindowBytes(
+      const PendingPartitionedBatch& batch) const;
+
   uint64_t maxTransferWindowBytes(const PendingPartitionedBatch& batch) const;
 
   uint64_t transferWindowBytes(

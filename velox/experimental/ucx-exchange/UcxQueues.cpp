@@ -290,10 +290,25 @@ bool UcxOutputQueue::checkTransferCapacity(
     ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_GT(maxBytes, 0);
-  const auto transferBytes = transferBytesLocked(destination);
-  if (transferBytes >= maxBytes && future) {
-    transferPromises_.emplace_back("UcxOutputQueue::checkTransferCapacity");
-    *future = transferPromises_.back().getSemiFuture();
+
+  VELOX_CHECK_GE(destination, 0);
+  VELOX_CHECK_LT(destination, queues_.size());
+  auto* queue = queues_[destination].get();
+  if (queue == nullptr) {
+    return false;
+  }
+
+  const auto destinationStats = queue->stats();
+  if (queue->waitingForData() && destinationStats.bytesQueued == 0) {
+    return false;
+  }
+
+  const auto transferBytes = queue->transferBytes();
+  if (transferBytes >= maxBytes) {
+    if (future) {
+      transferPromises_.emplace_back("UcxOutputQueue::checkTransferCapacity");
+      *future = transferPromises_.back().getSemiFuture();
+    }
     return true;
   }
   return false;

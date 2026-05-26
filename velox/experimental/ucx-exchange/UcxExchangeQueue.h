@@ -113,6 +113,10 @@ class UcxExchangeQueue {
     return totalBytes_ + reservedBytes_ + inFlightBytes_;
   }
 
+  uint64_t queuedReceiveBytesLocked() const {
+    return totalBytes_ + reservedBytes_;
+  }
+
   uint64_t receiveHighWaterBytes() const {
     return receiveHighWaterBytes_;
   }
@@ -123,12 +127,12 @@ class UcxExchangeQueue {
 
   bool receiveBytesAtHighWaterLocked() const {
     return receiveHighWaterBytes_ > 0 &&
-        retainedReceiveBytesLocked() >= receiveHighWaterBytes_;
+        queuedReceiveBytesLocked() >= receiveHighWaterBytes_;
   }
 
   bool receiveBytesBelowLowWaterLocked() const {
     return receiveHighWaterBytes_ == 0 ||
-        retainedReceiveBytesLocked() <= receiveLowWaterBytes_;
+        queuedReceiveBytesLocked() <= receiveLowWaterBytes_;
   }
 
   bool tryReserveReceiveBytesLocked(uint64_t bytes);

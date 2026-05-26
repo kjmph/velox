@@ -81,10 +81,14 @@ void UcxExchangeQueue::enqueueLocked(
 
 bool UcxExchangeQueue::tryReserveReceiveBytesLocked(uint64_t bytes) {
   if (receiveHighWaterBytes_ > 0) {
-    const auto retainedBytes = retainedReceiveBytesLocked();
-    if (retainedBytes > 0 &&
+    // Receive admission must be based on memory still owned by UCX exchange.
+    // Dequeued data can be retained by stateful downstream operators until
+    // end-of-input; using it for receive backpressure can prevent that
+    // end-of-input from ever arriving.
+    const auto queuedBytes = queuedReceiveBytesLocked();
+    if (queuedBytes > 0 &&
         (bytes > receiveHighWaterBytes_ ||
-         retainedBytes > receiveHighWaterBytes_ - bytes)) {
+         queuedBytes > receiveHighWaterBytes_ - bytes)) {
       return false;
     }
   }

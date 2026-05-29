@@ -68,7 +68,8 @@ class UcxOutputQueueManager {
       std::string_view taskId,
       int destination,
       std::unique_ptr<cudf::packed_columns> txData,
-      int32_t numRows);
+      int32_t numRows,
+      int64_t transferReservationBytes = 0);
 
   /// @brief Checks if the queue for a task is over capacity.
   /// Producers call this before accepting more input and after enqueueing a
@@ -84,6 +85,61 @@ class UcxOutputQueueManager {
       int destination,
       int64_t maxBytes,
       ContinueFuture* future);
+
+  /// @brief Reserves destination-local transfer capacity before GPU output
+  /// materialization.
+  bool reserveTransferBytes(
+      std::string_view taskId,
+      int destination,
+      int64_t bytes,
+      int64_t maxBytes,
+      ContinueFuture* future);
+
+  /// @brief Reserves full contiguous_split payload capacity before GPU output
+  /// materialization.
+  bool reserveFullTransferBytes(
+      std::string_view taskId,
+      int destination,
+      int64_t bytes,
+      ContinueFuture* future);
+
+  /// @brief Blocks until the learned full-transfer retained-byte window has
+  /// room. Does not reserve bytes.
+  bool waitForFullTransferCapacity(
+      std::string_view taskId,
+      int64_t bytes,
+      ContinueFuture* future);
+
+  /// @brief Releases destination-local transfer capacity.
+  void releaseTransferReservation(
+      std::string_view taskId,
+      int destination,
+      int64_t bytes);
+
+  /// @brief Returns the destination-local adaptive transfer admission window.
+  int64_t transferWindowBytes(
+      std::string_view taskId,
+      int destination,
+      int64_t baseBytes,
+      int64_t normalBytes,
+      int64_t maxBytes);
+
+  /// @brief Records allocation/admission congestion for a destination.
+  void recordTransferCongestion(
+      std::string_view taskId,
+      int destination,
+      int64_t baseBytes);
+
+  /// @brief Records larger payload demand for adaptive transfer probing.
+  void recordTransferDemand(
+      std::string_view taskId,
+      int destination,
+      int64_t targetBytes,
+      int64_t baseBytes,
+      int64_t maxBytes);
+
+  /// @brief Records full contiguous_split allocation/admission pressure.
+  void recordFullTransferCongestion(std::string_view taskId);
 
   /// @brief Returns queued/in-flight pressure for a single destination.
   UcxDestinationTransferStats transferStats(
@@ -149,6 +205,12 @@ class UcxOutputQueueManager {
   // Retrieves the queue for a task if it exists.
   // Returns NULL if task not found.
   std::shared_ptr<UcxOutputQueue> getQueueIfExists(std::string_view taskId);
+
+  // Retrieves the queue for a task if it exists. Returns NULL only when the
+  // task is known to have been removed; unknown task IDs still fail fast.
+  std::shared_ptr<UcxOutputQueue> getQueueIfActive(std::string_view taskId);
+
+  bool isRemovedTask(std::string_view taskId);
 
   // Throws an exception if queue doesn't exist.
   std::shared_ptr<UcxOutputQueue> getQueue(std::string_view taskId);

@@ -51,19 +51,11 @@ void UcxExchangeQueue::enqueueLocked(
 
   auto dataSize = data->gpuDataSize();
   totalBytes_ += dataSize;
-  if (peakBytes_ < retainedReceiveBytesLocked()) {
-    peakBytes_ = retainedReceiveBytesLocked();
-  }
 
   ++receivedTables_;
   receivedBytes_ += dataSize;
 
   queue_.push_back(std::move(data));
-
-  auto newSize = static_cast<int64_t>(queue_.size());
-  if (newSize > peakSize_) {
-    peakSize_ = newSize;
-  }
 
   while (!promises_.empty()) {
     VELOX_CHECK_LE(promises_.size(), numberOfConsumers_);
@@ -81,31 +73,26 @@ void UcxExchangeQueue::enqueueLocked(
 
 bool UcxExchangeQueue::tryReserveReceiveBytesLocked(uint64_t bytes) {
   if (receiveHighWaterBytes_ > 0) {
-    // Receive admission must be based on memory still owned by UCX exchange.
-    // Dequeued data can be retained by stateful downstream operators until
-    // end-of-input; using it for receive backpressure can prevent that
-    // end-of-input from ever arriving.
+    maybeGrowReceivePrefetchLimitLocked();
     const auto queuedBytes = queuedReceiveBytesLocked();
+    const auto receiveLimit = receivePrefetchByteLimitLocked();
     if (queuedBytes > 0 &&
-        (bytes > receiveHighWaterBytes_ ||
-         queuedBytes > receiveHighWaterBytes_ - bytes)) {
+        (bytes > receiveLimit || queuedBytes > receiveLimit - bytes)) {
       return false;
     }
   }
 
   reservedBytes_ += bytes;
-  if (peakBytes_ < retainedReceiveBytesLocked()) {
-    peakBytes_ = retainedReceiveBytesLocked();
-  }
   return true;
 }
 
 void UcxExchangeQueue::releaseReceiveBytesLocked(uint64_t bytes) {
   if (reservedBytes_ < bytes) {
     reservedBytes_ = 0;
-    return;
+  } else {
+    reservedBytes_ -= bytes;
   }
-  reservedBytes_ -= bytes;
+  maybeGrowReceivePrefetchLimitLocked();
 }
 
 void UcxExchangeQueue::releaseInFlightReceiveBytesLocked(uint64_t bytes) {
@@ -115,11 +102,29 @@ void UcxExchangeQueue::releaseInFlightReceiveBytesLocked(uint64_t bytes) {
     inFlightBytes_ -= bytes;
   }
 
-  if (inFlightTables_ <= 0) {
-    inFlightTables_ = 0;
-  } else {
-    --inFlightTables_;
+  maybeGrowReceivePrefetchLimitLocked();
+}
+
+bool UcxExchangeQueue::recordReceiveAllocationPressureLocked(
+    uint64_t attemptedBytes) {
+  if (receiveHighWaterBytes_ == 0) {
+    return false;
   }
+
+  const auto retainedBytes = retainedReceiveBytesLocked();
+  if (retainedBytes == 0) {
+    return false;
+  }
+
+  const auto defaultLimit = defaultReceivePrefetchByteLimitLocked();
+  const auto pressureBytes = retainedBytes + attemptedBytes;
+  const auto reducedLimit = pressureBytes - pressureBytes / 8;
+  const auto minimumLimit =
+      std::max<uint64_t>(receiveHighWaterBytes_, attemptedBytes);
+  receivePrefetchByteLimit_ =
+      std::min<uint64_t>(defaultLimit, std::max(minimumLimit, reducedLimit));
+  receivePrefetchLimitActive_ = true;
+  return true;
 }
 
 void UcxExchangeQueue::addPromiseLocked(
@@ -168,8 +173,9 @@ PackedTableWithStreamPtr UcxExchangeQueue::dequeueLocked(
   const auto dataSize = static_cast<int64_t>(data->gpuDataSize());
   VELOX_CHECK_GE(totalBytes_, dataSize);
   totalBytes_ -= dataSize;
-  inFlightBytes_ += dataSize;
-  ++inFlightTables_;
+  if (tracksInFlightReceiveBytes()) {
+    inFlightBytes_ += dataSize;
+  }
 
   return data;
 }

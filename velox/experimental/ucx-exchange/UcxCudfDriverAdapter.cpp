@@ -30,9 +30,11 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
@@ -107,7 +109,7 @@ core::PlanNodePtr findPlanNode(
 }
 
 std::shared_ptr<UcxExchangeClient> getOrCreateExchangeClient(
-    const exec::DriverFactory& factory,
+    exec::Exchange* exchangeOp,
     const exec::Operator* op,
     exec::DriverCtx* ctx) {
   const TaskPipelineKey key{op->taskId(), ctx->pipelineId};
@@ -124,14 +126,18 @@ std::shared_ptr<UcxExchangeClient> getOrCreateExchangeClient(
   auto it = clientMap.find(key);
   if (it != clientMap.end()) {
     if (auto existing = it->second.lock()) {
+      exchangeOp->resetExchangeClient();
       return existing;
     }
   }
 
+  auto veloxExchangeClient = exchangeOp->releaseExchangeClient();
+  VELOX_CHECK_NOT_NULL(
+      veloxExchangeClient, "Velox exchange client can't be null.");
   auto client = std::make_shared<UcxExchangeClient>(
       op->taskId(),
-      ctx->task->destination(),
-      factory.numDrivers,
+      veloxExchangeClient->getDestination(),
+      veloxExchangeClient->getNumberOfConsumers(),
       ctx->task->queryCtx()->queryConfig().maxOutputBufferSize());
   clientMap[key] = client;
   return client;
@@ -176,7 +182,35 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       continue;
     }
 
+    if (dynamic_cast<exec::MergeExchange*>(op) != nullptr) {
+      auto planNode = findPlanNode(factory, op->planNodeId());
+      auto mergeExchangeNode =
+          std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
+      if (!mergeExchangeNode ||
+          ctx->task->queryCtx()->inputTransportType(op->planNodeId()) !=
+              core::ExchangeTransportType::kUcx) {
+        continue;
+      }
+
+      if (!canUseCudfUcxExchange()) {
+        continue;
+      }
+      std::vector<std::unique_ptr<exec::Operator>> replacement;
+      replacement.push_back(
+          std::make_unique<UcxExchange>(
+              op->operatorId(), ctx, mergeExchangeNode, nullptr));
+      replacement.push_back(
+          std::make_unique<cudf_velox::CudfOrderBy>(
+              op->operatorId(), ctx, mergeExchangeNode));
+      [[maybe_unused]] auto replaced =
+          factory.replaceOperators(driver, i, i + 1, std::move(replacement));
+      VLOG(1) << "[CUDF-UCX] replacing MergeExchange at index " << i
+              << " (planNodeId=" << op->planNodeId() << ")";
+      continue;
+    }
+
     if (dynamic_cast<exec::Exchange*>(op) != nullptr) {
+      auto* exchangeOp = dynamic_cast<exec::Exchange*>(op);
       auto planNode = findPlanNode(factory, op->planNodeId());
       auto exchangeNode =
           std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
@@ -191,10 +225,10 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
       replacement.push_back(std::make_unique<UcxExchange>(
-          op->operatorId(),
-          ctx,
-          exchangeNode,
-          getOrCreateExchangeClient(factory, op, ctx)));
+              op->operatorId(),
+              ctx,
+              exchangeNode,
+              getOrCreateExchangeClient(exchangeOp, op, ctx)));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       VLOG(1) << "[CUDF-UCX] replacing Exchange at index " << i

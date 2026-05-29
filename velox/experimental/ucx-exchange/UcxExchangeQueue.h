@@ -17,7 +17,9 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <algorithm>
 #include <cinttypes>
+#include <limits>
 #include <memory>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
@@ -117,8 +119,20 @@ class UcxExchangeQueue {
     return totalBytes_ + reservedBytes_;
   }
 
+  uint64_t reservedReceiveBytesLocked() const {
+    return reservedBytes_;
+  }
+
+  uint64_t inFlightReceiveBytesLocked() const {
+    return inFlightBytes_;
+  }
+
   uint64_t receiveHighWaterBytes() const {
     return receiveHighWaterBytes_;
+  }
+
+  bool tracksInFlightReceiveBytes() const {
+    return receiveHighWaterBytes_ > 0;
   }
 
   uint64_t receiveLowWaterBytes() const {
@@ -135,21 +149,74 @@ class UcxExchangeQueue {
         queuedReceiveBytesLocked() <= receiveLowWaterBytes_;
   }
 
+  uint64_t receivePipelineTableLimitLocked() const {
+    // Keep one large GPU payload available to each consumer without letting the
+    // receive queue grow with the number of sources.
+    return std::max<int64_t>(2, numberOfConsumers_);
+  }
+
+  uint64_t estimatedReceivePayloadBytesLocked() const {
+    const auto averageBytes = averageReceivedTablesBytes();
+    return std::max<uint64_t>(averageBytes, receiveHighWaterBytes_);
+  }
+
+  uint64_t receivePrefetchByteLimitLocked() const {
+    if (receiveHighWaterBytes_ == 0) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+
+    const auto defaultLimit = defaultReceivePrefetchByteLimitLocked();
+    if (receivePrefetchByteLimit_ > 0) {
+      return std::min<uint64_t>(receivePrefetchByteLimit_, defaultLimit);
+    }
+
+    return defaultLimit;
+  }
+
+  uint64_t defaultReceivePrefetchByteLimitLocked() const {
+    VELOX_CHECK_GT(receiveHighWaterBytes_, 0);
+
+    const auto payloadBytes = estimatedReceivePayloadBytesLocked();
+    const auto tableLimit = receivePipelineTableLimitLocked();
+    const auto max = std::numeric_limits<uint64_t>::max();
+    if (payloadBytes > max - receiveHighWaterBytes_) {
+      return max;
+    }
+    const auto payloadWithSlack = payloadBytes + receiveHighWaterBytes_;
+    if (payloadWithSlack > max / tableLimit) {
+      return max;
+    }
+    return payloadWithSlack * tableLimit;
+  }
+
+  bool receiveBytesBelowPrefetchLimitLocked() const {
+    const auto limit = receivePrefetchByteLimitLocked();
+    if (limit == std::numeric_limits<uint64_t>::max()) {
+      return true;
+    }
+
+    // Admission must be based on bytes still owned by the receive queue. Bytes
+    // already handed to downstream operators are useful congestion signal, but
+    // using them as a hard gate can block metadata/EOS progress.
+    const auto queuedBytes = queuedReceiveBytesLocked();
+    if (queuedBytes == 0) {
+      return true;
+    }
+    const auto payloadBytes = estimatedReceivePayloadBytesLocked();
+    return queuedBytes <= limit && payloadBytes <= limit - queuedBytes;
+  }
+
+  bool receiveCanPrefetchLocked() const {
+    return receiveBytesBelowPrefetchLimitLocked();
+  }
+
   bool tryReserveReceiveBytesLocked(uint64_t bytes);
 
   void releaseReceiveBytesLocked(uint64_t bytes);
 
   void releaseInFlightReceiveBytesLocked(uint64_t bytes);
 
-  /// Returns the maximum retained receive bytes.
-  uint64_t peakBytes() const {
-    return peakBytes_;
-  }
-
-  /// Returns total number of packed tables received from all sources.
-  uint64_t receivedTables() const {
-    return receivedTables_;
-  }
+  bool recordReceiveAllocationPressureLocked(uint64_t attemptedBytes);
 
   /// Returns an average size of tables. Returns 0 if hasn't received
   /// any tables yet.
@@ -216,6 +283,32 @@ class UcxExchangeQueue {
 
   static constexpr uint32_t kContinuePct{70};
 
+  void maybeGrowReceivePrefetchLimitLocked() {
+    if (!receivePrefetchLimitActive_ || receiveHighWaterBytes_ == 0) {
+      return;
+    }
+
+    const auto defaultLimit = defaultReceivePrefetchByteLimitLocked();
+    if (receivePrefetchByteLimit_ >= defaultLimit) {
+      receivePrefetchByteLimit_ = 0;
+      receivePrefetchLimitActive_ = false;
+      return;
+    }
+
+    if (retainedReceiveBytesLocked() > receivePrefetchByteLimit_ / 2) {
+      return;
+    }
+
+    const auto increment = std::max<uint64_t>(
+        receiveHighWaterBytes_, estimatedReceivePayloadBytesLocked() / 2);
+    if (receivePrefetchByteLimit_ > defaultLimit - increment) {
+      receivePrefetchByteLimit_ = 0;
+      receivePrefetchLimitActive_ = false;
+    } else {
+      receivePrefetchByteLimit_ += increment;
+    }
+  }
+
   const int32_t numberOfConsumers_;
 
   int numCompleted_{0};
@@ -238,18 +331,15 @@ class UcxExchangeQueue {
   // Bytes dequeued by an Exchange operator but still retained by downstream
   // CudfVectors that own the packed table.
   int64_t inFlightBytes_{0};
-  int64_t inFlightTables_{0};
   const uint64_t receiveHighWaterBytes_{0};
   const uint64_t receiveLowWaterBytes_{0};
+  bool receivePrefetchLimitActive_{false};
+  uint64_t receivePrefetchByteLimit_{0};
   // Number of packed tables received.
   int64_t receivedTables_{0};
   // Total size of packed tables received. Used to calculate an average
   // expected size.
   int64_t receivedBytes_{0};
-  // Maximum value of retained receive bytes.
-  int64_t peakBytes_{0};
-  // Peak queue size (number of items). Used for high-water-mark alerts.
-  int64_t peakSize_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

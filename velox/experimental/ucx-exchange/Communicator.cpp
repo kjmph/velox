@@ -99,7 +99,7 @@ bool readBoolEnv(
 int maxWorkItemsPerDrain() {
   static const int value =
       readIntEnv(
-          "VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN", 64, 1, 1 << 20);
+          "VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN", 256, 1, 1 << 20);
   return value;
 }
 } // namespace

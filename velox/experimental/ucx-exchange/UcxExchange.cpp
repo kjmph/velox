@@ -182,13 +182,16 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
   auto numRows = data.packedTable->table.num_rows();
   auto gpuDataSize = data.gpuDataSize();
   auto stream = data.stream;
-  std::weak_ptr<UcxExchangeClient> exchangeClient{exchangeClient_};
-  auto releaseCallback = [exchangeClient, gpuDataSize, stream]() {
-    stream.synchronize();
-    if (auto client = exchangeClient.lock()) {
-      client->releaseInFlightReceiveBytes(gpuDataSize);
-    }
-  };
+  cudf_velox::CudfVector::ReleaseCallback releaseCallback;
+  if (exchangeClient_->tracksInFlightReceiveBytes()) {
+    std::weak_ptr<UcxExchangeClient> exchangeClient{exchangeClient_};
+    releaseCallback = [exchangeClient, gpuDataSize, stream]() {
+      stream.synchronize();
+      if (auto client = exchangeClient.lock()) {
+        client->releaseInFlightReceiveBytes(gpuDataSize);
+      }
+    };
+  }
 
   // Use the stream that was allocated in UcxExchangeSource::onMetadata
   // and the packed_table constructor of CudfVector to avoid copying data.

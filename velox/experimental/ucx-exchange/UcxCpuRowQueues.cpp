@@ -288,6 +288,12 @@ void UcxCpuRowOutputQueue::enqueue(
       totalRowsSent_ += numRows;
       totalPayloadsSent_++;
       success = true;
+    } else if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      VELOX_CHECK_EQ(destination, 0, "Arbitrary uses destination 0");
+      enqueueArbitraryOutputLocked(
+          std::move(sharedData), dataAvailableCallbacks);
+      updateStatsWithEnqueuedLocked(numBytes, numRows);
+      success = true;
     } else {
       VELOX_CHECK_LT(destination, queues_.size());
       success = enqueuePartitionedOutputLocked(
@@ -338,12 +344,22 @@ void UcxCpuRowOutputQueue::getData(
     // placeholder destination queues to hold the notify callback.
     for (int i = queues_.size(); i <= destination; ++i) {
       queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
+      if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary && atEnd_) {
+        queues_.back()->enqueueBack(nullptr);
+      }
     }
     finishedBufferStats_.resize(queues_.size());
     auto* queue = queues_[destination].get();
     // queue can be nullptr if the destination's results have already
     // been deleted (post-cancellation). Return empty in that case.
     if (queue) {
+      // For arbitrary mode, pull from the shared buffer if the destination
+      // queue is empty. This ensures demand-driven distribution.
+      if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary &&
+          !arbitraryBuffer_.empty()) {
+        queue->enqueueBack(std::move(arbitraryBuffer_.front()));
+        arbitraryBuffer_.pop_front();
+      }
       // weak_ptr capture: removeTask() can destroy this UcxCpuRowOutputQueue
       // while the callback is still scheduled.
       std::weak_ptr<UcxCpuRowOutputQueue> weakSelf = shared_from_this();
@@ -464,6 +480,25 @@ void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
     if (!atEnd_) {
       return;
     }
+    // For arbitrary, drain remaining shared pool to destination queues
+    // round-robin before sending end markers.
+    if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      int32_t bufferId =
+          queues_.empty() ? 0 : nextArbitraryLoadIndex_ % queues_.size();
+      int32_t nullCount = 0;
+      while (!arbitraryBuffer_.empty() && !queues_.empty()) {
+        auto* queue = queues_[bufferId].get();
+        if (queue != nullptr) {
+          queue->enqueueBack(std::move(arbitraryBuffer_.front()));
+          arbitraryBuffer_.pop_front();
+          nullCount = 0;
+        } else if (++nullCount >= queues_.size()) {
+          arbitraryBuffer_.clear();
+          break;
+        }
+        bufferId = (bufferId + 1) % queues_.size();
+      }
+    }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
         queue->enqueueBack(nullptr);
@@ -513,12 +548,50 @@ void UcxCpuRowOutputQueue::enqueueBroadcastOutputLocked(
   }
 }
 
+void UcxCpuRowOutputQueue::enqueueArbitraryOutputLocked(
+    std::shared_ptr<UcxCpuRowPayload> data,
+    std::vector<UcxCpuRowDataAvailable>& dataAvailableCbs) {
+  VELOX_DCHECK(dataAvailableCbs.empty());
+
+  arbitraryBuffer_.push_back(std::move(data));
+
+  // Distribute from the shared pool to destinations with waiting consumers,
+  // probing round-robin so no single destination starves.
+  int32_t bufferId =
+      queues_.empty() ? 0 : nextArbitraryLoadIndex_ % queues_.size();
+  for (int32_t i = 0; i < queues_.size(); ++i) {
+    if (arbitraryBuffer_.empty()) {
+      break;
+    }
+    auto* queue = queues_[bufferId].get();
+    if (queue != nullptr) {
+      auto pending = queue->getAndClearNotify();
+      if (pending.callback) {
+        pending.data = std::move(arbitraryBuffer_.front());
+        arbitraryBuffer_.pop_front();
+        pending.remainingBytes.clear();
+        for (const auto& item : arbitraryBuffer_) {
+          if (item != nullptr) {
+            pending.remainingBytes.push_back(item->numBytes);
+          }
+        }
+        recordDirectHandoffLocked(pending);
+        dataAvailableCbs.push_back(std::move(pending));
+      }
+    }
+    bufferId = (bufferId + 1) % queues_.size();
+  }
+  nextArbitraryLoadIndex_ = bufferId;
+}
+
 bool UcxCpuRowOutputQueue::isFinished() {
   std::lock_guard<std::mutex> l(mutex_);
   return isFinishedLocked();
 }
 
 bool UcxCpuRowOutputQueue::isFinishedLocked() {
+  // For arbitrary, the coordinator lazily manages consumers and may never send
+  // noMoreBufferIds, so only broadcast gates on noMoreQueues_.
   if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast &&
       !noMoreQueues_) {
     return false;
@@ -543,7 +616,7 @@ void UcxCpuRowOutputQueue::updateOutputBuffers(
     return;
   }
 
-  VELOX_CHECK_EQ(kind_, Kind::kBroadcast);
+  VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
   bool isFinished;
   {
     std::lock_guard<std::mutex> l(mutex_);
@@ -553,13 +626,17 @@ void UcxCpuRowOutputQueue::updateOutputBuffers(
       queues_.reserve(numBuffers);
       for (int32_t i = 0; i < numNewBuffers; ++i) {
         auto buffer = std::make_unique<UcxCpuRowDestinationQueue>();
-        for (const auto& data : dataToBroadcast_) {
-          buffer->enqueueBack(data);
-          // Account for backfilled data so dequeue decrements don't
-          // drive queuedBytes_ negative.
-          queuedBytes_ += data->numBytes;
-          queuedPayloads_++;
+        if (kind_ == Kind::kBroadcast) {
+          for (const auto& data : dataToBroadcast_) {
+            buffer->enqueueBack(data);
+            // Account for backfilled data so dequeue decrements don't
+            // drive queuedBytes_ negative.
+            queuedBytes_ += data->numBytes;
+            queuedPayloads_++;
+          }
         }
+        // No backfill for arbitrary. New consumers only get future data, or an
+        // end marker if production already completed.
         if (atEnd_) {
           buffer->enqueueBack(nullptr);
         }
@@ -631,6 +708,7 @@ void UcxCpuRowOutputQueue::terminate() {
       LOG(WARNING) << "UcxCpuRowOutputQueue::terminate() called while task "
                    << task_->taskId() << " is still running";
     }
+    arbitraryBuffer_.clear();
     // End-of-stream marker on every destination so consumers don't
     // wait forever after a producer-side abort.
     for (auto& queue : queues_) {
@@ -775,6 +853,12 @@ void UcxCpuRowOutputQueue::acknowledgeDirectHandoffLocked(
 void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char*) {
   int64_t actualBytes = pendingDirectHandoffBytes_;
   int64_t actualPayloads = pendingDirectHandoffPayloads_;
+  for (const auto& payload : arbitraryBuffer_) {
+    if (payload != nullptr) {
+      actualBytes += payload->numBytes;
+      actualPayloads++;
+    }
+  }
   for (const auto& queue : queues_) {
     if (queue != nullptr) {
       const auto stats = queue->stats();

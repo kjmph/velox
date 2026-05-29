@@ -72,6 +72,8 @@ class UcxPartitionedOutput : public exec::Operator,
   std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
   sharedQueueManager();
 
+  bool usesHashPartitioning() const;
+
   // Heuristic method to derive the partition keys from the PartitionNode
   // specification.
   void initPartitionKeys(
@@ -79,7 +81,10 @@ class UcxPartitionedOutput : public exec::Operator,
 
   // Partitions the cudf table view using the partition keys and a hash
   // function using the given stream.
-  void hashPartition(cudf::table_view tableView, rmm::cuda_stream_view stream);
+  void hashPartition(
+      cudf::table_view tableView,
+      rmm::cuda_stream_view stream,
+      int64_t estimatedBytes);
 
   // Splits the cudf table view into equal sizes. This is used when
   // RoundRobin partitioning is requested but round robin on a
@@ -88,7 +93,8 @@ class UcxPartitionedOutput : public exec::Operator,
       cudf::table_view tableView,
       rmm::cuda_stream_view stream,
       std::unique_ptr<cudf::table> tableOwner,
-      std::vector<cudf_velox::CudfVectorPtr> vectorOwners);
+      std::vector<cudf_velox::CudfVectorPtr> vectorOwners,
+      int64_t estimatedBytes);
 
   struct PendingPartitionedBatch {
     std::unique_ptr<cudf::table> tableOwner;
@@ -96,6 +102,7 @@ class UcxPartitionedOutput : public exec::Operator,
     cudf::table_view tableView;
     std::vector<cudf::size_type> offsets;
     int64_t estimatedBytes{0};
+    bool conservativeChunkSizing{false};
     rmm::cuda_stream_view stream;
     size_t nextPartition{0};
     std::vector<cudf::size_type> nextRows;
@@ -104,9 +111,33 @@ class UcxPartitionedOutput : public exec::Operator,
     size_t remainingPartitions{0};
   };
 
+  struct PendingInputBatch {
+    std::unique_ptr<cudf::table> tableOwner;
+    std::vector<cudf_velox::CudfVectorPtr> vectorOwners;
+    cudf::table_view tableView;
+    int64_t estimatedBytes{0};
+    rmm::cuda_stream_view stream;
+  };
+
+  void partitionPendingInputBatch();
+
   bool drainPendingPartitionedBatch();
 
+  bool tryDrainWithFullContiguousSplit(PendingPartitionedBatch& batch);
+
+  bool tryDrainWithContiguousSplit(PendingPartitionedBatch& batch);
+
   void initializePartitionDrainState(PendingPartitionedBatch& batch) const;
+
+  uint64_t estimatedPartitionBytes(
+      const PendingPartitionedBatch& batch,
+      cudf::size_type start,
+      cudf::size_type end) const;
+
+  uint64_t exactPartitionBytes(
+      const PendingPartitionedBatch& batch,
+      cudf::size_type start,
+      cudf::size_type end) const;
 
   cudf::size_type rowsForPayloadTarget(
       const PendingPartitionedBatch& batch,
@@ -131,6 +162,8 @@ class UcxPartitionedOutput : public exec::Operator,
       int destination,
       const std::shared_ptr<UcxOutputQueueManager>& queueManager) const;
 
+  void recordAllocationPressure(uint64_t waitBytes);
+
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
   const size_t numPartitions_;
@@ -143,6 +176,7 @@ class UcxPartitionedOutput : public exec::Operator,
 
   bool finished_{false};
   std::string spec_;
+  bool isGatherPartition_{false};
 
   // Used for switching columns when column order differs between input and
   // output.
@@ -155,10 +189,6 @@ class UcxPartitionedOutput : public exec::Operator,
 
   bool shouldDrainPending() const;
 
-  bool ensureOutputReservation(ContinueFuture* future);
-
-  void releaseOutputReservation();
-
   /// Accumulated CudfVectors awaiting flush.
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
@@ -170,12 +200,15 @@ class UcxPartitionedOutput : public exec::Operator,
   /// Initial target GPU payload size for geometrically chunked UCX messages.
   const uint64_t initialPayloadBytes_;
 
-  int64_t outputReservationBytes_{0};
-
   /// Partitioned table waiting to be packed and enqueued destination-by-
   /// destination. This avoids materializing the full fanout before UCX output
   /// backpressure can take effect.
   std::optional<PendingPartitionedBatch> pendingPartitionedBatch_;
+
+  /// Cudf input that has been materialized enough to retry partitioning after
+  /// GPU allocation pressure without asking the upstream driver for the row
+  /// again.
+  std::optional<PendingInputBatch> pendingInputBatch_;
 };
 
 } // namespace facebook::velox::ucx_exchange

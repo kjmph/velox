@@ -610,6 +610,23 @@ void UcxExchangeSource::startDataReceive(
   } catch (const rmm::bad_alloc& e) {
     releaseReceiveBytes(ptr);
     VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
+    bool retryLater = false;
+    {
+      std::lock_guard<std::mutex> l(queue_->mutex());
+      retryLater = queue_->recordReceiveAllocationPressureLocked(
+          static_cast<uint64_t>(ptr->metadata.dataSizeBytes));
+    }
+    if (retryLater) {
+      pendingDataReceive_ = std::move(ptr);
+      backpressureActive_.store(true, std::memory_order_release);
+      if (expectedState == ReceiverState::WaitingForMetadata) {
+        setStateIf(
+            ReceiverState::WaitingForMetadata,
+            ReceiverState::WaitingForReceiveCredit);
+      }
+      return;
+    }
+
     queue_->setError("Failed to alloc GPU memory");
     deliverEndMarker();
     setState(ReceiverState::Done);
@@ -920,7 +937,7 @@ bool UcxExchangeSource::setStateIf(
 
 bool UcxExchangeSource::receiveQueueExceedsHighWater() {
   std::lock_guard<std::mutex> l(queue_->mutex());
-  return queue_->receiveBytesAtHighWaterLocked() ||
+  return !queue_->receiveBytesBelowPrefetchLimitLocked() ||
       queue_->size() >= backpressureHighWaterMark();
 }
 

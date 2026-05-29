@@ -80,6 +80,10 @@ class UcxExchangeClient
 
   void releaseInFlightReceiveBytes(uint64_t bytes);
 
+  bool tracksInFlightReceiveBytes() const {
+    return queue_->tracksInFlightReceiveBytes();
+  }
+
   std::string toString() const;
 
   folly::dynamic toJson() const;

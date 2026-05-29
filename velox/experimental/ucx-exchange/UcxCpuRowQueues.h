@@ -272,6 +272,10 @@ class UcxCpuRowOutputQueue
       std::shared_ptr<UcxCpuRowPayload> data,
       std::vector<UcxCpuRowDataAvailable>& dataAvailableCbs);
 
+  void enqueueArbitraryOutputLocked(
+      std::shared_ptr<UcxCpuRowPayload> data,
+      std::vector<UcxCpuRowDataAvailable>& dataAvailableCbs);
+
   std::shared_ptr<exec::Task> task_{nullptr};
 
   core::PartitionedOutputNode::Kind kind_{
@@ -282,6 +286,13 @@ class UcxCpuRowOutputQueue
   // For broadcast: payloads kept around so late-arriving destinations
   // can be backfilled. Cleared once noMoreQueues_ is set.
   std::vector<std::shared_ptr<UcxCpuRowPayload>> dataToBroadcast_;
+
+  // For arbitrary: shared pool of payloads that any consumer can pull from.
+  std::deque<std::shared_ptr<UcxCpuRowPayload>> arbitraryBuffer_;
+
+  // For arbitrary: round-robin index for distributing payloads to waiting
+  // consumers.
+  int32_t nextArbitraryLoadIndex_{0};
 
   uint64_t maxSize_{0};
   uint64_t continueSize_{0};

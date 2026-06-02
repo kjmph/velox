@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeQueue.h"
-#include <glog/logging.h>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -42,10 +41,6 @@ void UcxCpuRowExchangeQueue::enqueueLocked(
     std::vector<ContinuePromise>& promises) {
   if (data == nullptr) {
     ++numCompleted_;
-    VLOG(4) << "[EX-QUEUE-CPU] source completed (null enqueued)"
-            << " numCompleted=" << numCompleted_
-            << " numSources=" << numSources_
-            << " noMoreSources=" << noMoreSources_;
     auto completedPromises = checkCompleteLocked();
     promises.reserve(promises.size() + completedPromises.size());
     for (auto& promise : completedPromises) {
@@ -54,31 +49,8 @@ void UcxCpuRowExchangeQueue::enqueueLocked(
     return;
   }
 
-  auto dataSize = data->numBytes;
-  totalBytes_ += dataSize;
-  if (peakBytes_ < totalBytes_) {
-    peakBytes_ = totalBytes_;
-  }
-
-  ++receivedPayloads_;
-  receivedBytes_ += dataSize;
-
   queue_.push_back(std::move(data));
 
-  // High-water-mark alerts: log when queue size crosses thresholds.
-  auto newSize = static_cast<int64_t>(queue_.size());
-  if (newSize > peakSize_) {
-    if ((peakSize_ < 100 && newSize >= 100) ||
-        (peakSize_ < 1000 && newSize >= 1000) ||
-        (peakSize_ < 10000 && newSize >= 10000)) {
-      VLOG(1) << "[EX-QUEUE-CPU] high water mark: queueSize=" << newSize
-              << " peakBytes=" << peakBytes_
-              << " receivedPayloads=" << receivedPayloads_;
-    }
-    peakSize_ = newSize;
-  }
-
-  size_t wokenConsumers = 0;
   while (!promises_.empty()) {
     VELOX_CHECK_LE(promises_.size(), numberOfConsumers_);
     const int32_t unblockedConsumers = numberOfConsumers_ - promises_.size();
@@ -89,11 +61,6 @@ void UcxCpuRowExchangeQueue::enqueueLocked(
     auto it = promises_.begin();
     promises.push_back(std::move(it->second));
     promises_.erase(it);
-    ++wokenConsumers;
-  }
-  if (wokenConsumers > 0) {
-    VLOG(4) << "[EX-QUEUE-CPU] waking " << wokenConsumers << " consumers"
-            << " queueSize=" << queue_.size();
   }
 }
 
@@ -131,11 +98,6 @@ UcxCpuRowReceivedPtr UcxCpuRowExchangeQueue::dequeueLocked(
     if (atEnd_) {
       *atEnd = true;
     } else {
-      VLOG(4) << "[EX-QUEUE-CPU] consumer=" << consumerId
-              << " blocked (empty queue, waiting for data)"
-              << " numSources=" << numSources_
-              << " numCompleted=" << numCompleted_
-              << " waitingConsumers=" << (promises_.size() + 1);
       addPromiseLocked(consumerId, future, stalePromise);
     }
     return data;
@@ -143,7 +105,6 @@ UcxCpuRowReceivedPtr UcxCpuRowExchangeQueue::dequeueLocked(
 
   data = std::move(queue_.front());
   queue_.pop_front();
-  totalBytes_ -= data->numBytes;
 
   return data;
 }

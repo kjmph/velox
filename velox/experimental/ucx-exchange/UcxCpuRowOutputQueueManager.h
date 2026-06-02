@@ -52,6 +52,10 @@ class UcxCpuRowOutputQueueManager {
       int numBuffers,
       bool noMoreBuffers);
 
+  /// For grouped execution, update the producing driver count after Velox
+  /// discovers the actual split groups assigned to this task.
+  bool updateNumDrivers(std::string_view taskId, uint32_t newNumDrivers);
+
   /// Enqueue a serialized RowVector chunk into the destination's queue.
   /// Caller transfers ownership of the payload.
   void enqueue(

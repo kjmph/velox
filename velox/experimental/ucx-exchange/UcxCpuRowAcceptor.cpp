@@ -16,6 +16,7 @@
 #include "velox/experimental/ucx-exchange/UcxCpuRowAcceptor.h"
 #include <glog/logging.h>
 #include <cstring>
+#include <vector>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -88,6 +89,34 @@ ParsedCpuHandshake parseCpuHandshake(ucxx::Buffer& buffer) {
       header.sourceHostIdHash};
 }
 
+std::shared_ptr<std::vector<uint8_t>> makeCpuHandshakeResponse(
+    CpuRowDataEndpointMode dataEndpointMode,
+    std::string_view serverWorkerAddress,
+    uint32_t serverHostIdHash) {
+  VELOX_CHECK_LE(
+      serverWorkerAddress.size(),
+      kMaxCpuRowWorkerAddressBytes,
+      "CPU HandshakeResponse worker address length {} exceeds limit {}",
+      serverWorkerAddress.size(),
+      kMaxCpuRowWorkerAddressBytes);
+
+  auto response = std::make_shared<std::vector<uint8_t>>(
+      sizeof(CpuRowHandshakeResponseHeader) + serverWorkerAddress.size());
+  CpuRowHandshakeResponseHeader header;
+  header.dataEndpointMode = dataEndpointMode;
+  header.serverWorkerAddressBytes =
+      static_cast<uint32_t>(serverWorkerAddress.size());
+  header.serverHostIdHash = serverHostIdHash;
+  std::memcpy(response->data(), &header, sizeof(header));
+  if (!serverWorkerAddress.empty()) {
+    std::memcpy(
+        response->data() + sizeof(CpuRowHandshakeResponseHeader),
+        serverWorkerAddress.data(),
+        serverWorkerAddress.size());
+  }
+  return response;
+}
+
 } // namespace
 
 /* static */
@@ -122,61 +151,56 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
       std::string(handshakePtr->taskId, taskIdLength),
       handshakePtr->destination};
 
-  auto epRef = bootstrapEpRef;
-  const bool workerAddressEndpoint =
-      !parsedHandshake.sourceWorkerAddress.empty();
+  auto dataEpRef = bootstrapEpRef;
+  CpuRowDataEndpointMode dataEndpointMode = CpuRowDataEndpointMode::kBootstrap;
+  std::string serverWorkerAddress;
+  const bool hasWorkerAddress = !parsedHandshake.sourceWorkerAddress.empty();
   const bool sameHost = communicator->hasSameHostTransportIdentity(
       parsedHandshake.sourceHostIdHash);
-  if (workerAddressEndpoint && sameHost) {
-    if (auto dataEpRef =
+  if (hasWorkerAddress && sameHost) {
+    serverWorkerAddress = communicator->getWorkerAddress();
+    if (serverWorkerAddress.empty() ||
+        serverWorkerAddress.size() > kMaxCpuRowWorkerAddressBytes) {
+      serverWorkerAddress.clear();
+    } else if (auto sameHostDataEpRef =
             communicator->createSameHostEndpointRefFromWorkerAddress(
                 parsedHandshake.sourceWorkerAddress,
                 bootstrapEpRef->getPeerIp(),
                 parsedHandshake.sourceHostIdHash)) {
-      epRef = std::move(dataEpRef);
-      VLOG(1) << "[ACCEPTOR-CPU] using same-host worker-address endpoint for "
-              << key.toString() << " sourceWorkerAddressBytes="
-              << parsedHandshake.sourceWorkerAddress.size()
-              << " sourceHostIdHash=" << parsedHandshake.sourceHostIdHash;
+      dataEpRef = std::move(sameHostDataEpRef);
+      dataEndpointMode = CpuRowDataEndpointMode::kSameHostWorkerAddress;
     } else {
-      VLOG(1) << "[ACCEPTOR-CPU] failed to create same-host worker-address "
-                 "endpoint for "
-              << key.toString() << "; using listener endpoint";
+      serverWorkerAddress.clear();
     }
-  } else {
-    VLOG(1) << "[ACCEPTOR-CPU] using listener endpoint for " << key.toString()
-            << " workerAddressBytes="
-            << parsedHandshake.sourceWorkerAddress.size()
-            << " sourceHostIdHash=" << parsedHandshake.sourceHostIdHash
-            << " sameHost=" << sameHost;
   }
 
-  auto exchangeServer =
-      UcxCpuRowExchangeServer::create(communicator, epRef, key);
+  const bool waitForDataEndpointAck =
+      dataEndpointMode == CpuRowDataEndpointMode::kSameHostWorkerAddress;
+  auto exchangeServer = UcxCpuRowExchangeServer::create(
+      communicator, dataEpRef, key, waitForDataEndpointAck);
+  exchangeServer->postDataEndpointAckReceive();
 
-  epRef->addCommElem(exchangeServer);
+  dataEpRef->addCommElem(exchangeServer);
   communicator->registerCommElement(exchangeServer);
 
-  VLOG(2) << "[ACCEPTOR-CPU] new server: " << exchangeServer->toString()
-          << " peerIp=" << epRef->getPeerIp()
-          << " workerAddressEndpoint=" << (epRef != bootstrapEpRef);
-
-  auto response = std::make_shared<HandshakeResponse>();
-  response->isIntraNodeTransfer = false;
+  auto response = makeCpuHandshakeResponse(
+      dataEndpointMode, serverWorkerAddress, communicator->getHostIdHash());
 
   uint64_t responseTag = getHandshakeResponseTag(fnv1a_32(key.toString()));
-  epRef->endpoint_->tagSend(
-      response.get(),
-      sizeof(*response),
+  // Keep the control-plane response on the listener endpoint that received the
+  // AM. If same-host data is selected, this response carries the server worker
+  // address so the source can create the reciprocal data endpoint before
+  // posting metadata receives.
+  bootstrapEpRef->endpoint_->tagSend(
+      response->data(),
+      response->size(),
       ucxx::Tag{responseTag},
       false,
       [response, keyStr = key.toString()](
           ucs_status_t status, std::shared_ptr<void> /*arg*/) {
-        if (status == UCS_OK) {
-          VLOG(3) << "CPU HandshakeResponse sent successfully to " << keyStr;
-        } else {
-          VLOG(0) << "Failed to send CPU HandshakeResponse to " << keyStr
-                  << ": " << ucs_status_string(status);
+        if (status != UCS_OK) {
+          LOG(WARNING) << "Failed to send CPU HandshakeResponse to " << keyStr
+                       << ": " << ucs_status_string(status);
         }
       },
       response);

@@ -79,26 +79,6 @@ class UcxCpuRowExchangeQueue {
     return queue_.size();
   }
 
-  int64_t totalBytes() const {
-    return totalBytes_;
-  }
-
-  uint64_t peakBytes() const {
-    return peakBytes_;
-  }
-
-  uint64_t peakSize() const {
-    return peakSize_;
-  }
-
-  uint64_t receivedPayloads() const {
-    return receivedPayloads_;
-  }
-
-  uint64_t averageReceivedPayloadBytes() const {
-    return receivedPayloads_ > 0 ? receivedBytes_ / receivedPayloads_ : 0;
-  }
-
   void addSourceLocked() {
     VELOX_CHECK(!noMoreSources_, "addSource called after noMoreSources");
     numSources_++;
@@ -167,11 +147,6 @@ class UcxCpuRowExchangeQueue {
   folly::F14FastMap<int, ContinuePromise> promises_;
 
   std::string error_;
-  int64_t totalBytes_{0};
-  int64_t receivedPayloads_{0};
-  int64_t receivedBytes_{0};
-  int64_t peakBytes_{0};
-  int64_t peakSize_{0};
 };
 
 } // namespace facebook::velox::ucx_exchange

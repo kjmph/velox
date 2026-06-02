@@ -231,6 +231,9 @@ bool UcxCpuRowOutputQueue::initialize(
   continueSize_ = (maxSize_ * kContinuePct) / 100;
   for (int i = queues_.size(); i < numDestinations; ++i) {
     queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
+    if (atEnd_) {
+      queues_.back()->enqueueBack(nullptr);
+    }
   }
   finishedBufferStats_.resize(queues_.size());
   // Release-store: paired with isInitialized()'s acquire-load so
@@ -344,7 +347,7 @@ void UcxCpuRowOutputQueue::getData(
     // placeholder destination queues to hold the notify callback.
     for (int i = queues_.size(); i <= destination; ++i) {
       queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
-      if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary && atEnd_) {
+      if (atEnd_) {
         queues_.back()->enqueueBack(nullptr);
       }
     }
@@ -400,10 +403,6 @@ void UcxCpuRowOutputQueue::getData(
   }
   if (data.immediate) {
     notify(std::move(data.data), std::move(data.remainingBytes));
-  } else {
-    VLOG(3) << "[QUEUE-CPU] task=" << (task_ ? task_->taskId() : "n/a")
-            << " dest=" << destination
-            << " server waiting for data (callback installed)";
   }
   for (auto& promise : promises) {
     promise.setValue();
@@ -666,13 +665,10 @@ void UcxCpuRowOutputQueue::deleteResults(int destination) {
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (destination >= queues_.size()) {
-      VLOG(1) << "deleteResults: destination " << destination
-              << " out of range (size=" << queues_.size() << "), ignoring";
       return;
     }
     auto* queue = queues_[destination].get();
     if (queue == nullptr) {
-      VLOG(1) << "Extra delete received for destination " << destination;
       return;
     }
     int64_t bytes = queue->stats().bytesQueued;

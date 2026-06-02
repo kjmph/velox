@@ -19,7 +19,6 @@
 
 #include <algorithm>
 
-using facebook::velox::exec::Operator;
 using facebook::velox::exec::PrestoSerializedPage;
 using facebook::velox::exec::RemoteConnectorSplit;
 
@@ -50,8 +49,6 @@ UcxCpuRowExchange::UcxCpuRowExchange(
           operatorCtx_->driverCtx()
               ->queryConfig()
               .minShuffleCompressionPageSizeBytes())},
-      processSplits_{driverCtx->driverId == 0},
-      pipelineId_{driverCtx->pipelineId},
       driverId_{driverCtx->driverId} {
   if (exchangeClient) {
     exchangeClient_ = std::move(exchangeClient);
@@ -60,6 +57,10 @@ UcxCpuRowExchange::UcxCpuRowExchange(
     exchangeClient_ = std::make_shared<UcxCpuRowExchangeClient>(
         task->taskId(), task->destination(), /*numConsumers=*/1);
   }
+  // The CPU UCX adapter shares one exchange client across all drivers in a
+  // task pipeline. Claim split ownership on that shared client instead of
+  // assuming task-global driverId 0 belongs to this pipeline.
+  processSplits_ = exchangeClient_->claimSplitProcessor();
 }
 
 UcxCpuRowExchange::~UcxCpuRowExchange() {
@@ -76,8 +77,6 @@ void UcxCpuRowExchange::addRemoteTaskIds(
 }
 
 void UcxCpuRowExchange::getSplits(ContinueFuture* future) {
-  VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
-          << " getSplits called";
   if (!processSplits_) {
     return;
   }
@@ -114,7 +113,6 @@ void UcxCpuRowExchange::getSplits(ContinueFuture* future) {
     if (atEnd_) {
       operatorCtx_->task()->multipleSplitsFinished(
           false, stats_.rlock()->numSplits, 0);
-      recordExchangeClientStats();
     }
     return;
   }
@@ -136,7 +134,6 @@ BlockingReason UcxCpuRowExchange::isBlocked(ContinueFuture* future) {
       const auto numSplits = stats_.rlock()->numSplits;
       operatorCtx_->task()->multipleSplitsFinished(false, numSplits, 0);
     }
-    recordExchangeClientStats();
     return BlockingReason::kNotBlocked;
   }
 
@@ -258,34 +255,11 @@ void UcxCpuRowExchange::close() {
   currentStream_.reset();
   currentPage_.reset();
   currentReceived_.reset();
-  if (exchangeClient_) {
-    recordExchangeClientStats();
-    exchangeClient_->close();
-  }
+  // The CPU UCX adapter shares one exchange client across all drivers in a
+  // task pipeline. Individual operator close must not tear down the shared
+  // client while sibling drivers are still blocked on it; the client destructor
+  // closes it when the last operator releases its shared_ptr.
   exchangeClient_ = nullptr;
-}
-
-void UcxCpuRowExchange::recordExchangeClientStats() {
-  if (!processSplits_) {
-    return;
-  }
-
-  auto lockedStats = stats_.wlock();
-  const auto exchangeClientStats = exchangeClient_->stats();
-  for (const auto& [name, value] : exchangeClientStats) {
-    lockedStats->runtimeStats.erase(name);
-    lockedStats->runtimeStats.insert({name, value});
-  }
-
-  const auto iter = exchangeClientStats.find(Operator::kBackgroundCpuTimeNanos);
-  if (iter != exchangeClientStats.end()) {
-    const CpuWallTiming backgroundTiming{
-        static_cast<uint64_t>(iter->second.count),
-        0,
-        static_cast<uint64_t>(iter->second.sum)};
-    lockedStats->backgroundTiming.clear();
-    lockedStats->backgroundTiming.add(backgroundTiming);
-  }
 }
 
 } // namespace facebook::velox::ucx_exchange

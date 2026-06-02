@@ -58,6 +58,17 @@ void UcxCpuRowOutputQueueManager::updateOutputBuffers(
   getQueue(taskId)->updateOutputBuffers(numBuffers, noMoreBuffers);
 }
 
+bool UcxCpuRowOutputQueueManager::updateNumDrivers(
+    std::string_view taskId,
+    uint32_t newNumDrivers) {
+  auto queue = getQueueIfExists(taskId);
+  if (queue == nullptr) {
+    return false;
+  }
+  queue->updateNumDrivers(newNumDrivers);
+  return true;
+}
+
 void UcxCpuRowOutputQueueManager::enqueue(
     std::string_view taskId,
     int destination,
@@ -104,16 +115,12 @@ void UcxCpuRowOutputQueueManager::getData(
       // its capacity.
       if (removedTasks_.withLock(
               [&](auto& removed) { return removed.count(taskIdStr) > 0; })) {
-        VLOG(2) << "[QUEUE-MGR-CPU] task=" << taskId << " dest=" << destination
-                << " getData ignored (task already removed)";
         taskRemoved = true;
         return;
       }
       // Server arrived before initializeTask. Create a placeholder
       // queue to hold the notify callback; it'll be promoted to a real
       // queue when the producer task initializes.
-      VLOG(2) << "[QUEUE-MGR-CPU] task=" << taskId << " dest=" << destination
-              << " creating placeholder queue (server before init)";
       outputQueue =
           std::make_shared<UcxCpuRowOutputQueue>(nullptr, destination, 0);
       queues[taskIdStr] = outputQueue;
@@ -173,8 +180,6 @@ void UcxCpuRowOutputQueueManager::removeTask(std::string_view taskId) {
             [&](auto& removed) { removed.insert(taskIdStr); });
         return taskQueue;
       });
-  VLOG(2) << "[QUEUE-MGR-CPU] removeTask=" << taskId
-          << " queueExists=" << (queue != nullptr);
   if (queue != nullptr) {
     queue->terminate();
   }

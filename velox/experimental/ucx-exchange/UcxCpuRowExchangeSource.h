@@ -19,7 +19,6 @@
 #include <map>
 #include <set>
 #include "velox/common/EnumDeclare.h"
-#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -35,16 +34,6 @@
 
 namespace facebook::velox::ucx_exchange {
 
-struct UcxCpuRowExchangeMetrics {
-  UcxCpuRowExchangeMetrics()
-      : numPayloads_(RuntimeCounter::Unit::kNone),
-        totalBytes_(RuntimeCounter::Unit::kBytes),
-        rttPerRequest_(RuntimeCounter::Unit::kNanos) {}
-  RuntimeMetric numPayloads_;
-  RuntimeMetric totalBytes_;
-  RuntimeMetric rttPerRequest_;
-};
-
 class UcxCpuRowExchangeSource
     : public CommElement,
       public std::enable_shared_from_this<UcxCpuRowExchangeSource> {
@@ -55,6 +44,7 @@ class UcxCpuRowExchangeSource
     WaitingForHandshakeResponse,
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveCredit,
     WaitingForData,
     Done,
   };
@@ -72,10 +62,6 @@ class UcxCpuRowExchangeSource
   /// owning exchange queue has registered the source so any early
   /// failure can wake consumers correctly.
   void start();
-
-  bool supportsMetrics() const {
-    return true;
-  }
 
   void process() override;
 
@@ -102,10 +88,6 @@ class UcxCpuRowExchangeSource
   static int32_t backpressureHighWaterMark();
 
   static int32_t backpressureLowWaterMark();
-
-  folly::F14FastMap<std::string, int64_t> stats() const;
-
-  folly::F14FastMap<std::string, RuntimeMetric> metrics() const;
 
   std::string toString() const {
     std::stringstream out;
@@ -159,14 +141,22 @@ class UcxCpuRowExchangeSource
 
   void onHandshakeResponse(ucs_status_t status, std::shared_ptr<void> arg);
 
+  void sendDataEndpointAck();
+
+  void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
+
   void postReceiveWindow();
 
   void getMetadata(uint32_t sequenceNumber);
+
+  bool receiveQueueExceedsHighWater();
 
   void onMetadata(
       uint32_t sequenceNumber,
       ucs_status_t status,
       std::shared_ptr<void> arg);
+
+  void startDataReceive(std::shared_ptr<DataAndMetadata> dataAndMetadata);
 
   void onData(
       uint32_t sequenceNumber,
@@ -210,13 +200,15 @@ class UcxCpuRowExchangeSource
   std::atomic<bool> endMarkerDelivered_{false};
   std::atomic<bool> registered_{false};
   std::atomic<bool> backpressureActive_{false};
-
-  UcxCpuRowExchangeMetrics metrics_;
+  bool dataEndpointAckNeeded_{false};
+  uint32_t dataEndpointPeerHostIdHash_{0};
 
   std::shared_ptr<ucxx::Request> handshakeRequest_{nullptr};
   std::shared_ptr<ucxx::Request> handshakeResponseRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
   std::vector<std::shared_ptr<ucxx::Request>> metadataRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
+  std::shared_ptr<DataAndMetadata> pendingDataReceive_;
 };
 
 } // namespace facebook::velox::ucx_exchange

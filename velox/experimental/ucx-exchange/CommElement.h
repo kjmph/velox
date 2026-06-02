@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -33,11 +34,18 @@ class CommElement {
  public:
   CommElement(
       const std::shared_ptr<Communicator> communicator,
-      std::shared_ptr<EndpointRef> endpointRef)
-      : communicator_{communicator}, endpointRef_{endpointRef} {}
+      std::shared_ptr<EndpointRef> endpointRef,
+      bool coalesceWorkQueueEntries = false)
+      : communicator_{communicator},
+        endpointRef_{endpointRef},
+        coalesceWorkQueueEntries_{coalesceWorkQueueEntries} {}
 
-  CommElement(const std::shared_ptr<Communicator> communicator)
-      : communicator_{communicator}, endpointRef_{nullptr} {}
+  CommElement(
+      const std::shared_ptr<Communicator> communicator,
+      bool coalesceWorkQueueEntries = false)
+      : communicator_{communicator},
+        endpointRef_{nullptr},
+        coalesceWorkQueueEntries_{coalesceWorkQueueEntries} {}
 
   virtual ~CommElement() = default;
 
@@ -59,6 +67,21 @@ class CommElement {
   /// endpoint cleanup paths; both use the same per-element exclusion.
   std::recursive_mutex processMutex_;
 
+  bool markQueued() {
+    if (!coalesceWorkQueueEntries_) {
+      return true;
+    }
+    bool expected = false;
+    return queued_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel);
+  }
+
+  void clearQueued() {
+    if (coalesceWorkQueueEntries_) {
+      queued_.store(false, std::memory_order_release);
+    }
+  }
+
  protected:
   using StateEvent = std::function<void()>;
 
@@ -75,6 +98,8 @@ class CommElement {
   std::shared_ptr<EndpointRef> endpointRef_;
 
  private:
+  const bool coalesceWorkQueueEntries_;
+  std::atomic<bool> queued_{false};
   std::mutex stateEventMutex_;
   std::deque<StateEvent> stateEvents_;
 };

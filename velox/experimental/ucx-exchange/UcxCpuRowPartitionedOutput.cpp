@@ -193,7 +193,7 @@ readUint64Env(const char* name, uint64_t minValue, uint64_t maxValue) {
   char* end = nullptr;
   const auto parsed = std::strtoull(value, &end, 10);
   if (end == value || *end != '\0' || errno != 0) {
-    VLOG(1) << "Ignoring invalid " << name << "=" << value;
+    LOG(WARNING) << "Ignoring invalid " << name << "=" << value;
     return std::nullopt;
   }
 
@@ -675,6 +675,27 @@ void UcxCpuRowPartitionedOutput::addInput(RowVectorPtr input) {
   }
 }
 
+void UcxCpuRowPartitionedOutput::noMoreInput() {
+  Operator::noMoreInput();
+  finishOutput();
+}
+
+void UcxCpuRowPartitionedOutput::finishOutput() {
+  if (finished_) {
+    return;
+  }
+
+  for (auto& destination : destinations_) {
+    if (destination->isFinished()) {
+      continue;
+    }
+    destination->flush(/*future=*/nullptr);
+    destination->setFinished();
+  }
+  queueMgr_->noMoreData(operatorCtx_->task()->taskId());
+  finished_ = true;
+}
+
 RowVectorPtr UcxCpuRowPartitionedOutput::getOutput() {
   if (finished_) {
     return nullptr;
@@ -721,15 +742,7 @@ RowVectorPtr UcxCpuRowPartitionedOutput::getOutput() {
   }
 
   if (noMoreInput_) {
-    for (auto& destination : destinations_) {
-      if (destination->isFinished()) {
-        continue;
-      }
-      destination->flush(/*future=*/nullptr);
-      destination->setFinished();
-    }
-    queueMgr_->noMoreData(operatorCtx_->task()->taskId());
-    finished_ = true;
+    finishOutput();
   }
 
   input_ = nullptr;

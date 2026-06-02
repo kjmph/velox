@@ -40,6 +40,7 @@ class UcxCpuRowExchangeServer
   // Public for logging and the VELOX_DEFINE_EMBEDDED_ENUM_NAME names map.
   enum class ServerState : uint32_t {
     Created,
+    WaitingForDataEndpointAck,
     ReadyToTransfer,
     WaitingForDataFromQueue,
     DataReady,
@@ -57,7 +58,8 @@ class UcxCpuRowExchangeServer
   static std::shared_ptr<UcxCpuRowExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key);
+      const PartitionKey& key,
+      bool waitForDataEndpointAck = false);
 
   void process() override;
 
@@ -69,11 +71,15 @@ class UcxCpuRowExchangeServer
     return partitionKey_;
   }
 
+  /// Posts the data-endpoint ACK receive before the handshake response is sent.
+  void postDataEndpointAckReceive();
+
  private:
   explicit UcxCpuRowExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
-      const PartitionKey& key);
+      const PartitionKey& key,
+      bool waitForDataEndpointAck);
 
   std::shared_ptr<UcxCpuRowExchangeServer> getSelfPtr();
 
@@ -98,9 +104,12 @@ class UcxCpuRowExchangeServer
   /// UCX completion handler for the final metadata send.
   void finalMetadataComplete(ucs_status_t status);
 
+  /// UCX completion handler for the data-endpoint ACK.
+  void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
+
   void maybeFinish();
 
-  /// Sequentially-consistent state set with verbose transition trace.
+  /// Sequentially-consistent state set.
   void setState(ServerState newState);
 
   ServerState getState() {
@@ -118,14 +127,20 @@ class UcxCpuRowExchangeServer
   uint32_t sequenceNumber_{0};
   uint32_t inFlightSends_{0};
   bool waitingForData_{false};
+  bool waitForDataEndpointAck_{false};
+  bool dataEndpointAckReceived_{false};
+  bool hasPendingData_{false};
   bool finalMetadataSent_{false};
   bool finalMetadataCompleted_{false};
+
+  std::shared_ptr<UcxCpuRowPayload> pendingData_;
 
   // The Request owns its callback closure; completed UCXX requests are
   // kept for the server lifetime because UCP wireup-replay can invoke
   // callbacks after ucxx marks a request complete.
   std::vector<std::shared_ptr<ucxx::Request>> metaRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
+  std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
 
   std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
 };

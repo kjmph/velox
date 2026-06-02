@@ -16,8 +16,6 @@
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeServer.h"
 #include <glog/logging.h>
 #include <algorithm>
-#include <cerrno>
-#include <cstdlib>
 #include <cstring>
 #include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -33,6 +31,8 @@ serverStateNames() {
       F14FastMap<UcxCpuRowExchangeServer::ServerState, std::string_view>
           kNames = {
               {UcxCpuRowExchangeServer::ServerState::Created, "Created"},
+              {UcxCpuRowExchangeServer::ServerState::WaitingForDataEndpointAck,
+               "WaitingForDataEndpointAck"},
               {UcxCpuRowExchangeServer::ServerState::ReadyToTransfer,
                "ReadyToTransfer"},
               {UcxCpuRowExchangeServer::ServerState::WaitingForDataFromQueue,
@@ -48,24 +48,8 @@ serverStateNames() {
   return kNames;
 }
 
-uint32_t maxInFlightBundles() {
-  static const uint32_t kDepth = []() -> uint32_t {
-    const char* env = std::getenv("VELOX_UCX_CPU_PIPELINE_DEPTH");
-    if (env == nullptr || *env == '\0') {
-      return 1U;
-    }
-
-    char* end = nullptr;
-    errno = 0;
-    long value = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0' || errno != 0 || value < 1) {
-      VLOG(1) << "Ignoring invalid VELOX_UCX_CPU_PIPELINE_DEPTH=" << env;
-      return 1U;
-    }
-    return static_cast<uint32_t>(std::min<long>(value, 64));
-  }();
-  return kDepth;
-}
+// Keep CPU row exchange single-flight to match the receive-side state machine.
+constexpr uint32_t kMaxInFlightBundles = 1;
 
 } // namespace
 
@@ -121,19 +105,18 @@ constexpr int64_t kStandaloneFrameMinBytes = 512L << 10; // 512 KiB
 constexpr int64_t kBundleTargetBytes = 64L << 20; // 64 MiB
 
 void UcxCpuRowExchangeServer::setState(ServerState newState) {
-  auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
-  VLOG(4) << "[ExSrv-CPU " << partitionKey_.toString()
-          << " seq=" << sequenceNumber_ << "] " << toName(oldState) << " -> "
-          << toName(newState);
+  state_.store(newState, std::memory_order_seq_cst);
 }
 
 UcxCpuRowExchangeServer::UcxCpuRowExchangeServer(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
-    const PartitionKey& key)
-    : CommElement(communicator, endpointRef),
+    const PartitionKey& key,
+    bool waitForDataEndpointAck)
+    : CommElement(communicator, endpointRef, true),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
+      waitForDataEndpointAck_(waitForDataEndpointAck),
       queueMgr_(UcxCpuRowOutputQueueManager::getInstanceRef()) {
   setState(ServerState::Created);
 }
@@ -142,44 +125,54 @@ UcxCpuRowExchangeServer::UcxCpuRowExchangeServer(
 std::shared_ptr<UcxCpuRowExchangeServer> UcxCpuRowExchangeServer::create(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
-    const PartitionKey& key) {
+    const PartitionKey& key,
+    bool waitForDataEndpointAck) {
   return std::shared_ptr<UcxCpuRowExchangeServer>(
-      new UcxCpuRowExchangeServer(communicator, endpointRef, key));
+      new UcxCpuRowExchangeServer(
+          communicator, endpointRef, key, waitForDataEndpointAck));
 }
 
 void UcxCpuRowExchangeServer::process() {
-  drainStateEvents();
-  if (closed_.load(std::memory_order_acquire)) {
-    return;
+  while (true) {
+    drainStateEvents();
+    if (closed_.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    switch (state_) {
+      case ServerState::Created:
+        if (waitForDataEndpointAck_ && !dataEndpointAckReceived_) {
+          setState(ServerState::WaitingForDataEndpointAck);
+          return;
+        }
+        setState(ServerState::ReadyToTransfer);
+        continue;
+      case ServerState::WaitingForDataEndpointAck:
+        return;
+      case ServerState::ReadyToTransfer:
+      case ServerState::WaitingForDataFromQueue:
+      case ServerState::DataReady:
+      case ServerState::WaitingForSendComplete:
+        fillSendWindow();
+        if (getState() == ServerState::Done) {
+          continue;
+        }
+        return;
+      case ServerState::WaitingForFinalMetadataComplete:
+        maybeFinish();
+        if (getState() == ServerState::Done) {
+          continue;
+        }
+        return;
+      case ServerState::Done:
+        close();
+        if (endpointRef_) {
+          endpointRef_->removeCommElem(getSelfPtr());
+          endpointRef_ = nullptr;
+        }
+        return;
+    };
   }
-  switch (state_) {
-    case ServerState::Created:
-      setState(ServerState::ReadyToTransfer);
-      communicator_->addToWorkQueue(getSelfPtr());
-      break;
-    case ServerState::ReadyToTransfer: {
-      fillSendWindow();
-    } break;
-    case ServerState::WaitingForDataFromQueue:
-      fillSendWindow();
-      break;
-    case ServerState::DataReady:
-      fillSendWindow();
-      break;
-    case ServerState::WaitingForSendComplete:
-      fillSendWindow();
-      break;
-    case ServerState::WaitingForFinalMetadataComplete:
-      maybeFinish();
-      break;
-    case ServerState::Done:
-      close();
-      if (endpointRef_) {
-        endpointRef_->removeCommElem(getSelfPtr());
-        endpointRef_ = nullptr;
-      }
-      break;
-  };
 }
 
 void UcxCpuRowExchangeServer::close() {
@@ -189,10 +182,6 @@ void UcxCpuRowExchangeServer::close() {
           expected, true, std::memory_order_acq_rel)) {
     return;
   }
-  VLOG(3) << "@" << partitionKey_.taskId
-          << " Close UcxCpuRowExchangeServer to remote "
-          << partitionKey_.toString();
-
   for (auto& req : metaRequests_) {
     if (req && !req->isCompleted()) {
       req->cancel();
@@ -203,6 +192,11 @@ void UcxCpuRowExchangeServer::close() {
       req->cancel();
     }
   }
+  if (dataEndpointAckRequest_ && !dataEndpointAckRequest_->isCompleted()) {
+    dataEndpointAckRequest_->cancel();
+  }
+  pendingData_.reset();
+  hasPendingData_ = false;
 
   if (communicator_) {
     for (auto& req : metaRequests_) {
@@ -217,6 +211,9 @@ void UcxCpuRowExchangeServer::close() {
       }
     }
     dataRequests_.clear();
+    if (dataEndpointAckRequest_) {
+      communicator_->deferRequestCleanup(std::move(dataEndpointAckRequest_));
+    }
   }
 
   communicator_->unregister(getSelfPtr());
@@ -235,13 +232,78 @@ std::shared_ptr<UcxCpuRowExchangeServer> UcxCpuRowExchangeServer::getSelfPtr() {
   return shared_from_this();
 }
 
+void UcxCpuRowExchangeServer::postDataEndpointAckReceive() {
+  if (!waitForDataEndpointAck_ || dataEndpointAckRequest_) {
+    return;
+  }
+
+  auto ack = std::make_shared<CpuRowHandshakeAckHeader>();
+  uint64_t ackTag = getHandshakeAckTag(partitionKeyHash_);
+
+  std::weak_ptr<UcxCpuRowExchangeServer> weak = weak_from_this();
+  dataEndpointAckRequest_ = endpointRef_->endpoint_->tagRecv(
+      ack.get(),
+      sizeof(*ack),
+      ucxx::Tag{ackTag},
+      ucxx::TagMaskFull,
+      false,
+      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onDataEndpointAck(status, std::move(arg));
+              });
+        }
+      },
+      ack);
+}
+
+void UcxCpuRowExchangeServer::onDataEndpointAck(
+    ucs_status_t status,
+    std::shared_ptr<void> arg) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  if (status != UCS_OK) {
+    LOG(ERROR) << "[ExSrv-CPU " << partitionKey_.toString()
+               << "] failed to receive data endpoint ACK: "
+               << ucs_status_string(status);
+    setState(ServerState::Done);
+    return;
+  }
+
+  auto ack = std::static_pointer_cast<CpuRowHandshakeAckHeader>(arg);
+  if (ack->magic != kCpuRowHandshakeAckMagic ||
+      ack->version != kCpuRowHandshakeAckVersion ||
+      ack->headerSize != sizeof(CpuRowHandshakeAckHeader)) {
+    LOG(ERROR) << "[ExSrv-CPU " << partitionKey_.toString()
+               << "] invalid CPU data endpoint ACK";
+    setState(ServerState::Done);
+    return;
+  }
+
+  dataEndpointAckReceived_ = true;
+  setState(ServerState::ReadyToTransfer);
+}
+
 void UcxCpuRowExchangeServer::fillSendWindow() {
   if (closed_.load(std::memory_order_acquire) || finalMetadataSent_) {
     return;
   }
 
-  const uint32_t sendWindow = maxInFlightBundles();
-  while (inFlightSends_ < sendWindow) {
+  while (inFlightSends_ < kMaxInFlightBundles) {
+    if (hasPendingData_) {
+      auto data = std::move(pendingData_);
+      hasPendingData_ = false;
+      if (!data) {
+        sendFinalMetadata();
+        return;
+      }
+      sendData(std::move(data));
+      continue;
+    }
+
     auto data =
         queueMgr_->tryGetData(partitionKey_.taskId, partitionKey_.destination);
     if (data) {
@@ -282,25 +344,17 @@ void UcxCpuRowExchangeServer::onDataAvailable(
     std::shared_ptr<UcxCpuRowPayload> data) {
   waitingForData_ = false;
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " getData callback after close, ignoring";
     return;
   }
   if (finalMetadataSent_) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " getData callback after final metadata, ignoring";
     return;
   }
 
-  if (!data) {
-    sendFinalMetadata();
-    return;
-  }
-
-  VLOG(3) << "@" << partitionKey_.taskId
-          << " Found data for client: " << partitionKey_.toString();
-  sendData(std::move(data));
-  fillSendWindow();
+  VELOX_CHECK(
+      !hasPendingData_, "CPU row exchange queue callback overlap detected");
+  pendingData_ = std::move(data);
+  hasPendingData_ = true;
+  setState(ServerState::DataReady);
 }
 
 void UcxCpuRowExchangeServer::sendData(
@@ -390,11 +444,6 @@ void UcxCpuRowExchangeServer::sendData(
   const size_t numFrames = multiState->frames.size();
   VELOX_CHECK_GT(numFrames, 0, "sendData requires a non-empty data bundle");
 
-  VLOG(4) << "[ExSrv-CPU " << partitionKey_.toString()
-          << " seq=" << sequenceNumber
-          << "] sendData hasData=" << (numFrames > 0) << " frames=" << numFrames
-          << " size=" << combinedBytes;
-
   // Build metadata reflecting the packed frame layout.
   UcxCpuRowMetadataMsg metadataMsg;
   metadataMsg.dataSizeBytes = combinedBytes;
@@ -419,7 +468,7 @@ void UcxCpuRowExchangeServer::sendData(
       serMetaSize,
       ucxx::Tag{metadataTag},
       false,
-      [tid = partitionKey_.toString(), metadataTag, weakMeta](
+      [tid = partitionKey_.toString(), weakMeta](
           ucs_status_t status, std::shared_ptr<void> arg) {
         auto ctx = std::static_pointer_cast<CpuRowMetaSendContext>(arg);
         auto metaHolder = std::move(ctx->metadata);
@@ -429,20 +478,14 @@ void UcxCpuRowExchangeServer::sendData(
           return;
         }
         self->enqueueStateEvent(
-            self, [raw = self.get(), status, tid, metadataTag]() {
+            self, [raw = self.get(), status, tid]() {
               if (raw->closed_.load(std::memory_order_acquire)) {
-                VLOG(3) << "@" << raw->partitionKey_.taskId
-                        << " metadata send callback after close, ignoring";
                 return;
               }
-              if (status == UCS_OK) {
-                VLOG(3) << "@" << raw->partitionKey_.taskId
-                        << " metadata sent to " << tid << " tag=" << std::hex
-                        << metadataTag;
-              } else {
-                VLOG(0) << "@" << raw->partitionKey_.taskId
-                        << " Error in sendData metadata: "
-                        << ucs_status_string(status) << " task: " << tid;
+              if (status != UCS_OK) {
+                LOG(ERROR) << "@" << raw->partitionKey_.taskId
+                           << " Error in sendData metadata: "
+                           << ucs_status_string(status) << " task: " << tid;
                 raw->setState(ServerState::Done);
               }
             });
@@ -545,8 +588,6 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
 
 void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " final metadata callback after close, ignoring";
     return;
   }
 
@@ -554,9 +595,9 @@ void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
     finalMetadataCompleted_ = true;
     maybeFinish();
   } else {
-    VLOG(0) << "@" << partitionKey_.taskId
-            << " Error in final metadata send: " << ucs_status_string(status)
-            << " task: " << partitionKey_.toString();
+    LOG(ERROR) << "@" << partitionKey_.taskId
+               << " Error in final metadata send: " << ucs_status_string(status)
+               << " task: " << partitionKey_.toString();
     setState(ServerState::Done);
   }
 }
@@ -565,7 +606,6 @@ void UcxCpuRowExchangeServer::maybeFinish() {
   if (finalMetadataCompleted_ && inFlightSends_ == 0 &&
       getState() != ServerState::Done) {
     setState(ServerState::Done);
-    communicator_->addToWorkQueue(getSelfPtr());
   }
 }
 
@@ -573,8 +613,6 @@ void UcxCpuRowExchangeServer::sendComplete(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " sendComplete after close, ignoring";
     return;
   }
   auto state = std::static_pointer_cast<CpuRowMultiSendState>(arg);
@@ -589,13 +627,12 @@ void UcxCpuRowExchangeServer::sendComplete(
 
     if (!finalMetadataSent_) {
       setState(ServerState::ReadyToTransfer);
-      fillSendWindow();
     } else {
       maybeFinish();
     }
   } else {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Error in sendComplete: " << ucs_status_string(status);
+    LOG(ERROR) << "@" << partitionKey_.taskId
+               << " Error in sendComplete: " << ucs_status_string(status);
     setState(ServerState::Done);
   }
 }

@@ -102,16 +102,6 @@ const CpuUcxConfig& cpuUcxConfig() {
   return instance;
 }
 
-std::string_view transportName(core::ExchangeTransportType type) {
-  switch (type) {
-    case core::ExchangeTransportType::kHttp:
-      return "HTTP";
-    case core::ExchangeTransportType::kUcx:
-      return "UCX";
-  }
-  return "UNKNOWN";
-}
-
 // Communicator is a singleton; the adapter lazy-starts it on first driver that
 // opts in. Once running, it stays up for the process lifetime. Detach only
 // releases std::thread ownership; it does not stop the Communicator. A graceful
@@ -254,12 +244,16 @@ void ensureCommunicatorStarted() {
     const auto& cfg = cpuUcxConfig();
     LOG(INFO) << "[CPU-UCX] Starting Communicator on port " << cfg.port;
     // coordinatorURL is currently dead state in Communicator (unused).
-    auto comm = Communicator::initAndGet(cfg.port, "");
+    ContinueFuture readyFuture;
+    auto comm = Communicator::initAndGet(cfg.port, "", &readyFuture);
     if (!comm) {
       LOG(ERROR) << "[CPU-UCX] Communicator::initAndGet failed";
       return;
     }
     std::thread([c = comm]() { c->run(); }).detach();
+    if (readyFuture.valid()) {
+      std::move(readyFuture).wait();
+    }
   });
 }
 
@@ -313,10 +307,6 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       auto transportType =
           ctx->task->queryCtx()->outputTransportType(planNodeId);
       if (transportType != core::ExchangeTransportType::kUcx) {
-        VLOG(1) << "[CPU-UCX] keeping standard PartitionedOutput at index " << i
-                << " (planNodeId=" << planNodeId << ", taskId=" << op->taskId()
-                << ", transport=" << transportName(transportType)
-                << ")";
         continue;
       }
 
@@ -325,8 +315,6 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       // bundles on the exchange-server side.
       replacement.push_back(std::make_unique<UcxCpuRowPartitionedOutput>(
           op->operatorId(), ctx, poNode, /*eagerFlush=*/false));
-      VLOG(1) << "[CPU-UCX] replacing PartitionedOutput at index " << i
-              << " (planNodeId=" << planNodeId << ")";
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       replacedAny = true;
@@ -344,10 +332,6 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       auto transportType =
           ctx->task->queryCtx()->inputTransportType(planNodeId);
       if (transportType != core::ExchangeTransportType::kUcx) {
-        VLOG(1) << "[CPU-UCX] keeping standard Exchange at index " << i
-                << " (planNodeId=" << planNodeId << ", taskId=" << op->taskId()
-                << ", transport=" << transportName(transportType)
-                << ")";
         continue;
       }
       // Share one UcxCpuRowExchangeClient across all drivers in the
@@ -379,8 +363,6 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       std::vector<std::unique_ptr<exec::Operator>> replacement;
       replacement.push_back(std::make_unique<UcxCpuRowExchange>(
           op->operatorId(), ctx, exchangeNode, client));
-      VLOG(1) << "[CPU-UCX] replacing Exchange at index " << i
-              << " (planNodeId=" << planNodeId << ")";
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       replacedAny = true;
@@ -416,9 +398,7 @@ void registerCpuUcxDriverAdapter() {
         return std::make_shared<UcxCpuRowMergeExchangeSource>(
             mergeExchange, taskId, destination);
       });
-  const auto& cfg = cpuUcxConfig();
-  LOG(INFO) << "[CPU-UCX] DriverAdapter registered (enabled=" << cfg.enabled
-            << ", port=" << cfg.port << ")";
+  LOG(INFO) << "[CPU-UCX] DriverAdapter registered";
 }
 
 // __attribute__((constructor)) puts this function pointer in

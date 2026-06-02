@@ -59,16 +59,13 @@ class UcxCpuRowExchange : public SourceOperator {
 
   void getSplits(ContinueFuture* future);
 
-  void recordExchangeClientStats();
-
   void recordInputStats(uint64_t rawInputBytes, const RowVectorPtr& result);
 
   std::shared_ptr<UcxCpuRowExchangeClient> exchangeClient_;
 
   const uint64_t preferredOutputBatchBytes_;
   const std::unique_ptr<VectorSerde::Options> serdeOptions_;
-  const bool processSplits_;
-  const int pipelineId_;
+  bool processSplits_{false};
   const int driverId_;
   bool noMoreSplits_{false};
 

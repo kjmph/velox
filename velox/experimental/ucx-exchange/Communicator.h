@@ -127,6 +127,12 @@ class Communicator {
       std::string peerIp = "",
       uint32_t peerHostIdHash = 0);
 
+  /// Logs when a same-host worker-address endpoint selected no shared-memory
+  /// transport. This is diagnostic only and does not change endpoint selection.
+  void logUnexpectedSameHostEndpointTransport(
+      const std::shared_ptr<EndpointRef>& endpointRef,
+      uint32_t peerHostIdHash) const;
+
   /// Returns this process' serialized UCX worker address.
   [[nodiscard]] std::string getWorkerAddress() const;
 
@@ -210,6 +216,7 @@ class Communicator {
   uint16_t port_;
   std::string coordinatorURL_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> runStarted_{false};
   Acceptor acceptor_;
   ContinuePromise promise_{"Communicator::run"};
 

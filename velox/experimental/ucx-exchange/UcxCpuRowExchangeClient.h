@@ -36,8 +36,6 @@ class UcxCpuRowExchangeClient
       int32_t requestDataSizesMaxWaitSec = 10)
       : taskId_{std::move(taskId)},
         destination_(destination),
-        maxQueuedPayloads_(
-            UcxCpuRowExchangeSource::backpressureHighWaterMark()),
         kRequestDataSizesMaxWaitSec_(requestDataSizesMaxWaitSec),
         queue_(std::make_shared<UcxCpuRowExchangeQueue>(numberOfConsumers)) {
     VELOX_CHECK_GE(
@@ -52,7 +50,14 @@ class UcxCpuRowExchangeClient
 
   void close();
 
-  folly::F14FastMap<std::string, RuntimeMetric> stats() const;
+  bool claimSplitProcessor() {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    if (splitProcessorClaimed_) {
+      return false;
+    }
+    splitProcessorClaimed_ = true;
+    return true;
+  }
 
   const std::shared_ptr<UcxCpuRowExchangeQueue>& queue() const {
     return queue_;
@@ -79,7 +84,6 @@ class UcxCpuRowExchangeClient
  private:
   const std::string taskId_;
   const int destination_;
-  const int32_t maxQueuedPayloads_;
   const std::chrono::seconds kRequestDataSizesMaxWaitSec_;
 
   const std::shared_ptr<UcxCpuRowExchangeQueue> queue_;
@@ -87,9 +91,7 @@ class UcxCpuRowExchangeClient
   std::unordered_set<std::string> remoteTaskIds_;
   std::vector<std::shared_ptr<UcxCpuRowExchangeSource>> sources_;
   bool closed_{false};
-
-  int64_t totalDequeued_{0};
-  bool inFlowControl_{false};
+  bool splitProcessorClaimed_{false};
 };
 
 } // namespace facebook::velox::ucx_exchange

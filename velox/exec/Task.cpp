@@ -2028,6 +2028,12 @@ bool Task::checkNoMoreSplitGroupsLocked() {
       auto bufferManager = bufferManager_.lock();
       bufferManager->updateNumDrivers(
           taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+      auto cpuQueueMgr = facebook::velox::ucx_exchange::
+          UcxCpuRowOutputQueueManager::getInstanceRef();
+      cpuQueueMgr->updateNumDrivers(
+          taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+#endif
     }
 
     return checkIfFinishedLocked();

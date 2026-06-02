@@ -16,6 +16,7 @@
 #pragma once
 
 #include <random>
+#include <string_view>
 #include "velox/exec/Operator.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
@@ -77,6 +78,7 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
   std::shared_ptr<UcxExchangeClient> exchangeClient_;
 
   const uint64_t preferredOutputBatchBytes_;
+  const bool closeExchangeClientOnClose_;
 
   /// True if this operator is responsible for fetching splits from the Task
   /// and passing these to ExchangeClient. When running with multile drivers,

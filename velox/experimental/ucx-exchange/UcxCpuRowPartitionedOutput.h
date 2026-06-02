@@ -57,6 +57,8 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
 
   void addInput(RowVectorPtr input) override;
 
+  void noMoreInput() override;
+
   RowVectorPtr getOutput() override;
 
   bool needsInput() const override {
@@ -168,6 +170,7 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   void initializeSizeBuffers();
   void estimateRowSizes();
   void collectNullRows();
+  void finishOutput();
 
   const std::vector<column_index_t> keyChannels_;
   const int numDestinations_;

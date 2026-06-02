@@ -36,14 +36,10 @@ void UcxCpuRowExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
     queue_->addSourceLocked();
     source->setRegistered();
     source->start();
-    VLOG(3) << "@" << taskId_
-            << " Added remote split for task: " << remoteTaskId;
   }
 }
 
 void UcxCpuRowExchangeClient::noMoreRemoteTasks() {
-  VLOG(3) << "@" << taskId_
-          << " UcxCpuRowExchangeClient::noMoreRemoteTasks called.";
   queue_->noMoreSources();
 }
 
@@ -64,42 +60,10 @@ void UcxCpuRowExchangeClient::close() {
   queue_->close();
 }
 
-folly::F14FastMap<std::string, RuntimeMetric> UcxCpuRowExchangeClient::stats()
-    const {
-  folly::F14FastMap<std::string, RuntimeMetric> stats;
-  std::lock_guard<std::mutex> l(queue_->mutex());
-  for (const auto& source : sources_) {
-    for (const auto& [name, value] : source->metrics()) {
-      auto [iter, inserted] = stats.try_emplace(name, value.unit);
-      iter->second.merge(value);
-    }
-  }
-
-  stats.insert_or_assign(
-      "ucxCpuRowExchangeClient.peakBytes",
-      RuntimeMetric(queue_->peakBytes(), RuntimeCounter::Unit::kBytes));
-  stats.insert_or_assign(
-      "ucxCpuRowExchangeClient.numReceivedPayloads",
-      RuntimeMetric(queue_->receivedPayloads()));
-  stats.insert_or_assign(
-      "ucxCpuRowExchangeClient.peakQueuedPayloads",
-      RuntimeMetric(queue_->peakSize()));
-  stats.insert_or_assign(
-      "ucxCpuRowExchangeClient.maxQueuedPayloads",
-      RuntimeMetric(maxQueuedPayloads_));
-  stats.insert_or_assign(
-      "ucxCpuRowExchangeClient.averageReceivedPayloadBytes",
-      RuntimeMetric(
-          queue_->averageReceivedPayloadBytes(), RuntimeCounter::Unit::kBytes));
-  return stats;
-}
-
 UcxCpuRowReceivedPtr UcxCpuRowExchangeClient::next(
     int consumerId,
     bool* atEnd,
     ContinueFuture* future) {
-  VLOG(3) << "@" << taskId_
-          << " UcxCpuRowExchangeClient::next consumerId=" << consumerId;
   UcxCpuRowReceivedPtr data;
   ContinuePromise stalePromise = ContinuePromise::makeEmpty();
   std::vector<std::shared_ptr<UcxCpuRowExchangeSource>> sourcesToResume;
@@ -116,39 +80,13 @@ UcxCpuRowReceivedPtr UcxCpuRowExchangeClient::next(
       return data;
     }
 
-    // The push-based UCX exchange has no "request more" knob; this
-    // counter is purely diagnostic. Real backpressure lives in
-    // UcxCpuRowExchangeSource::process()'s ReadyToReceive branch.
-    if (data != nullptr && queue_->size() > maxQueuedPayloads_) {
-      if (!inFlowControl_) {
-        inFlowControl_ = true;
-        VLOG(1) << "[FLOW-CTRL-CPU] @" << taskId_ << " consumer=" << consumerId
-                << " entering flow control" << " queueSize=" << queue_->size()
-                << " maxQueued=" << maxQueuedPayloads_;
-      }
-    } else if (inFlowControl_ && data != nullptr) {
-      inFlowControl_ = false;
-      VLOG(1) << "[FLOW-CTRL-CPU] @" << taskId_ << " consumer=" << consumerId
-              << " leaving flow control" << " queueSize=" << queue_->size()
-              << " maxQueued=" << maxQueuedPayloads_;
-    }
-
-    if (data != nullptr) {
-      ++totalDequeued_;
-      if (totalDequeued_ % 1000 == 0) {
-        VLOG(1) << "[PROGRESS-CPU] @" << taskId_ << " consumer=" << consumerId
-                << " dequeued=" << totalDequeued_
-                << " queueSize=" << queue_->size()
-                << " queueBytes=" << queue_->totalBytes();
-      }
-    }
-
-    // Collect sources to resume while holding the queue mutex; the
-    // resume call grabs the WorkQueue mutex, so we must not nest the
-    // two (queue mutex then WorkQueue mutex would deadlock against the
-    // Communicator thread).
-    if (data != nullptr &&
-        queue_->size() <= UcxCpuRowExchangeSource::backpressureLowWaterMark()) {
+    // A parked consumer on an empty/low queue is also a receive-credit signal.
+    // If sources stopped posting receives due to backpressure, requiring a
+    // successful dequeue to resume them can deadlock: no source is active, so
+    // no future dequeue can happen. resumeFromBackpressure() is idempotent via
+    // CAS, so waking all sources at low-water is cheap and closes that edge.
+    if (queue_->size() <=
+        UcxCpuRowExchangeSource::backpressureLowWaterMark()) {
       sourcesToResume.assign(sources_.begin(), sources_.end());
     }
   }

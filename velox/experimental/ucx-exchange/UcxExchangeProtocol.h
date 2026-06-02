@@ -43,6 +43,7 @@ namespace facebook::velox::ucx_exchange {
 constexpr uint64_t METADATA_TAG = 0x02000000;
 constexpr uint64_t DATA_TAG = 0x03000000;
 constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
+constexpr uint64_t HANDSHAKE_ACK_TAG = 0x05000000;
 
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(std::string_view s);
@@ -65,6 +66,12 @@ inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
   return (taskHash << 32) | HANDSHAKE_RESPONSE_TAG;
 }
 
+// Gets the tag used for CPU-row data-endpoint ACK communication.
+// Note: taskHash is implicitly converted to 64 bits.
+inline uint64_t getHandshakeAckTag(uint64_t taskHash) {
+  return (taskHash << 32) | HANDSHAKE_ACK_TAG;
+}
+
 /// @brief Request that is sent from the client (UcxExchangeSource) to the
 /// server (UcxExchangeServer) after connection.
 ///
@@ -83,6 +90,16 @@ struct HandshakeMsg {
 
 constexpr uint32_t kCpuRowHandshakeMagic = 0x43505558; // "CPUX"
 constexpr uint16_t kCpuRowHandshakeVersion = 1;
+constexpr uint32_t kCpuRowHandshakeResponseMagic = 0x43505258; // "CPRX"
+constexpr uint16_t kCpuRowHandshakeResponseVersion = 1;
+constexpr uint32_t kCpuRowHandshakeAckMagic = 0x4350414b; // "CPAK"
+constexpr uint16_t kCpuRowHandshakeAckVersion = 1;
+constexpr uint32_t kMaxCpuRowWorkerAddressBytes = 4096;
+
+enum class CpuRowDataEndpointMode : uint8_t {
+  kBootstrap = 0,
+  kSameHostWorkerAddress = 1,
+};
 
 /// CPU-row handshake envelope. The legacy HandshakeMsg remains unchanged for
 /// the GPU exchange path; CPU adds the source UCX worker address after this
@@ -103,9 +120,34 @@ struct CpuRowHandshakeHeader {
   uint32_t sourceHostIdHash{0};
 };
 
+/// CPU-row handshake response envelope. The listener endpoint remains the
+/// control channel. When both sides are on the same host, this response carries
+/// the producer worker address so the source can create the reciprocal UCX
+/// worker-address data endpoint before posting metadata receives.
+struct CpuRowHandshakeResponseHeader {
+  uint32_t magic{kCpuRowHandshakeResponseMagic};
+  uint16_t version{kCpuRowHandshakeResponseVersion};
+  uint16_t headerSize{sizeof(CpuRowHandshakeResponseHeader)};
+  CpuRowDataEndpointMode dataEndpointMode{CpuRowDataEndpointMode::kBootstrap};
+  uint8_t reserved[3]{};
+  uint32_t serverWorkerAddressBytes{0};
+  uint32_t serverHostIdHash{0};
+};
+
+/// CPU-row data-endpoint ACK. The source sends this on the selected data
+/// endpoint after it has created the endpoint and posted its first metadata
+/// receive. The producer registers the server before the response, but does
+/// not start metadata/data transfer on a worker-address endpoint until this
+/// ACK arrives.
+struct CpuRowHandshakeAckHeader {
+  uint32_t magic{kCpuRowHandshakeAckMagic};
+  uint16_t version{kCpuRowHandshakeAckVersion};
+  uint16_t headerSize{sizeof(CpuRowHandshakeAckHeader)};
+};
+
 /// @brief Response sent from server to source after handshake.
 /// The GPU exchange path uses this to report same-process intra-node transfer
-/// availability. The CPU row exchange always transfers through UCX.
+/// availability. CPU row exchange uses CpuRowHandshakeResponseHeader instead.
 struct HandshakeResponse {
   /// True if the GPU exchange source should use IntraNodeTransferRegistry.
   bool isIntraNodeTransfer{false};

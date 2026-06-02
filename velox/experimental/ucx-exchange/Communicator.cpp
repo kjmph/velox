@@ -19,6 +19,7 @@
 #endif
 #include <gflags/gflags.h>
 #include <sys/stat.h>
+#include <ucp/api/ucp.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <unistd.h>
@@ -31,6 +32,7 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -44,6 +46,7 @@
 #endif
 
 #include <glog/logging.h>
+#include <folly/String.h>
 
 // gflag for whether the UCX exchange is active.
 DEFINE_bool(velox_ucx_exchange, true, "Enable UCX exchange");
@@ -101,6 +104,65 @@ int maxWorkItemsPerDrain() {
       readIntEnv(
           "VELOX_UCX_MAX_WORK_ITEMS_PER_DRAIN", 256, 1, 1 << 20);
   return value;
+}
+
+bool isSharedMemoryTransport(std::string_view transport) {
+  return transport == "posix" || transport == "sysv" ||
+      transport == "cma" || transport == "xpmem" || transport == "knem" ||
+      transport == "mm";
+}
+
+void logUnexpectedSameHostTransport(
+    const std::shared_ptr<ucxx::Endpoint>& endpoint,
+    const std::string& peerIp,
+    uint32_t localHostIdHash,
+    uint32_t peerHostIdHash) {
+  auto* endpointHandle = endpoint->getHandle();
+  if (endpointHandle == nullptr) {
+    return;
+  }
+
+  constexpr unsigned kMaxTransports = 16;
+  std::array<ucp_transport_entry_t, kMaxTransports> entries;
+  ucp_ep_attr_t attrs{};
+  attrs.field_mask = UCP_EP_ATTR_FIELD_TRANSPORTS;
+  attrs.transports.entries = entries.data();
+  attrs.transports.num_entries = entries.size();
+  attrs.transports.entry_size = sizeof(ucp_transport_entry_t);
+
+  const auto status = ucp_ep_query(endpointHandle, &attrs);
+  if (status != UCS_OK) {
+    VLOG(1) << "Failed to query CPU same-host UCX endpoint transports: "
+            << ucs_status_string(status);
+    return;
+  }
+
+  bool hasSharedMemory = false;
+  std::vector<std::string> transports;
+  transports.reserve(attrs.transports.num_entries);
+  for (unsigned i = 0; i < attrs.transports.num_entries; ++i) {
+    const char* transport = entries[i].transport_name;
+    const char* device = entries[i].device_name;
+    if (transport == nullptr) {
+      continue;
+    }
+    std::string transportName{transport};
+    if (device != nullptr && *device != '\0') {
+      transportName.append("/").append(device);
+    }
+    transports.push_back(transportName);
+    hasSharedMemory = hasSharedMemory || isSharedMemoryTransport(transport);
+  }
+
+  if (hasSharedMemory) {
+    return;
+  }
+
+  LOG(WARNING) << "CPU same-host UCX worker-address endpoint selected no "
+               << "shared-memory transport. peerIp=" << peerIp
+               << " localHostIdHash=" << localHostIdHash
+               << " peerHostIdHash=" << peerHostIdHash
+               << " transports=" << folly::join(",", transports);
 }
 } // namespace
 
@@ -259,6 +321,12 @@ Communicator::~Communicator() {
 /// The thread that calls run owns communicator state dispatch. UCX worker
 /// progress is owned by the dedicated progress thread started by run().
 void Communicator::run() {
+  bool expected = false;
+  if (!runStarted_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
   VLOG(3) << "Using error handling mode: " << UcxConfigView::ucxxErrorHandling()
           << std::endl;
   VLOG(3) << "Using blocking progress mode: "
@@ -462,12 +530,13 @@ void Communicator::stop() {
 }
 
 void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
-  std::lock_guard<std::mutex> lock(elemMutex_);
-  auto ret = elements_.insert(comms);
-  VELOX_CHECK(ret.second, "CommElement already registered!");
+  {
+    std::lock_guard<std::mutex> lock(elemMutex_);
+    auto ret = elements_.insert(comms);
+    VELOX_CHECK(ret.second, "CommElement already registered!");
+  }
   // Also put the comms element into the work queue.
-  workQueue_.push(comms);
-  signalWorker();
+  addToWorkQueue(std::move(comms));
 }
 
 void Communicator::signalWorker() {
@@ -480,6 +549,9 @@ void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
   if (!comms) {
     return;
   }
+  if (!comms->markQueued()) {
+    return;
+  }
   workQueue_.push(comms);
   signalWorker();
 }
@@ -490,6 +562,7 @@ void Communicator::unregister(std::shared_ptr<CommElement> comms) {
     return;
   }
   workQueue_.erase(comms);
+  comms->clearQueued();
   elements_.erase(comms);
 }
 
@@ -525,6 +598,17 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
 
   auto epRef = std::make_shared<EndpointRef>(ep);
   epRef->addCommElem(comms);
+  if (errorHandling) {
+    try {
+      ep->setCloseCallback(EndpointRef::onClose, epRef);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "UCX endpoint to " << hostPort.hostname << ":"
+                   << hostPort.port
+                   << " closed before close callback registration: "
+                   << e.what();
+      return nullptr;
+    }
+  }
 
   {
     std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
@@ -534,9 +618,6 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
       existing->addCommElem(comms);
       return existing;
     }
-  }
-  if (errorHandling) {
-    ep->setCloseCallback(EndpointRef::onClose, epRef);
   }
   return epRef;
 }
@@ -555,9 +636,6 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
   }
 
   if (!hasSameHostTransportIdentity(peerHostIdHash)) {
-    VLOG(1) << "[CPU-UCX] not creating same-host worker-address endpoint "
-            << "peerIp=" << peerIp << " localHostIdHash=" << hostIdHash_
-            << " peerHostIdHash=" << peerHostIdHash;
     return nullptr;
   }
 
@@ -570,15 +648,13 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
     }
   }
 
-  // This is a separate worker-address data connection, not the listener
-  // bootstrap connection. UCX wireup carries this endpoint's err_mode to the
-  // peer; the remote internal endpoint is created with the same mode. Do not
-  // mix modes across the two sides of a single listener/conn_request pair.
+  // This is a same-host worker-address data connection, not the listener
+  // bootstrap connection. UCX shared-memory transports do not support peer
+  // failure handling; enabling it forces TCP selection or makes sm-only
+  // endpoint creation fail. The same-host predicate above includes IPC/PID
+  // namespace identity, so keep error handling on cross-host/listener
+  // connections and leave it off here to preserve the shared-memory path.
   constexpr bool kErrorHandling = false;
-  VLOG(1) << "[CPU-UCX] creating same-host worker-address endpoint peerIp="
-          << peerIp << " localHostIdHash=" << hostIdHash_
-          << " peerHostIdHash=" << peerHostIdHash
-          << " errorHandling=" << kErrorHandling;
   std::shared_ptr<ucxx::Endpoint> ep;
   try {
     auto address = ucxx::createAddressFromString(key);
@@ -593,6 +669,15 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
   }
 
   auto epRef = std::make_shared<EndpointRef>(ep, std::move(peerIp));
+  try {
+    ep->setCloseCallback(EndpointRef::onClose, epRef);
+  } catch (const std::exception& e) {
+    LOG(WARNING)
+        << "CPU same-host UCX endpoint closed before close callback "
+           "registration: "
+        << e.what();
+    return nullptr;
+  }
 
   {
     std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
@@ -602,6 +687,20 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
     }
   }
   return epRef;
+}
+
+void Communicator::logUnexpectedSameHostEndpointTransport(
+    const std::shared_ptr<EndpointRef>& endpointRef,
+    uint32_t peerHostIdHash) const {
+  if (endpointRef == nullptr || endpointRef->endpoint_ == nullptr ||
+      !hasSameHostTransportIdentity(peerHostIdHash)) {
+    return;
+  }
+  logUnexpectedSameHostTransport(
+      endpointRef->endpoint_,
+      endpointRef->getPeerIp(),
+      hostIdHash_,
+      peerHostIdHash);
 }
 
 std::string Communicator::getWorkerAddress() const {
@@ -673,6 +772,7 @@ void Communicator::drainWorkQueue() {
       deferred.push_back(std::move(comms));
       continue;
     }
+    comms->clearQueued();
     comms->process();
     workItemsProcessed_.fetch_add(1, std::memory_order_relaxed);
     anyProcessed = true;

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 #include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
 
@@ -48,6 +49,8 @@ const folly::
            "ReadyToReceive"},
           {UcxCpuRowExchangeSource::ReceiverState::WaitingForMetadata,
            "WaitingForMetadata"},
+          {UcxCpuRowExchangeSource::ReceiverState::WaitingForReceiveCredit,
+           "WaitingForReceiveCredit"},
           {UcxCpuRowExchangeSource::ReceiverState::WaitingForData,
            "WaitingForData"},
           {UcxCpuRowExchangeSource::ReceiverState::Done, "Done"},
@@ -55,24 +58,10 @@ const folly::
   return kNames;
 }
 
-uint32_t maxInFlightBundles() {
-  static const uint32_t kDepth = []() -> uint32_t {
-    const char* env = std::getenv("VELOX_UCX_CPU_PIPELINE_DEPTH");
-    if (env == nullptr || *env == '\0') {
-      return 1U;
-    }
-
-    char* end = nullptr;
-    errno = 0;
-    long value = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0' || errno != 0 || value < 1) {
-      VLOG(1) << "Ignoring invalid VELOX_UCX_CPU_PIPELINE_DEPTH=" << env;
-      return 1U;
-    }
-    return static_cast<uint32_t>(std::min<long>(value, 64));
-  }();
-  return kDepth;
-}
+// Keep CPU row exchange single-flight. Multiple in-flight bundles require a
+// sequence-indexed receive-credit path; the current state machine intentionally
+// posts the next metadata receive only after the previous bundle is complete.
+constexpr uint32_t kMaxInFlightBundles = 1;
 
 int32_t readIntEnv(
     const char* name,
@@ -89,11 +78,70 @@ int32_t readIntEnv(
   long value = std::strtol(env, &end, 10);
   if (end == env || *end != '\0' || errno != 0 || value < minValue ||
       value > maxValue) {
-    VLOG(1) << "Ignoring invalid " << name << "=" << env << " (expected "
-            << minValue << ".." << maxValue << ")";
+    LOG(WARNING) << "Ignoring invalid " << name << "=" << env << " (expected "
+                 << minValue << ".." << maxValue << ")";
     return defaultValue;
   }
   return static_cast<int32_t>(value);
+}
+
+struct ParsedCpuHandshakeResponse {
+  CpuRowDataEndpointMode dataEndpointMode{CpuRowDataEndpointMode::kBootstrap};
+  std::string_view serverWorkerAddress;
+  uint32_t serverHostIdHash{0};
+};
+
+ParsedCpuHandshakeResponse parseCpuHandshakeResponse(
+    const std::vector<uint8_t>& response) {
+  VELOX_CHECK_GE(
+      response.size(),
+      sizeof(CpuRowHandshakeResponseHeader),
+      "CPU HandshakeResponse buffer size ({}) is smaller than header ({})",
+      response.size(),
+      sizeof(CpuRowHandshakeResponseHeader));
+
+  CpuRowHandshakeResponseHeader header;
+  std::memcpy(&header, response.data(), sizeof(header));
+  VELOX_CHECK_EQ(
+      header.magic,
+      kCpuRowHandshakeResponseMagic,
+      "CPU HandshakeResponse magic mismatch: {}",
+      header.magic);
+  VELOX_CHECK_EQ(
+      header.version,
+      kCpuRowHandshakeResponseVersion,
+      "CPU HandshakeResponse unsupported version {}",
+      header.version);
+  VELOX_CHECK_GE(
+      header.headerSize,
+      sizeof(CpuRowHandshakeResponseHeader),
+      "CPU HandshakeResponse invalid header size {}",
+      header.headerSize);
+  VELOX_CHECK_LE(
+      header.headerSize,
+      response.size(),
+      "CPU HandshakeResponse header size {} exceeds buffer size {}",
+      header.headerSize,
+      response.size());
+  VELOX_CHECK_LE(
+      header.serverWorkerAddressBytes,
+      kMaxCpuRowWorkerAddressBytes,
+      "CPU HandshakeResponse worker address length {} exceeds limit {}",
+      header.serverWorkerAddressBytes,
+      kMaxCpuRowWorkerAddressBytes);
+  VELOX_CHECK_LE(
+      header.serverWorkerAddressBytes,
+      response.size() - header.headerSize,
+      "CPU HandshakeResponse worker address length {} exceeds remaining bytes {}",
+      header.serverWorkerAddressBytes,
+      response.size() - header.headerSize);
+
+  const auto* address =
+      reinterpret_cast<const char*>(response.data()) + header.headerSize;
+  return {
+      header.dataEndpointMode,
+      std::string_view(address, header.serverWorkerAddressBytes),
+      header.serverHostIdHash};
 }
 } // namespace
 
@@ -124,11 +172,7 @@ int32_t UcxCpuRowExchangeSource::backpressureLowWaterMark() {
 }
 
 void UcxCpuRowExchangeSource::setState(ReceiverState newState) {
-  auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
-  VLOG(4) << "[ExSrc-CPU " << toString()
-          << " nextMeta=" << nextMetadataSequence_
-          << " nextDeliver=" << nextDeliverySequence_ << "] "
-          << toName(oldState) << " -> " << toName(newState);
+  state_.store(newState, std::memory_order_seq_cst);
 }
 
 UcxCpuRowExchangeSource::UcxCpuRowExchangeSource(
@@ -138,7 +182,7 @@ UcxCpuRowExchangeSource::UcxCpuRowExchangeSource(
     uint16_t port,
     const PartitionKey& partitionKey,
     const std::shared_ptr<UcxCpuRowExchangeQueue> queue)
-    : CommElement(communicator),
+    : CommElement(communicator, true),
       host_(host),
       port_(port),
       taskId_(taskId),
@@ -178,8 +222,6 @@ std::shared_ptr<UcxCpuRowExchangeSource> UcxCpuRowExchangeSource::create(
   auto source =
       std::shared_ptr<UcxCpuRowExchangeSource>(new UcxCpuRowExchangeSource(
           communicator, taskId, host, port, key, queue));
-  VLOG(3) << source->toString()
-          << " creating UcxCpuRowExchangeSource for url: " << url;
   return source;
 }
 
@@ -191,27 +233,27 @@ void UcxCpuRowExchangeSource::start() {
 }
 
 void UcxCpuRowExchangeSource::process() {
-  drainStateEvents();
-  if (closed_) {
-    cleanUp();
-    return;
-  }
+  while (true) {
+    drainStateEvents();
+    if (closed_) {
+      cleanUp();
+      return;
+    }
 
-  switch (state_) {
-    case ReceiverState::Created: {
-      HostPort hp{host_, port_};
-      std::shared_ptr<UcxCpuRowExchangeSource> selfPtr = getSelfPtr();
-      auto epRef = communicator_->assocEndpointRef(selfPtr, hp);
-      if (epRef) {
-        setEndpoint(epRef);
-        setStateIf(
-            ReceiverState::Created, ReceiverState::WaitingForHandshakeComplete);
-        sendHandshake();
-        // The amSend completion callback (onHandshake) re-queues us when
-        // the handshake send completes; no explicit addToWorkQueue
-        // needed here. Saves an extra Communicator iteration that
-        // would just no-op in WaitingForHandshakeComplete.
-      } else {
+    switch (state_) {
+      case ReceiverState::Created: {
+        HostPort hp{host_, port_};
+        std::shared_ptr<UcxCpuRowExchangeSource> selfPtr = getSelfPtr();
+        auto epRef = communicator_->assocEndpointRef(selfPtr, hp);
+        if (epRef) {
+          setEndpoint(epRef);
+          setStateIf(
+              ReceiverState::Created,
+              ReceiverState::WaitingForHandshakeComplete);
+          sendHandshake();
+          return;
+        }
+
         auto errorMsg = fmt::format(
             "Failed to connect CPU UCX exchange source to {}:{}, task {}. "
             "The remote split must point at a native worker exposing the CPU "
@@ -220,59 +262,70 @@ void UcxCpuRowExchangeSource::process() {
             host_,
             port_,
             partitionKey_.toString());
-        VLOG(0) << toString() << " " << errorMsg;
+        LOG(ERROR) << toString() << " " << errorMsg;
         queue_->setError(errorMsg);
         deliverEndMarker();
         setState(ReceiverState::Done);
-        // Failure path has no callback; re-queue so process()
-        // picks up the Done state and runs cleanUp().
-        communicator_->addToWorkQueue(getSelfPtr());
+        continue;
       }
-    } break;
-    case ReceiverState::WaitingForHandshakeComplete:
-      // Driven by the amSend completion callback (onHandshake).
-      break;
-    case ReceiverState::WaitingForHandshakeResponse:
-      // Driven by the tagRecv completion callback (onHandshakeResponse).
-      break;
-    case ReceiverState::ReadyToReceive: {
-      // Backpressure: skip posting the next metadata recv if the queue
-      // is over the high-water mark. Source goes dormant; the consumer
-      // will call resumeFromBackpressure() once the queue drains.
-      int32_t queueSize = queue_->size();
-      const int32_t highWater = backpressureHighWaterMark();
-      if (queueSize > highWater) {
-        backpressureActive_.store(true, std::memory_order_release);
-        break;
+      case ReceiverState::WaitingForHandshakeComplete:
+        // Driven by the amSend completion callback (onHandshake).
+        return;
+      case ReceiverState::WaitingForHandshakeResponse:
+        // Driven by the tagRecv completion callback (onHandshakeResponse).
+        return;
+      case ReceiverState::ReadyToReceive: {
+        postReceiveWindow();
+        if (dataEndpointAckNeeded_ && !inFlightSequences_.empty()) {
+          dataEndpointAckNeeded_ = false;
+          sendDataEndpointAck();
+        }
+        if (getState() == ReceiverState::Done) {
+          continue;
+        }
+        return;
       }
-
-      postReceiveWindow();
-    } break;
-    case ReceiverState::WaitingForMetadata:
-      // Legacy state from the single-flight receiver. The pipelined
-      // receiver stays ReadyToReceive while sequence-specific callbacks
-      // advance individual bundles.
-      break;
-    case ReceiverState::WaitingForData:
-      // Legacy state from the single-flight receiver.
-      break;
-    case ReceiverState::Done:
-      cleanUp();
-      break;
+      case ReceiverState::WaitingForMetadata:
+        // Legacy state from the single-flight receiver. The pipelined
+        // receiver stays ReadyToReceive while sequence-specific callbacks
+        // advance individual bundles.
+        return;
+      case ReceiverState::WaitingForReceiveCredit: {
+        if (!pendingDataReceive_) {
+          setState(ReceiverState::ReadyToReceive);
+          continue;
+        }
+        if (receiveQueueExceedsHighWater()) {
+          backpressureActive_.store(true, std::memory_order_release);
+          return;
+        }
+        auto pending = std::move(pendingDataReceive_);
+        setState(ReceiverState::ReadyToReceive);
+        startDataReceive(std::move(pending));
+        if (getState() == ReceiverState::Done) {
+          continue;
+        }
+        return;
+      }
+      case ReceiverState::WaitingForData:
+        // Legacy state from the single-flight receiver.
+        return;
+      case ReceiverState::Done:
+        cleanUp();
+        return;
+    }
   }
 }
 
 void UcxCpuRowExchangeSource::cleanUp() {
-  if (getState() != ReceiverState::Done) {
-    VLOG(3) << toString() << " UcxCpuRowExchangeSource::cleanUp in state "
-            << toName(getState());
-  }
-
   if (handshakeRequest_ && !handshakeRequest_->isCompleted()) {
     handshakeRequest_->cancel();
   }
   if (handshakeResponseRequest_ && !handshakeResponseRequest_->isCompleted()) {
     handshakeResponseRequest_->cancel();
+  }
+  if (dataEndpointAckRequest_ && !dataEndpointAckRequest_->isCompleted()) {
+    dataEndpointAckRequest_->cancel();
   }
   for (auto& req : metadataRequests_) {
     if (req && !req->isCompleted()) {
@@ -291,6 +344,9 @@ void UcxCpuRowExchangeSource::cleanUp() {
     }
     if (handshakeResponseRequest_) {
       communicator_->deferRequestCleanup(std::move(handshakeResponseRequest_));
+    }
+    if (dataEndpointAckRequest_) {
+      communicator_->deferRequestCleanup(std::move(dataEndpointAckRequest_));
     }
     for (auto& req : metadataRequests_) {
       if (req) {
@@ -322,7 +378,6 @@ void UcxCpuRowExchangeSource::close() {
           expected, true, std::memory_order_acq_rel)) {
     return;
   }
-  VLOG(1) << toString() << " UcxCpuRowExchangeSource::close called.";
   deliverEndMarker();
   setState(ReceiverState::Done);
   communicator_->addToWorkQueue(getSelfPtr());
@@ -334,19 +389,6 @@ void UcxCpuRowExchangeSource::resumeFromBackpressure() {
       expected, false, std::memory_order_acq_rel)) {
     communicator_->addToWorkQueue(getSelfPtr());
   }
-}
-
-folly::F14FastMap<std::string, int64_t> UcxCpuRowExchangeSource::stats() const {
-  VELOX_UNREACHABLE();
-}
-
-folly::F14FastMap<std::string, RuntimeMetric> UcxCpuRowExchangeSource::metrics()
-    const {
-  folly::F14FastMap<std::string, RuntimeMetric> map;
-  map["ucxCpuRowExchangeSource.numPayloads"] = metrics_.numPayloads_;
-  map["ucxCpuRowExchangeSource.totalBytes"] = metrics_.totalBytes_;
-  map["ucxCpuRowExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
-  return map;
 }
 
 // ---- private methods ----
@@ -432,7 +474,6 @@ void UcxCpuRowExchangeSource::deliverEndMarker() {
           expected, true, std::memory_order_acq_rel)) {
     return;
   }
-  VLOG(3) << toString() << " delivering end-of-stream marker to queue";
   enqueue(nullptr);
 }
 
@@ -448,8 +489,10 @@ void UcxCpuRowExchangeSource::sendHandshake() {
       std::numeric_limits<uint32_t>::max(),
       "UCX worker address is too large: {} bytes",
       workerAddress.size());
+
   auto handshakeReq = std::make_shared<std::vector<uint8_t>>(
       sizeof(CpuRowHandshakeHeader) + workerAddress.size());
+
   CpuRowHandshakeHeader header{};
   header.sourceWorkerAddressBytes = static_cast<uint32_t>(workerAddress.size());
   header.sourceHostIdHash = communicator_->getHostIdHash();
@@ -462,6 +505,7 @@ void UcxCpuRowExchangeSource::sendHandshake() {
       sizeof(handshake->taskId) - 1);
   handshake->taskId[sizeof(handshake->taskId) - 1] = '\0';
   handshake->workerId = communicator_->getWorkerId();
+
   std::memcpy(handshakeReq->data(), &header, sizeof(header));
   if (!workerAddress.empty()) {
     std::memcpy(
@@ -469,9 +513,6 @@ void UcxCpuRowExchangeSource::sendHandshake() {
         workerAddress.data(),
         workerAddress.size());
   }
-
-  VLOG(3) << toString() << " Sending handshake for " << partitionKey_.toString()
-          << " (CPU AM id)";
 
   // Dispatch to the CPU-specific AM callback. This is the only piece
   // that diverges from the cudf source: same HandshakeMsg struct, but
@@ -500,13 +541,10 @@ void UcxCpuRowExchangeSource::onHandshake(
     ucs_status_t status,
     std::shared_ptr<void> /*arg*/) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onHandshake after close, ignoring";
     deliverEndMarker();
     return;
   }
   if (getState() != ReceiverState::WaitingForHandshakeComplete) {
-    VLOG(2) << toString() << " onHandshake in state " << toName(getState())
-            << ", ignoring (possible UCXX replay)";
     return;
   }
   if (status != UCS_OK) {
@@ -516,12 +554,11 @@ void UcxCpuRowExchangeSource::onHandshake(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
+    LOG(ERROR) << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
   } else {
-    VLOG(3) << toString() << " + onHandshake " << ucs_status_string(status);
     setStateIf(
         ReceiverState::WaitingForHandshakeComplete,
         ReceiverState::WaitingForHandshakeResponse);
@@ -530,16 +567,14 @@ void UcxCpuRowExchangeSource::onHandshake(
 }
 
 void UcxCpuRowExchangeSource::receiveHandshakeResponse() {
-  auto responseBuffer = std::make_shared<HandshakeResponse>();
+  auto responseBuffer = std::make_shared<std::vector<uint8_t>>(
+      sizeof(CpuRowHandshakeResponseHeader) + kMaxCpuRowWorkerAddressBytes);
   uint64_t responseTag = getHandshakeResponseTag(partitionKeyHash_);
-
-  VLOG(3) << toString() << " waiting for CPU HandshakeResponse tag=" << std::hex
-          << responseTag << std::dec;
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   handshakeResponseRequest_ = endpointRef_->endpoint_->tagRecv(
-      responseBuffer.get(),
-      sizeof(*responseBuffer),
+      responseBuffer->data(),
+      responseBuffer->size(),
       ucxx::Tag{responseTag},
       ucxx::TagMaskFull,
       false,
@@ -558,13 +593,10 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onHandshakeResponse after close, ignoring";
     deliverEndMarker();
     return;
   }
   if (getState() != ReceiverState::WaitingForHandshakeResponse) {
-    VLOG(2) << toString() << " onHandshakeResponse in state "
-            << toName(getState()) << ", ignoring (possible UCXX replay)";
     return;
   }
   if (status != UCS_OK) {
@@ -574,28 +606,124 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
+    LOG(ERROR) << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
     return;
   }
 
-  auto response = std::static_pointer_cast<HandshakeResponse>(arg);
-  VLOG(3) << toString() << " + CPU HandshakeResponse isIntraNodeTransfer="
-          << response->isIntraNodeTransfer;
+  auto responseBuffer = std::static_pointer_cast<std::vector<uint8_t>>(arg);
+  const auto response = parseCpuHandshakeResponse(*responseBuffer);
+
+  if (response.dataEndpointMode ==
+      CpuRowDataEndpointMode::kSameHostWorkerAddress) {
+    if (response.serverWorkerAddress.empty() ||
+        !communicator_->hasSameHostTransportIdentity(
+            response.serverHostIdHash)) {
+      std::string errorMsg = fmt::format(
+          "CPU HandshakeResponse selected same-host worker-address endpoint "
+          "for task {}, but server address is unavailable or host identity "
+          "does not match (serverHostIdHash={})",
+          partitionKey_.toString(),
+          response.serverHostIdHash);
+      LOG(ERROR) << errorMsg;
+      queue_->setError(errorMsg);
+      deliverEndMarker();
+      setState(ReceiverState::Done);
+      return;
+    }
+
+    auto dataEpRef = communicator_->createSameHostEndpointRefFromWorkerAddress(
+        response.serverWorkerAddress, host_, response.serverHostIdHash);
+    if (!dataEpRef) {
+      std::string errorMsg = fmt::format(
+          "Failed to create CPU same-host data endpoint to host {}:{}, task {}",
+          host_,
+          port_,
+          partitionKey_.toString());
+      LOG(ERROR) << errorMsg;
+      queue_->setError(errorMsg);
+      deliverEndMarker();
+      setState(ReceiverState::Done);
+      return;
+    }
+
+    auto self = getSelfPtr();
+    dataEpRef->addCommElem(self);
+    if (endpointRef_ && endpointRef_ != dataEpRef) {
+      endpointRef_->removeCommElem(self);
+    }
+    endpointRef_ = std::move(dataEpRef);
+    dataEndpointAckNeeded_ = true;
+    dataEndpointPeerHostIdHash_ = response.serverHostIdHash;
+  } else if (
+      response.dataEndpointMode != CpuRowDataEndpointMode::kBootstrap) {
+    std::string errorMsg = fmt::format(
+        "CPU HandshakeResponse selected unsupported dataEndpointMode={} for "
+        "task {}",
+        static_cast<int>(response.dataEndpointMode),
+        partitionKey_.toString());
+    LOG(ERROR) << errorMsg;
+    queue_->setError(errorMsg);
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    return;
+  }
 
   setStateIf(
       ReceiverState::WaitingForHandshakeResponse,
       ReceiverState::ReadyToReceive);
 }
 
+void UcxCpuRowExchangeSource::sendDataEndpointAck() {
+  auto ack = std::make_shared<CpuRowHandshakeAckHeader>();
+  uint64_t ackTag = getHandshakeAckTag(partitionKeyHash_);
+
+  std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
+  dataEndpointAckRequest_ = endpointRef_->endpoint_->tagSend(
+      ack.get(),
+      sizeof(*ack),
+      ucxx::Tag{ackTag},
+      false,
+      [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onDataEndpointAck(status, std::move(arg));
+              });
+        }
+      },
+      ack);
+}
+
+void UcxCpuRowExchangeSource::onDataEndpointAck(
+    ucs_status_t status,
+    std::shared_ptr<void> /*arg*/) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (status != UCS_OK) {
+    std::string errorMsg = fmt::format(
+        "Failed to send CPU data endpoint ACK to host {}:{}, task {}: {}",
+        host_,
+        port_,
+        partitionKey_.toString(),
+        ucs_status_string(status));
+    LOG(ERROR) << errorMsg;
+    queue_->setError(errorMsg);
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+  } else {
+    communicator_->logUnexpectedSameHostEndpointTransport(
+        endpointRef_, dataEndpointPeerHostIdHash_);
+  }
+}
+
 void UcxCpuRowExchangeSource::postReceiveWindow() {
   while (!atEnd_ && !closed_.load(std::memory_order_acquire) &&
-         inFlightSequences_.size() < maxInFlightBundles()) {
-    int32_t queueSize = queue_->size();
-    const int32_t highWater = backpressureHighWaterMark();
-    if (queueSize > highWater) {
+         inFlightSequences_.size() < kMaxInFlightBundles) {
+    if (receiveQueueExceedsHighWater() && !inFlightSequences_.empty()) {
       backpressureActive_.store(true, std::memory_order_release);
       break;
     }
@@ -606,12 +734,14 @@ void UcxCpuRowExchangeSource::postReceiveWindow() {
   }
 }
 
+bool UcxCpuRowExchangeSource::receiveQueueExceedsHighWater() {
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  return queue_->size() > backpressureHighWaterMark();
+}
+
 void UcxCpuRowExchangeSource::getMetadata(uint32_t sequenceNumber) {
   auto metadataReq = std::make_shared<std::vector<uint8_t>>(kMaxMetaBufSize);
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber);
-
-  VLOG(3) << toString() << " waiting for metadata seq=" << sequenceNumber
-          << " tag=" << std::hex << metadataTag << std::dec;
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   auto request = endpointRef_->endpoint_->tagRecv(
@@ -641,22 +771,15 @@ void UcxCpuRowExchangeSource::onMetadata(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onMetadata after close, ignoring";
     deliverEndMarker();
     return;
   }
   if (getState() == ReceiverState::Done) {
-    VLOG(2) << toString() << " onMetadata seq=" << sequenceNumber
-            << " after Done, ignoring (possible UCXX replay)";
     return;
   }
   if (!inFlightSequences_.count(sequenceNumber)) {
-    VLOG(2) << toString() << " onMetadata seq=" << sequenceNumber
-            << " is not in flight, ignoring (possible UCXX replay)";
     return;
   }
-  VLOG(3) << toString() << " + onMetadata seq=" << sequenceNumber << " "
-          << ucs_status_string(status);
 
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
@@ -665,7 +788,7 @@ void UcxCpuRowExchangeSource::onMetadata(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << errorMsg;
+    LOG(ERROR) << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
@@ -679,20 +802,27 @@ void UcxCpuRowExchangeSource::onMetadata(
   ptr->sequenceNumber = sequenceNumber;
   ptr->metadata = UcxCpuRowMetadataMsg::deserialize(metadataMsg->data());
 
-  VLOG(3) << toString() << " seq=" << sequenceNumber
-          << " Datasize bytes == " << ptr->metadata.dataSizeBytes
-          << " numFrames=" << ptr->metadata.frameSizes.size();
-
   if (ptr->metadata.atEnd) {
     atEnd_ = true;
     endSequence_ = sequenceNumber;
     inFlightSequences_.erase(sequenceNumber);
-    VLOG(3) << "There is no more data to transfer for " << toString()
-            << " endSeq=" << endSequence_;
     drainCompletedData();
     return;
   }
 
+  if (receiveQueueExceedsHighWater()) {
+    pendingDataReceive_ = std::move(ptr);
+    backpressureActive_.store(true, std::memory_order_release);
+    setState(ReceiverState::WaitingForReceiveCredit);
+    return;
+  }
+
+  startDataReceive(std::move(ptr));
+}
+
+void UcxCpuRowExchangeSource::startDataReceive(
+    std::shared_ptr<DataAndMetadata> ptr) {
+  VELOX_CHECK_NOT_NULL(ptr);
   const size_t numFrames = ptr->metadata.frameSizes.size();
   VELOX_CHECK_GT(
       numFrames, 0, "Non-end metadata must carry at least one frame");
@@ -724,11 +854,8 @@ void UcxCpuRowExchangeSource::onMetadata(
       static_cast<int32_t>(numFrames), std::memory_order_release);
   ptr->finalStatus.store(UCS_OK, std::memory_order_release);
 
+  const auto sequenceNumber = ptr->sequenceNumber;
   uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber);
-  VLOG(3) << toString() << " waiting for data seq=" << sequenceNumber
-          << " tag=" << std::hex << dataTag << std::dec
-          << " numFrames=" << numFrames
-          << " totalBytes=" << ptr->metadata.dataSizeBytes;
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   // Post N tagRecvs all sharing the same dataTag. UCX guarantees FIFO
@@ -780,22 +907,15 @@ void UcxCpuRowExchangeSource::onData(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onData after close, ignoring";
     deliverEndMarker();
     return;
   }
   if (getState() == ReceiverState::Done) {
-    VLOG(2) << toString() << " onData seq=" << sequenceNumber
-            << " after Done, ignoring (possible UCXX replay)";
     return;
   }
   if (!inFlightSequences_.count(sequenceNumber)) {
-    VLOG(2) << toString() << " onData seq=" << sequenceNumber
-            << " is not in flight, ignoring (possible UCXX replay)";
     return;
   }
-  VLOG(3) << toString() << " + onData seq=" << sequenceNumber << " "
-          << ucs_status_string(status);
 
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
@@ -804,18 +924,13 @@ void UcxCpuRowExchangeSource::onData(
         port_,
         partitionKey_.toString(),
         ucs_status_string(status));
-    VLOG(0) << toString() << errorMsg;
+    LOG(ERROR) << toString() << errorMsg;
     queue_->setError(errorMsg);
     deliverEndMarker();
     setState(ReceiverState::Done);
   } else {
-    VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
-            << " got chunk: " << sequenceNumber;
     auto ptr = std::static_pointer_cast<DataAndMetadata>(arg);
     VELOX_CHECK_EQ(ptr->sequenceNumber, sequenceNumber);
-
-    metrics_.numPayloads_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
     // Stitch all per-frame buffers into one IOBuf chain. Each segment
     // wraps its frame buffer with a takeOwnership freeFn that releases
@@ -850,7 +965,6 @@ void UcxCpuRowExchangeSource::onData(
     inFlightSequences_.erase(sequenceNumber);
     completedData_.emplace(sequenceNumber, std::move(received));
     drainCompletedData();
-    postReceiveWindow();
   }
 }
 
@@ -884,10 +998,6 @@ bool UcxCpuRowExchangeSource::setStateIf(
     }
     exp = expected;
   }
-  VLOG(4) << "[ExSrc-CPU " << toString()
-          << " nextMeta=" << nextMetadataSequence_
-          << " nextDeliver=" << nextDeliverySequence_ << "] "
-          << toName(expected) << " -> " << toName(desired);
   return true;
 }
 

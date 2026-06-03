@@ -209,6 +209,10 @@ CudfHashJoinBuild::CudfHashJoinBuild(
   lockedStats->addRuntimeStat(
       "trustedBuildKeysUnique", RuntimeCounter(joinNode_->rightKeysUnique()));
   lockedStats->addRuntimeStat(
+      "trustedProbeKeysNonNull", RuntimeCounter(joinNode_->leftKeysNonNull()));
+  lockedStats->addRuntimeStat(
+      "trustedBuildKeysNonNull", RuntimeCounter(joinNode_->rightKeysNonNull()));
+  lockedStats->addRuntimeStat(
       "trustedUniqueBuildHashJoinCandidate",
       RuntimeCounter(
           joinNode_->rightKeysUnique() &&
@@ -223,12 +227,14 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
-    auto const null_count = countNullJoinKeys(
-        cudfInput->getTableView(), buildKeyIndices_, cudfInput->stream());
-    {
-      // Update statistics for null keys in join operator.
-      auto lockedStats = stats_.wlock();
-      lockedStats->numNullKeys += null_count;
+    if (!joinNode_->rightKeysNonNull()) {
+      auto const null_count = countNullJoinKeys(
+          cudfInput->getTableView(), buildKeyIndices_, cudfInput->stream());
+      {
+        // Update statistics for null keys in join operator.
+        auto lockedStats = stats_.wlock();
+        lockedStats->numNullKeys += null_count;
+      }
     }
     inputs_.push_back(std::move(cudfInput));
   }
@@ -327,7 +333,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
   for (auto i = 0; i < tbls.size(); i++) {
     auto buildKeyView = tbls[i]->view().select(buildKeyIndices_);
     bool buildKeysHaveNulls = false;
-    if (preferDistinctHashJoin) {
+    if (preferDistinctHashJoin && !joinNode_->rightKeysNonNull()) {
       ++distinctHashJoinNullCheckTables;
       buildKeysHaveNulls = cudf::has_nulls(buildKeyView);
     }
@@ -444,6 +450,12 @@ CudfHashJoinProbe::CudfHashJoinProbe(
         "trustedProbeKeysUnique", RuntimeCounter(joinNode_->leftKeysUnique()));
     lockedStats->addRuntimeStat(
         "trustedBuildKeysUnique", RuntimeCounter(joinNode_->rightKeysUnique()));
+    lockedStats->addRuntimeStat(
+        "trustedProbeKeysNonNull",
+        RuntimeCounter(joinNode_->leftKeysNonNull()));
+    lockedStats->addRuntimeStat(
+        "trustedBuildKeysNonNull",
+        RuntimeCounter(joinNode_->rightKeysNonNull()));
     lockedStats->addRuntimeStat(
         "trustedUniqueBuildHashJoinCandidate",
         RuntimeCounter(

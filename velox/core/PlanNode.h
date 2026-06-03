@@ -3311,7 +3311,9 @@ class HashJoinNode : public AbstractJoinNode {
       bool useHashTableCache = false,
       bool nullAsValue = false,
       bool leftKeysUnique = false,
-      bool rightKeysUnique = false)
+      bool rightKeysUnique = false,
+      bool leftKeysNonNull = false,
+      bool rightKeysNonNull = false)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3325,7 +3327,9 @@ class HashJoinNode : public AbstractJoinNode {
         nullAsValue_{nullAsValue},
         useHashTableCache_{useHashTableCache},
         leftKeysUnique_{leftKeysUnique},
-        rightKeysUnique_{rightKeysUnique} {
+        rightKeysUnique_{rightKeysUnique},
+        leftKeysNonNull_{leftKeysNonNull},
+        rightKeysNonNull_{rightKeysNonNull} {
     validate();
 
     VELOX_USER_CHECK(
@@ -3364,6 +3368,8 @@ class HashJoinNode : public AbstractJoinNode {
       useHashTableCache_ = other.useHashTableCache();
       leftKeysUnique_ = other.leftKeysUnique();
       rightKeysUnique_ = other.rightKeysUnique();
+      leftKeysNonNull_ = other.leftKeysNonNull();
+      rightKeysNonNull_ = other.rightKeysNonNull();
     }
 
     Builder& nullAware(bool value) {
@@ -3388,6 +3394,16 @@ class HashJoinNode : public AbstractJoinNode {
 
     Builder& rightKeysUnique(bool value) {
       rightKeysUnique_ = value;
+      return *this;
+    }
+
+    Builder& leftKeysNonNull(bool value) {
+      leftKeysNonNull_ = value;
+      return *this;
+    }
+
+    Builder& rightKeysNonNull(bool value) {
+      rightKeysNonNull_ = value;
       return *this;
     }
 
@@ -3421,7 +3437,9 @@ class HashJoinNode : public AbstractJoinNode {
           useHashTableCache_.value_or(false),
           nullAsValue_.value_or(false),
           leftKeysUnique_.value_or(false),
-          rightKeysUnique_.value_or(false));
+          rightKeysUnique_.value_or(false),
+          leftKeysNonNull_.value_or(false),
+          rightKeysNonNull_.value_or(false));
     }
 
    private:
@@ -3430,6 +3448,8 @@ class HashJoinNode : public AbstractJoinNode {
     std::optional<bool> useHashTableCache_;
     std::optional<bool> leftKeysUnique_;
     std::optional<bool> rightKeysUnique_;
+    std::optional<bool> leftKeysNonNull_;
+    std::optional<bool> rightKeysNonNull_;
   };
 
   std::string_view name() const override {
@@ -3479,6 +3499,16 @@ class HashJoinNode : public AbstractJoinNode {
     return rightKeysUnique_;
   }
 
+  /// Returns true when the planner has proven the left/probe join keys non-null.
+  bool leftKeysNonNull() const {
+    return leftKeysNonNull_;
+  }
+
+  /// Returns true when the planner has proven the right/build join keys non-null.
+  bool rightKeysNonNull() const {
+    return rightKeysNonNull_;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -3491,6 +3521,8 @@ class HashJoinNode : public AbstractJoinNode {
   const bool useHashTableCache_;
   const bool leftKeysUnique_;
   const bool rightKeysUnique_;
+  const bool leftKeysNonNull_;
+  const bool rightKeysNonNull_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;

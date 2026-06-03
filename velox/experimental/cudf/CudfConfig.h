@@ -52,6 +52,7 @@ struct CudfConfig {
       "cudf.final_aggregation_batch_size_min_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  // TODO: Remove this switch during the production config/default pass.
   static constexpr const char* kCudfDistinctHashJoinEnabled{
       "cudf.distinct_hash_join_enabled"};
   static constexpr const char* kCudfExchange{"cudf.exchange"};
@@ -135,7 +136,7 @@ struct CudfConfig {
 
   /// Whether joins with trusted unique build keys should use
   /// cudf::distinct_hash_join instead of cudf::hash_join.
-  bool distinctHashJoinEnabled{false};
+  bool distinctHashJoinEnabled{true};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

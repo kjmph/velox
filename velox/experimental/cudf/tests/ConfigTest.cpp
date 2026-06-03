@@ -20,6 +20,20 @@
 
 namespace facebook::velox::cudf_velox::test {
 
+TEST(ConfigTest, Defaults) {
+  CudfConfig config;
+  ASSERT_EQ(config.distinctHashJoinEnabled, true);
+}
+
+TEST(ConfigTest, DistinctHashJoinCanBeDisabled) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "false"}};
+
+  CudfConfig config;
+  config.initialize(std::move(options));
+  ASSERT_EQ(config.distinctHashJoinEnabled, false);
+}
+
 TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},

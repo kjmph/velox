@@ -1692,6 +1692,12 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
   if (rightKeysUnique_) {
     stream << ", right keys unique";
   }
+  if (leftKeysNonNull_) {
+    stream << ", left keys non-null";
+  }
+  if (rightKeysNonNull_) {
+    stream << ", right keys non-null";
+  }
 }
 
 folly::dynamic HashJoinNode::serialize() const {
@@ -1701,6 +1707,8 @@ folly::dynamic HashJoinNode::serialize() const {
   obj["useHashTableCache"] = useHashTableCache_;
   obj["leftKeysUnique"] = leftKeysUnique_;
   obj["rightKeysUnique"] = rightKeysUnique_;
+  obj["leftKeysNonNull"] = leftKeysNonNull_;
+  obj["rightKeysNonNull"] = rightKeysNonNull_;
   return obj;
 }
 
@@ -1720,6 +1728,8 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
   auto useHashTableCache = obj.getDefault("useHashTableCache", false).asBool();
   auto leftKeysUnique = obj.getDefault("leftKeysUnique", false).asBool();
   auto rightKeysUnique = obj.getDefault("rightKeysUnique", false).asBool();
+  auto leftKeysNonNull = obj.getDefault("leftKeysNonNull", false).asBool();
+  auto rightKeysNonNull = obj.getDefault("rightKeysNonNull", false).asBool();
   auto leftKeys = deserializeFields(obj["leftKeys"], context);
   auto rightKeys = deserializeFields(obj["rightKeys"], context);
 
@@ -1743,7 +1753,9 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       useHashTableCache,
       nullAsValue,
       leftKeysUnique,
-      rightKeysUnique);
+      rightKeysUnique,
+      leftKeysNonNull,
+      rightKeysNonNull);
 }
 
 MergeJoinNode::MergeJoinNode(

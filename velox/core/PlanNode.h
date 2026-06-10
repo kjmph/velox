@@ -3313,7 +3313,9 @@ class HashJoinNode : public AbstractJoinNode {
       bool leftKeysUnique = false,
       bool rightKeysUnique = false,
       bool leftKeysNonNull = false,
-      bool rightKeysNonNull = false)
+      bool rightKeysNonNull = false,
+      bool leftKeysCoveredByRightKeys = false,
+      bool rightKeysCoveredByLeftKeys = false)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3329,7 +3331,9 @@ class HashJoinNode : public AbstractJoinNode {
         leftKeysUnique_{leftKeysUnique},
         rightKeysUnique_{rightKeysUnique},
         leftKeysNonNull_{leftKeysNonNull},
-        rightKeysNonNull_{rightKeysNonNull} {
+        rightKeysNonNull_{rightKeysNonNull},
+        leftKeysCoveredByRightKeys_{leftKeysCoveredByRightKeys},
+        rightKeysCoveredByLeftKeys_{rightKeysCoveredByLeftKeys} {
     validate();
 
     VELOX_USER_CHECK(
@@ -3370,6 +3374,8 @@ class HashJoinNode : public AbstractJoinNode {
       rightKeysUnique_ = other.rightKeysUnique();
       leftKeysNonNull_ = other.leftKeysNonNull();
       rightKeysNonNull_ = other.rightKeysNonNull();
+      leftKeysCoveredByRightKeys_ = other.leftKeysCoveredByRightKeys();
+      rightKeysCoveredByLeftKeys_ = other.rightKeysCoveredByLeftKeys();
     }
 
     Builder& nullAware(bool value) {
@@ -3407,6 +3413,16 @@ class HashJoinNode : public AbstractJoinNode {
       return *this;
     }
 
+    Builder& leftKeysCoveredByRightKeys(bool value) {
+      leftKeysCoveredByRightKeys_ = value;
+      return *this;
+    }
+
+    Builder& rightKeysCoveredByLeftKeys(bool value) {
+      rightKeysCoveredByLeftKeys_ = value;
+      return *this;
+    }
+
     std::shared_ptr<HashJoinNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "HashJoinNode id is not set");
       VELOX_USER_CHECK(
@@ -3439,7 +3455,9 @@ class HashJoinNode : public AbstractJoinNode {
           leftKeysUnique_.value_or(false),
           rightKeysUnique_.value_or(false),
           leftKeysNonNull_.value_or(false),
-          rightKeysNonNull_.value_or(false));
+          rightKeysNonNull_.value_or(false),
+          leftKeysCoveredByRightKeys_.value_or(false),
+          rightKeysCoveredByLeftKeys_.value_or(false));
     }
 
    private:
@@ -3450,6 +3468,8 @@ class HashJoinNode : public AbstractJoinNode {
     std::optional<bool> rightKeysUnique_;
     std::optional<bool> leftKeysNonNull_;
     std::optional<bool> rightKeysNonNull_;
+    std::optional<bool> leftKeysCoveredByRightKeys_;
+    std::optional<bool> rightKeysCoveredByLeftKeys_;
   };
 
   std::string_view name() const override {
@@ -3509,6 +3529,14 @@ class HashJoinNode : public AbstractJoinNode {
     return rightKeysNonNull_;
   }
 
+  bool leftKeysCoveredByRightKeys() const {
+    return leftKeysCoveredByRightKeys_;
+  }
+
+  bool rightKeysCoveredByLeftKeys() const {
+    return rightKeysCoveredByLeftKeys_;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -3523,6 +3551,8 @@ class HashJoinNode : public AbstractJoinNode {
   const bool rightKeysUnique_;
   const bool leftKeysNonNull_;
   const bool rightKeysNonNull_;
+  const bool leftKeysCoveredByRightKeys_;
+  const bool rightKeysCoveredByLeftKeys_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;

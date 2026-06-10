@@ -31,6 +31,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -72,6 +73,8 @@ class TestCudaStream {
 struct RecordingAsyncResourceState {
   cudaStream_t lastDeallocationStream{nullptr};
   std::size_t deallocationCount{0};
+  std::array<const void*, 64> deallocatedPointers{};
+  std::size_t deallocatedPointerCount{0};
 };
 
 class RecordingAsyncDeviceResource {
@@ -90,6 +93,9 @@ class RecordingAsyncDeviceResource {
       std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept {
     state_->lastDeallocationStream = stream.get();
     ++state_->deallocationCount;
+    if (state_->deallocatedPointerCount < state_->deallocatedPointers.size()) {
+      state_->deallocatedPointers[state_->deallocatedPointerCount++] = ptr;
+    }
     asyncUpstream_.deallocate(stream, ptr, bytes, alignment);
   }
 
@@ -109,6 +115,8 @@ class RecordingAsyncDeviceResource {
   void reset() {
     state_->lastDeallocationStream = nullptr;
     state_->deallocationCount = 0;
+    state_->deallocatedPointers = {};
+    state_->deallocatedPointerCount = 0;
   }
 
   std::size_t deallocationCount() const {
@@ -117,6 +125,15 @@ class RecordingAsyncDeviceResource {
 
   cudaStream_t lastDeallocationStream() const {
     return state_->lastDeallocationStream;
+  }
+
+  bool wasDeallocated(const void* ptr) const {
+    for (std::size_t i = 0; i < state_->deallocatedPointerCount; ++i) {
+      if (state_->deallocatedPointers[i] == ptr) {
+        return true;
+      }
+    }
+    return false;
   }
 
   bool operator==(const RecordingAsyncDeviceResource& other) const noexcept {
@@ -146,13 +163,12 @@ std::unique_ptr<cudf::table> makeTable(
       stream.value()));
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(
-      std::make_unique<cudf::column>(
-          cudf::data_type{cudf::type_id::INT32},
-          static_cast<cudf::size_type>(values.size()),
-          std::move(data),
-          rmm::device_buffer{},
-          0));
+  columns.push_back(std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(values.size()),
+      std::move(data),
+      rmm::device_buffer{},
+      0));
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
@@ -222,6 +238,107 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
 
   EXPECT_GT(resource.deallocationCount(), 0);
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+}
+
+TEST_F(CudfVectorTest, packedTableReleaseRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table = makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view(),
+      [&]() {
+        callbackSawBackingStorageReleased.store(
+            resource.wasDeallocated(packedData), std::memory_order_relaxed);
+      });
+
+  auto materialized = vector.release();
+
+  ASSERT_TRUE(callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
+}
+
+TEST_F(
+    CudfVectorTest,
+    packedTableDestructorRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table = makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  {
+    CudfVector vector(
+        pool_.get(),
+        ROW({"c0"}, {INTEGER()}),
+        packedTable->table.num_rows(),
+        std::move(packedTable),
+        stream.view(),
+        [&]() {
+          callbackSawBackingStorageReleased.store(
+              resource.wasDeallocated(packedData), std::memory_order_relaxed);
+        });
+  }
+
+  ASSERT_TRUE(callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+}
+
+TEST_F(CudfVectorTest, sharedOwnerReleaseDropsOwnerAfterMaterializing) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  std::shared_ptr<cudf::table> owner(
+      makeTable(
+          stream.view(), rmm::to_device_async_resource_ref_checked(&resource))
+          .release());
+  stream.view().synchronize();
+
+  auto tableView = owner->view();
+  const auto numRows = owner->num_rows();
+  const void* sourceData = owner->get_column(0).view().data<int32_t>();
+  resource.reset();
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      numRows,
+      tableView,
+      std::move(owner),
+      stream.view(),
+      0);
+
+  auto materialized = vector.release();
+
+  EXPECT_TRUE(resource.wasDeallocated(sourceData));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
 }
 
 } // namespace

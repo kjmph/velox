@@ -55,6 +55,8 @@ struct CudfConfig {
   // TODO: Remove this switch during the production config/default pass.
   static constexpr const char* kCudfDistinctHashJoinEnabled{
       "cudf.distinct_hash_join_enabled"};
+  static constexpr const char* kCudfProbeUniqueInnerJoinEnabled{
+      "cudf.probe_unique_inner_join_enabled"};
   static constexpr const char* kCudfExchange{"cudf.exchange"};
   static constexpr const char* kCudfExchangeServerPort{
       "cudf.exchange.server.port"};
@@ -137,6 +139,11 @@ struct CudfConfig {
   /// Whether joins with trusted unique build keys should use
   /// cudf::distinct_hash_join instead of cudf::hash_join.
   bool distinctHashJoinEnabled{true};
+
+  /// Experimental: for inner joins with trusted unique, non-null probe keys,
+  /// build a temporary distinct hash table on the probe batch and probe it with
+  /// the build side.
+  bool probeUniqueInnerJoinEnabled{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

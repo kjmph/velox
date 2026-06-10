@@ -15,99 +15,46 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/buffer/Buffer.h"
 #include "velox/common/memory/MemoryPool.h"
-#include "velox/common/process/StackTrace.h"
 #include "velox/vector/TypeAliases.h"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_stream.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <exception>
 
 namespace facebook::velox::cudf_velox {
 namespace {
 
-/// Calculates the total memory size in bytes of a cudf column and reconstructs
-/// it.
-///
-/// This function disassembles a cudf column to access its underlying memory
-/// buffers, calculates the total size including children columns (for nested
-/// types), and then reassembles the column.
-///
-/// @return A pair containing the total size in bytes and the reconstructed
-/// column
-std::pair<uint64_t, std::unique_ptr<cudf::column>> getColumnSize(
-    std::unique_ptr<cudf::column> column) {
-  // Store column metadata (type, null count, and size) before releasing it,
-  // as the release() operation transfers ownership of the underlying buffers
-  // and invalidates access to these properties.
-  auto type = column->type();
-  auto nullCount = column->null_count();
-  auto size = column->size();
-
-  auto contents = column->release();
-  auto bytes = contents.data->size() + contents.null_mask->size();
-
-  // Recursively get the size of the children columns.
-  std::vector<std::unique_ptr<cudf::column>> children;
-  for (auto& child : contents.children) {
-    auto [childBytes, childColumn] = getColumnSize(std::move(child));
-    bytes += childBytes;
-    children.push_back(std::move(childColumn));
+uint64_t estimateColumnSize(cudf::column_view column) {
+  uint64_t bytes = 0;
+  if (cudf::is_fixed_width(column.type())) {
+    bytes +=
+        static_cast<uint64_t>(column.size()) * cudf::size_of(column.type());
   }
-
-  // Reassemble the column with the original metadata.
-  auto reconstitutedColumn = std::make_unique<cudf::column>(
-      type,
-      size,
-      std::move(*contents.data.release()),
-      std::move(*contents.null_mask.release()),
-      nullCount,
-      std::move(children));
-
-  return std::make_pair(bytes, std::move(reconstitutedColumn));
+  if (column.nullable()) {
+    bytes += cudf::bitmask_allocation_size_bytes(column.size());
+  }
+  for (auto child = column.child_begin(); child != column.child_end();
+       ++child) {
+    bytes += estimateColumnSize(*child);
+  }
+  return bytes;
 }
 
-/// Calculates the total memory size in bytes of a cudf table and reconstructs
-/// it.
-///
-/// This function disassembles a cudf table to access its underlying columns,
-/// calculates the total size, and then reassembles the table.
-///
-/// @note This is a workaround because cudf::table doesn't have an API to get
-/// this information without involving estimation and d->h copies.
-/// @see https://github.com/rapidsai/cudf/issues/18462
-///
-/// @return A pair containing the total size in bytes and the reconstructed
-/// table
-std::pair<uint64_t, std::unique_ptr<cudf::table>> getTableSize(
-    std::unique_ptr<cudf::table>&& table) {
-  auto columns = table->release();
-  std::vector<std::unique_ptr<cudf::column>> columnsOut;
+uint64_t estimateTableSize(cudf::table_view table) {
   uint64_t totalBytes = 0;
-
-  for (auto& column : columns) {
-    auto [bytes, columnOut] = getColumnSize(std::move(column));
-    totalBytes += bytes;
-    columnsOut.push_back(std::move(columnOut));
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    totalBytes += estimateColumnSize(table.column(i));
   }
-  return std::make_pair(
-      totalBytes, std::make_unique<cudf::table>(std::move(columnsOut)));
-}
-
-void logDefaultStreamIfNeeded(
-    rmm::cuda_stream_view stream,
-    const char* constructorName) {
-  if (stream.value() != rmm::cuda_stream_default.value()) {
-    return;
-  }
-  LOG(WARNING) << constructorName
-               << " constructed with default CUDA stream. Backtrace:\n"
-               << process::StackTrace().toString();
+  return totalBytes;
 }
 
 } // namespace
@@ -127,12 +74,9 @@ CudfVector::CudfVector(
           std::nullopt),
       tableStorage_{std::move(table)},
       stream_{stream} {
-  logDefaultStreamIfNeeded(stream_, "CudfVector(table)");
   auto& tablePtr = std::get<std::unique_ptr<cudf::table>>(tableStorage_);
-  auto [bytes, tableOut] = getTableSize(std::move(tablePtr));
-  flatSize_ = bytes;
-  tablePtr = std::move(tableOut);
   tabView_ = tablePtr->view();
+  flatSize_ = estimateTableSize(tabView_);
 }
 
 CudfVector::CudfVector(
@@ -152,7 +96,6 @@ CudfVector::CudfVector(
       tableStorage_{std::move(packedTable)},
       stream_{stream},
       releaseCallback_{std::move(releaseCallback)} {
-  logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
@@ -160,14 +103,41 @@ CudfVector::CudfVector(
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view tableView,
+    std::shared_ptr<cudf::table> owner,
+    rmm::cuda_stream_view stream,
+    uint64_t flatSize)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      tableStorage_{std::move(owner)},
+      tabView_{tableView},
+      stream_{stream},
+      flatSize_{flatSize} {
+  VELOX_CHECK_NOT_NULL(std::get<std::shared_ptr<cudf::table>>(tableStorage_));
+  VELOX_CHECK_EQ(tabView_.num_rows(), size);
+}
+
 CudfVector::~CudfVector() {
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
     tablePtr->reset();
-  } else {
-    auto& packedPtr =
-        std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
-    packedPtr.reset();
+  } else if (
+      auto* packedPtr =
+          std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_)) {
+    packedPtr->reset();
+  } else if (
+      auto* ownerPtr =
+          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+    ownerPtr->reset();
   }
   runReleaseCallback();
 }
@@ -193,18 +163,29 @@ std::unique_ptr<cudf::table> CudfVector::release() {
     // Constructed from owned table - just move it out
     return std::move(*tablePtr);
   }
-  // Constructed from packed_table - materialize a table from the view.
-  // This copies the data since the view references the packed buffer.
-  auto& packedPtr =
-      std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
-  // Using same memory resource as packed_table
-  auto mr = packedPtr->data.gpu_data->memory_resource();
-  auto materializedTable = std::make_unique<cudf::table>(tabView_, stream_, mr);
-  stream_.synchronize();
-  // Clear the packed table since we've materialized
-  packedPtr.reset();
-  runReleaseCallback();
-  return materializedTable;
+
+  if (auto* packedPtr =
+          std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_)) {
+    // Constructed from packed_table - materialize a table from the view.
+    // This copies the data since the view references the packed buffer.
+    auto mr = (*packedPtr)->data.gpu_data->memory_resource();
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, mr);
+    packedPtr->reset();
+    runReleaseCallback();
+    return materializedTable;
+  }
+
+  if (auto* ownerPtr =
+          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, get_output_mr());
+    ownerPtr->reset();
+    runReleaseCallback();
+    return materializedTable;
+  }
+
+  VELOX_UNREACHABLE();
 }
 
 bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
@@ -238,6 +219,11 @@ bool CudfVector::rebindStream(rmm::cuda_stream_view stream) {
     (*packedPtr)->data.gpu_data->set_stream(stream);
     stream_ = stream;
     return true;
+  }
+
+  if (auto* ownerPtr =
+          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+    return *ownerPtr != nullptr && stream_.value() == stream.value();
   }
 
   return false;

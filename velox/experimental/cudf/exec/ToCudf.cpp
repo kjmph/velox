@@ -407,6 +407,10 @@ void CudfConfig::initialize(
     distinctHashJoinEnabled =
         folly::to<bool>(config[kCudfDistinctHashJoinEnabled]);
   }
+  if (config.find(kCudfProbeUniqueInnerJoinEnabled) != config.end()) {
+    probeUniqueInnerJoinEnabled =
+        folly::to<bool>(config[kCudfProbeUniqueInnerJoinEnabled]);
+  }
   if (config.find(kCudfExchange) != config.end()) {
     exchange = folly::to<bool>(config[kCudfExchange]);
   }

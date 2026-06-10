@@ -18,19 +18,74 @@
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 
+#include <cudf/column/column_view.hpp>
 #include <cudf/groupby.hpp>
 
+#include <memory>
+#include <unordered_map>
+
 namespace facebook::velox::cudf_velox {
+
+struct GroupbyAggregationResultRef {
+  uint32_t requestIndex;
+  uint32_t resultIndex;
+  std::shared_ptr<bool> shared;
+};
+
+struct GroupbyPartialMeanResultRefs {
+  GroupbyAggregationResultRef sum;
+  GroupbyAggregationResultRef count;
+};
+
+class GroupbyAggregationRequestBuilder {
+ public:
+  GroupbyAggregationRequestBuilder(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests);
+
+  GroupbyAggregationResultRef addAggregationForColumn(
+      uint32_t inputIndex,
+      std::unique_ptr<cudf::groupby_aggregation> aggregation);
+
+  GroupbyAggregationResultRef addAggregationForValues(
+      cudf::column_view values,
+      std::unique_ptr<cudf::groupby_aggregation> aggregation);
+
+  GroupbyAggregationResultRef addSum(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey,
+      core::AggregationNode::Step step);
+
+  GroupbyPartialMeanResultRefs addPartialMean(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey);
+
+  cudf::table_view const& tableView() const {
+    return tableView_;
+  }
+
+  cudf::groupby::aggregation_request& aggregationRequest(
+      const GroupbyAggregationResultRef& ref);
+
+ private:
+  GroupbyAggregationResultRef addReusablePartialSum(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey);
+
+  cudf::table_view tableView_;
+  std::vector<cudf::groupby::aggregation_request>& requests_;
+  std::unordered_map<uint32_t, GroupbyAggregationResultRef>
+      reusablePartialSums_;
+};
 
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
   uint32_t inputIndex;
+  uint32_t reusableInputKey;
   VectorPtr constant;
   TypePtr resultType;
 
-  virtual void addGroupbyRequest(
-      cudf::table_view const& tbl,
-      std::vector<cudf::groupby::aggregation_request>& requests) = 0;
+  virtual void addGroupbyRequest(GroupbyAggregationRequestBuilder& builder) = 0;
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
@@ -42,10 +97,12 @@ struct GroupbyAggregator {
   GroupbyAggregator(
       core::AggregationNode::Step step,
       uint32_t inputIndex,
+      uint32_t reusableInputKey,
       VectorPtr constant,
       const TypePtr& resultType)
       : step(step),
         inputIndex(inputIndex),
+        reusableInputKey(reusableInputKey),
         constant(constant),
         resultType(resultType) {}
 };
@@ -55,7 +112,8 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
-    std::vector<VectorPtr> const& constants);
+    std::vector<VectorPtr> const& constants,
+    const std::vector<column_index_t>* aggregationInputChannels = nullptr);
 
 // Groupby-specific validation
 bool canGroupbyBeEvaluatedByCudf(
@@ -107,6 +165,14 @@ class CudfGroupby : public CudfOperatorBase {
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
+  void addPendingGroupbyState(
+      CudfVectorPtr state,
+      bool projectAggregationInputs);
+  void compactPendingGroupbyStates(bool projectAggregationInputs);
+  CudfVectorPtr compactGroupbyStates(
+      std::vector<CudfVectorPtr>&& states,
+      bool projectAggregationInputs,
+      CudfVectorPtr existingState = nullptr);
 
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
@@ -132,6 +198,8 @@ class CudfGroupby : public CudfOperatorBase {
   bool ignoreNullKeys_;
 
   std::vector<CudfVectorPtr> inputs_;
+  std::vector<CudfVectorPtr> pendingGroupbyStates_;
+  int64_t pendingGroupbyStateBytes_{0};
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;

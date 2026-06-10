@@ -290,6 +290,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::table_view leftKeyView,
       rmm::cuda_stream_view stream);
 
+  JoinIndices computeProbeUniqueInnerJoinIndices(
+      cudf::table_view leftKeyView,
+      cudf::table_view rightKeyView,
+      rmm::cuda_stream_view stream);
+
   /**
    * @brief Performs inner join between probe table and all build tables.
    * @param leftTable Probe-side table to join

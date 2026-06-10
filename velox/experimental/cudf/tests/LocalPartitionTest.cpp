@@ -160,6 +160,38 @@ TEST_F(LocalPartitionTest, partition) {
       queryBuilder.assertResults("SELECT c0, max(c0) FROM tmp GROUP BY 1");
 }
 
+TEST_F(LocalPartitionTest, partitionRetainsVariableWidthPayload) {
+  std::vector<RowVectorPtr> vectors = {
+      makeRowVector(
+          {makeFlatVector<int64_t>({0, 1, 0, 2}),
+           makeFlatVector<StringView>({"zero", "one", "zero", "two"}),
+           makeFlatVector<int64_t>({10, 20, 30, 40})}),
+      makeRowVector(
+          {makeFlatVector<int64_t>({1, 2, 3, 3}),
+           makeFlatVector<StringView>({"one", "two", "three", "three"}),
+           makeFlatVector<int64_t>({50, 60, 70, 80})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  std::vector<core::PlanNodePtr> sources;
+  for (const auto& vector : vectors) {
+    sources.push_back(
+        PlanBuilder(planNodeIdGenerator).values({vector}).planNode());
+  }
+
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .localPartition({"c0"}, sources)
+                  .singleAggregation({"c0", "c1"}, {"count(1)", "sum(c2)"})
+                  .planNode();
+
+  AssertQueryBuilder queryBuilder(plan, duckDbQueryRunner_);
+  queryBuilder.maxDrivers(2);
+  queryBuilder.config(core::QueryConfig::kMaxLocalExchangePartitionCount, "2");
+  queryBuilder.assertResults(
+      "SELECT c0, c1, count(1), sum(c2) FROM tmp GROUP BY 1, 2");
+}
+
 TEST_F(LocalPartitionTest, unionAllLocalExchange) {
   auto data1 = makeRowVector({"d0"}, {makeFlatVector<StringView>({"x"})});
   auto data2 = makeRowVector({"e0"}, {makeFlatVector<StringView>({"y"})});

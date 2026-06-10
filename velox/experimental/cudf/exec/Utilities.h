@@ -20,6 +20,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>

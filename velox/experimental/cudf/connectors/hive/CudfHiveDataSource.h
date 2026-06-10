@@ -33,6 +33,7 @@
 
 #include <cudf/ast/expressions.hpp>
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 

@@ -1698,6 +1698,12 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
   if (rightKeysNonNull_) {
     stream << ", right keys non-null";
   }
+  if (leftKeysCoveredByRightKeys_) {
+    stream << ", left keys covered by right keys";
+  }
+  if (rightKeysCoveredByLeftKeys_) {
+    stream << ", right keys covered by left keys";
+  }
 }
 
 folly::dynamic HashJoinNode::serialize() const {
@@ -1709,6 +1715,8 @@ folly::dynamic HashJoinNode::serialize() const {
   obj["rightKeysUnique"] = rightKeysUnique_;
   obj["leftKeysNonNull"] = leftKeysNonNull_;
   obj["rightKeysNonNull"] = rightKeysNonNull_;
+  obj["leftKeysCoveredByRightKeys"] = leftKeysCoveredByRightKeys_;
+  obj["rightKeysCoveredByLeftKeys"] = rightKeysCoveredByLeftKeys_;
   return obj;
 }
 
@@ -1730,6 +1738,10 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
   auto rightKeysUnique = obj.getDefault("rightKeysUnique", false).asBool();
   auto leftKeysNonNull = obj.getDefault("leftKeysNonNull", false).asBool();
   auto rightKeysNonNull = obj.getDefault("rightKeysNonNull", false).asBool();
+  auto leftKeysCoveredByRightKeys =
+      obj.getDefault("leftKeysCoveredByRightKeys", false).asBool();
+  auto rightKeysCoveredByLeftKeys =
+      obj.getDefault("rightKeysCoveredByLeftKeys", false).asBool();
   auto leftKeys = deserializeFields(obj["leftKeys"], context);
   auto rightKeys = deserializeFields(obj["rightKeys"], context);
 
@@ -1755,7 +1767,9 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       leftKeysUnique,
       rightKeysUnique,
       leftKeysNonNull,
-      rightKeysNonNull);
+      rightKeysNonNull,
+      leftKeysCoveredByRightKeys,
+      rightKeysCoveredByLeftKeys);
 }
 
 MergeJoinNode::MergeJoinNode(

@@ -27,8 +27,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
 
-#include <algorithm>
-
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -236,30 +234,18 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);
 
-    auto partitionedTableOwner =
-        std::shared_ptr<cudf::table>(std::move(partitionedTable));
-    const auto inputBytes = cudfVector->estimateFlatSize();
-    const auto inputRows = std::max<vector_size_t>(cudfVector->size(), 1);
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
-      auto partitionBytes =
-          inputBytes * static_cast<uint64_t>(partitionData.num_rows()) /
-          static_cast<uint64_t>(inputRows);
-      if (partitionBytes == 0) {
-        partitionBytes = 1;
-      }
       auto partitionCudfVector = std::make_shared<CudfVector>(
           pool(),
           outputType_,
           partitionData.num_rows(),
-          partitionData,
-          partitionedTableOwner,
-          stream,
-          partitionBytes);
+          std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
+          stream);
       enqueuePartition(i, partitionCudfVector);
     }
   } else {

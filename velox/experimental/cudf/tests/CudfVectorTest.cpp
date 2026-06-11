@@ -21,6 +21,7 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -38,6 +39,14 @@
 using namespace facebook::velox;
 using namespace facebook::velox::cudf_velox;
 using namespace facebook::velox::test;
+
+namespace facebook::velox::cudf_velox {
+
+rmm::device_async_resource_ref get_output_mr() {
+  return cudf::get_current_device_resource_ref();
+}
+
+} // namespace facebook::velox::cudf_velox
 
 namespace {
 
@@ -238,6 +247,39 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
 
   EXPECT_GT(resource.deallocationCount(), 0);
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+}
+
+TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
+  TestCudaStream allocationStream;
+  TestCudaStream targetStream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table = makeTable(
+      allocationStream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      allocationStream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  allocationStream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      targetStream.view());
+  resource.reset();
+
+  auto materialized = vector.release();
+
+  EXPECT_GT(resource.deallocationCount(), 0);
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+  targetStream.view().synchronize();
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseRunsCallbackAfterBackingStorageReset) {

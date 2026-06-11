@@ -325,9 +325,11 @@ void CudfHashJoinBuild::doNoMoreInput() {
   }
 
   // Construct hash_join object for join types that use hb->inner_join() or
-  // hb->left_join(). Semi filter, anti joins, and unfiltered left semi project
-  // joins use standalone cudf functions (e.g. mixed_left_semi_join,
-  // filtered_join, mark_join) that build hash tables internally.
+  // hb->left_join(). Filtered left semi project also uses this path to avoid
+  // rebuilding a standalone mixed semi join for every probe/build batch pair.
+  // Semi filter, anti joins, and unfiltered left semi project joins use
+  // standalone cudf functions (e.g. mixed_left_semi_join, filtered_join,
+  // mark_join) that build hash tables internally.
   const bool buildHashJoin = usesPrebuiltCudfHashJoin(*joinNode_);
   const bool preferDistinctHashJoin = buildHashJoin &&
       joinNode_->rightKeysUnique() &&
@@ -1685,10 +1687,10 @@ createCrossProductIndices(
 // Implementation approach:
 // 1. Without a join filter, build cudf::mark_join on the current probe batch
 //    keys and probe it with each build-side batch to get matching probe rows.
-// 2. With a join filter, keep the old pair-index path because filter evaluation
-//    needs both probe and build row indices.
-// 3. Accumulate matches across build table batches by scattering TRUE into the
-//    match column for every marked probe row.
+// 2. With a join filter, use the prebuilt hash join to get key-match pairs,
+//    apply the filter to the pairs, then mark the matched probe rows.
+// 3. Accumulate matches across build table batches by setting TRUE for every
+//    marked probe row.
 // 4. For null-aware mode (without filter): apply null mask based on probe key
 //    nullity and build side null keys presence.
 // 5. Output: all probe columns + match column.
@@ -1720,7 +1722,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
       falseScalar, numProbeRows, stream, get_output_mr());
 
   // Create probe row indices sequence: [0, 1, 2, ..., numProbeRows-1].
-  // This is only needed by the filtered path and null-aware filtered logic.
+  // The filtered path uses this to turn possibly-duplicated filtered pair
+  // indices into one boolean marker per probe row.
   std::unique_ptr<cudf::column> probeRowIndices;
   if (hasFilter) {
     probeRowIndices = cudf::sequence(
@@ -1747,10 +1750,15 @@ CudfHashJoinProbe::leftSemiProjectJoin(
 
   auto const leftKeyView = leftTableView.select(leftKeyIndices_);
   std::unique_ptr<cudf::mark_join> markJoin;
+  int64_t markJoinBatches = 0;
+  int64_t filteredPairBatches = 0;
+  int64_t filteredPairRows = 0;
+  int64_t semiProjectMatchedRows = 0;
   std::vector<std::unique_ptr<cudf::column>> retainedMatchColumns;
   std::vector<std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
       retainedMatchIndices;
   std::vector<std::unique_ptr<cudf::scalar>> retainedScatterScalars;
+  std::vector<std::unique_ptr<cudf::column>> retainedBinaryInputs;
   if (!hasFilter) {
     markJoin = std::make_unique<cudf::mark_join>(
         leftKeyView,
@@ -1763,6 +1771,9 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     retainedMatchColumns.reserve(rightTables.size());
     retainedMatchIndices.reserve(rightTables.size());
     retainedScatterScalars.reserve(rightTables.size());
+  } else {
+    retainedMatchIndices.reserve(rightTables.size());
+    retainedBinaryInputs.reserve(rightTables.size() * 2);
   }
 
   for (auto i = 0; i < rightTables.size(); i++) {
@@ -1771,6 +1782,9 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     if (!hasFilter) {
       auto matchedProbeIndices = markJoin->semi_join(
           rightTableView.select(rightKeyIndices_), stream, get_temp_mr());
+      ++markJoinBatches;
+      semiProjectMatchedRows +=
+          static_cast<int64_t>(matchedProbeIndices->size());
       if (matchedProbeIndices->size() == 0) {
         continue;
       }
@@ -1795,13 +1809,11 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         ? cachedExtendedRightViews_[i]
         : rightTableView;
 
-    // Step 1: Inner join to get (probe_idx, build_idx) pairs where keys match.
-    // Unlike left_join, inner_join only returns valid pairs (no JoinNoMatch).
-    auto [leftJoinIndices, rightJoinIndices] = computeInnerJoinIndices(
-        i, leftTableView.select(leftKeyIndices_), stream);
+    auto [leftJoinIndices, rightJoinIndices] =
+        computeInnerJoinIndices(i, leftKeyView, stream);
 
     if (leftJoinIndices->size() == 0) {
-      continue; // No matches from this build table
+      continue;
     }
 
     auto leftIndicesSpan =
@@ -1811,39 +1823,30 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     auto leftIndicesCol = cudf::column_view{leftIndicesSpan};
     auto rightIndicesCol = cudf::column_view{rightIndicesSpan};
 
-    cudf::column_view matchedProbeIndices;
-    std::unique_ptr<rmm::device_uvector<cudf::size_type>> filteredLeftIndices;
-
-    // Step 2: Apply filter to the join pairs. INNER_JOIN mode keeps only
-    // pairs where the predicate evaluates to true.
-    auto [filteredLeft, filteredRight] = cudf::filter_join_indices(
+    auto filteredJoinIndices = cudf::filter_join_indices(
         extendedLeftView,
         extendedRightView,
-        leftIndicesSpan,
-        rightIndicesSpan,
+        leftIndicesCol,
+        rightIndicesCol,
         tree_.back(),
         cudf::join_kind::INNER_JOIN,
         stream,
         get_temp_mr());
 
-    filteredLeftIndices = std::move(filteredLeft);
-    if (filteredLeftIndices->size() == 0) {
-      continue; // No matches passed filter
+    ++filteredPairBatches;
+    filteredPairRows += static_cast<int64_t>(filteredJoinIndices.first->size());
+    if (filteredJoinIndices.first->size() == 0) {
+      continue;
     }
+
+    retainedMatchIndices.push_back(std::move(filteredJoinIndices.first));
     auto filteredLeftSpan =
-        cudf::device_span<cudf::size_type const>{*filteredLeftIndices};
-    matchedProbeIndices = cudf::column_view{filteredLeftSpan};
-
-    // Step 3: Create match flags using cudf::contains. For each probe row index
-    // in [0, numProbeRows), check if it appears in matchedProbeIndices.
-    // This handles duplicates correctly - if a probe row matches multiple build
-    // rows, it appears multiple times in matchedProbeIndices, but contains()
-    // returns true if it appears at least once.
+        cudf::device_span<cudf::size_type const>{
+            *retainedMatchIndices.back()};
+    auto filteredLeftCol = cudf::column_view{filteredLeftSpan};
     auto matchedInBatch = cudf::contains(
-        matchedProbeIndices, probeRowIndices->view(), stream, get_temp_mr());
+        filteredLeftCol, probeRowIndices->view(), stream, get_temp_mr());
 
-    // Step 4: Accumulate matches across build table batches using OR.
-    // A probe row's final match value is true if it matched in ANY batch.
     auto updatedMatch = cudf::binary_operation(
         matchCol->view(),
         matchedInBatch->view(),
@@ -1851,8 +1854,29 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         cudf::data_type{cudf::type_id::BOOL8},
         stream,
         get_output_mr());
-    stream.synchronize();
+    retainedBinaryInputs.push_back(std::move(matchCol));
+    retainedBinaryInputs.push_back(std::move(matchedInBatch));
     matchCol = std::move(updatedMatch);
+  }
+
+  if (markJoinBatches > 0) {
+    addRuntimeStat(
+        "cudfLeftSemiProjectMarkJoinBatches", RuntimeCounter(markJoinBatches));
+  }
+  if (filteredPairBatches > 0) {
+    addRuntimeStat(
+        "cudfLeftSemiProjectFilteredPairBatches",
+        RuntimeCounter(filteredPairBatches));
+  }
+  if (filteredPairRows > 0) {
+    addRuntimeStat(
+        "cudfLeftSemiProjectFilteredPairRows",
+        RuntimeCounter(filteredPairRows));
+  }
+  if (semiProjectMatchedRows > 0) {
+    addRuntimeStat(
+        "cudfLeftSemiProjectMatchedRows",
+        RuntimeCounter(semiProjectMatchedRows));
   }
 
   // Step 5: Handle null-aware semantics (IN vs EXISTS).

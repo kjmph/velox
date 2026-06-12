@@ -207,6 +207,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   RowTypePtr buildType_;
   /** @brief Cached evaluator for post-join filter column */
   std::shared_ptr<CudfExpression> filterEvaluator_;
+  std::optional<cudf::size_type> simpleNotEqualLeftIndex_;
+  std::optional<cudf::size_type> simpleNotEqualRightIndex_;
 
   bool rightPrecomputed_{false};
 
@@ -350,6 +352,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
    * @return Vector of result tables (multiple if build data was batched)
    */
   std::vector<std::unique_ptr<cudf::table>> leftSemiProjectJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+
+  std::vector<std::unique_ptr<cudf::table>> leftSemiProjectMinMaxJoin(
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**

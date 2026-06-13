@@ -62,6 +62,8 @@ namespace facebook::velox::cudf_velox {
 
 namespace {
 
+constexpr size_t kDefaultMinMaxSummaryBatchRows = 100'000'000;
+
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
     cudf::table_view originalView,
@@ -270,6 +272,14 @@ std::unique_ptr<cudf::table> compactMinMaxSummaryTable(
   return std::make_unique<cudf::table>(std::move(summaryColumns));
 }
 
+size_t minMaxSummaryBatchRows() {
+  const auto& cudfConfig = CudfConfig::getInstance();
+  if (cudfConfig.batchSizeMaxThreshold.has_value()) {
+    return static_cast<size_t>(cudfConfig.batchSizeMaxThreshold.value());
+  }
+  return kDefaultMinMaxSummaryBatchRows;
+}
+
 std::vector<std::unique_ptr<cudf::table>> compactMinMaxSummaryTables(
     std::vector<std::unique_ptr<cudf::table>> inputTables,
     cudf::size_type numKeyColumns,
@@ -286,6 +296,61 @@ std::vector<std::unique_ptr<cudf::table>> compactMinMaxSummaryTables(
     summaryRows += static_cast<int64_t>(summary->num_rows());
     summaries.push_back(std::move(summary));
     inputTable.reset();
+  }
+
+  return summaries;
+}
+
+std::vector<std::unique_ptr<cudf::table>> compactMinMaxSummaryVectorsBatched(
+    std::vector<CudfVectorPtr> inputTables,
+    const TypePtr& tableType,
+    cudf::size_type numKeyColumns,
+    rmm::cuda_stream_view stream,
+    int64_t& summaryRows) {
+  summaryRows = 0;
+  if (inputTables.empty()) {
+    auto emptyTables = getConcatenatedTableBatched(
+        std::move(inputTables), tableType, stream, get_output_mr());
+    return compactMinMaxSummaryTables(
+        std::move(emptyTables), numKeyColumns, stream, summaryRows);
+  }
+
+  std::vector<std::unique_ptr<cudf::table>> summaries;
+  const auto targetRows = minMaxSummaryBatchRows();
+  size_t start = 0;
+  size_t runningRows = 0;
+
+  auto flush = [&](size_t end) {
+    std::vector<CudfVectorPtr> batch;
+    batch.reserve(end - start);
+    for (auto i = start; i < end; ++i) {
+      batch.push_back(std::move(inputTables[i]));
+    }
+    auto concatenated = getConcatenatedTableBatched(
+        std::move(batch), tableType, stream, get_output_mr());
+    int64_t batchSummaryRows = 0;
+    auto batchSummaries = compactMinMaxSummaryTables(
+        std::move(concatenated), numKeyColumns, stream, batchSummaryRows);
+    summaryRows += batchSummaryRows;
+    summaries.insert(
+        summaries.end(),
+        std::make_move_iterator(batchSummaries.begin()),
+        std::make_move_iterator(batchSummaries.end()));
+    start = end;
+    runningRows = 0;
+  };
+
+  for (size_t i = 0; i < inputTables.size(); ++i) {
+    VELOX_CHECK_NOT_NULL(inputTables[i]);
+    const auto rows =
+        static_cast<size_t>(inputTables[i]->getTableView().num_rows());
+    if (runningRows > 0 && runningRows + rows > targetRows) {
+      flush(i);
+    }
+    runningRows += rows;
+  }
+  if (start < inputTables.size()) {
+    flush(inputTables.size());
   }
 
   return summaries;
@@ -541,14 +606,10 @@ void CudfHashJoinBuild::doNoMoreInput() {
   auto hashBuildKeyIndices = buildKeyIndices_;
   if (simpleNotEqual_.has_value()) {
     VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
-    auto summaryInputs = getConcatenatedTableBatched(
+    int64_t summaryRows = 0;
+    tbls = compactMinMaxSummaryVectorsBatched(
         std::exchange(minMaxSummaryInputs_, {}),
         minMaxSummaryType_,
-        stream,
-        get_output_mr());
-    int64_t summaryRows = 0;
-    tbls = compactMinMaxSummaryTables(
-        std::move(summaryInputs),
         static_cast<cudf::size_type>(buildKeyIndices_.size()),
         stream,
         summaryRows);
@@ -566,6 +627,9 @@ void CudfHashJoinBuild::doNoMoreInput() {
     addRuntimeStat(
         "cudfLeftSemiProjectMinMaxBuildSummaryRows",
         RuntimeCounter(summaryRows));
+    addRuntimeStat(
+        "cudfLeftSemiProjectMinMaxBuildSummaryTargetRows",
+        RuntimeCounter(static_cast<int64_t>(minMaxSummaryBatchRows())));
     addRuntimeStat(
         "cudfLeftSemiProjectMinMaxBuildSummaryTables",
         RuntimeCounter(tbls.size()));

@@ -175,10 +175,104 @@ std::vector<cudf::size_type> sequenceIndices(cudf::size_type size) {
   return indices;
 }
 
-std::vector<std::unique_ptr<cudf::table>> buildMinMaxSummaryTables(
-    std::vector<std::unique_ptr<cudf::table>> inputTables,
+RowTypePtr makeMinMaxSummaryType(
+    const RowTypePtr& buildType,
+    const std::vector<cudf::size_type>& keyIndices,
+    cudf::size_type valueIndex) {
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  names.reserve(keyIndices.size() + 2);
+  types.reserve(keyIndices.size() + 2);
+
+  for (auto keyIndex : keyIndices) {
+    names.push_back(buildType->nameOf(keyIndex));
+    types.push_back(buildType->childAt(keyIndex));
+  }
+  names.push_back(buildType->nameOf(valueIndex) + "_min");
+  types.push_back(buildType->childAt(valueIndex));
+  names.push_back(buildType->nameOf(valueIndex) + "_max");
+  types.push_back(buildType->childAt(valueIndex));
+
+  return ROW(std::move(names), std::move(types));
+}
+
+std::unique_ptr<cudf::table> makeEmptyMinMaxSummaryTable(
+    cudf::table_view inputView,
+    const std::vector<cudf::size_type>& keyIndices,
+    cudf::size_type valueIndex) {
+  std::vector<std::unique_ptr<cudf::column>> emptyColumns;
+  emptyColumns.reserve(keyIndices.size() + 2);
+  for (auto keyIndex : keyIndices) {
+    emptyColumns.push_back(cudf::empty_like(inputView.column(keyIndex)));
+  }
+  emptyColumns.push_back(cudf::empty_like(inputView.column(valueIndex)));
+  emptyColumns.push_back(cudf::empty_like(inputView.column(valueIndex)));
+  return std::make_unique<cudf::table>(std::move(emptyColumns));
+}
+
+std::unique_ptr<cudf::table> buildMinMaxSummaryTable(
+    cudf::table_view inputView,
     const std::vector<cudf::size_type>& keyIndices,
     cudf::size_type valueIndex,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (inputView.num_rows() == 0) {
+    return makeEmptyMinMaxSummaryTable(inputView, keyIndices, valueIndex);
+  }
+
+  cudf::groupby::groupby groupByOwner(
+      inputView.select(keyIndices), cudf::null_policy::EXCLUDE);
+  std::vector<cudf::groupby::aggregation_request> requests(1);
+  requests[0].values = inputView.column(valueIndex);
+  requests[0].aggregations.push_back(
+      cudf::make_min_aggregation<cudf::groupby_aggregation>());
+  requests[0].aggregations.push_back(
+      cudf::make_max_aggregation<cudf::groupby_aggregation>());
+
+  auto [summaryKeys, results] = groupByOwner.aggregate(requests, stream, mr);
+  VELOX_CHECK_EQ(results.size(), 1);
+  VELOX_CHECK_EQ(results[0].results.size(), 2);
+
+  auto summaryColumns = summaryKeys->release();
+  summaryColumns.push_back(std::move(results[0].results[0]));
+  summaryColumns.push_back(std::move(results[0].results[1]));
+  return std::make_unique<cudf::table>(std::move(summaryColumns));
+}
+
+std::unique_ptr<cudf::table> compactMinMaxSummaryTable(
+    cudf::table_view inputView,
+    cudf::size_type numKeyColumns,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto const keyIndices = sequenceIndices(numKeyColumns);
+  if (inputView.num_rows() == 0) {
+    return makeEmptyMinMaxSummaryTable(inputView, keyIndices, numKeyColumns);
+  }
+
+  cudf::groupby::groupby groupByOwner(
+      inputView.select(keyIndices), cudf::null_policy::EXCLUDE);
+  std::vector<cudf::groupby::aggregation_request> requests(2);
+  requests[0].values = inputView.column(numKeyColumns);
+  requests[0].aggregations.push_back(
+      cudf::make_min_aggregation<cudf::groupby_aggregation>());
+  requests[1].values = inputView.column(numKeyColumns + 1);
+  requests[1].aggregations.push_back(
+      cudf::make_max_aggregation<cudf::groupby_aggregation>());
+
+  auto [summaryKeys, results] = groupByOwner.aggregate(requests, stream, mr);
+  VELOX_CHECK_EQ(results.size(), 2);
+  VELOX_CHECK_EQ(results[0].results.size(), 1);
+  VELOX_CHECK_EQ(results[1].results.size(), 1);
+
+  auto summaryColumns = summaryKeys->release();
+  summaryColumns.push_back(std::move(results[0].results[0]));
+  summaryColumns.push_back(std::move(results[1].results[0]));
+  return std::make_unique<cudf::table>(std::move(summaryColumns));
+}
+
+std::vector<std::unique_ptr<cudf::table>> compactMinMaxSummaryTables(
+    std::vector<std::unique_ptr<cudf::table>> inputTables,
+    cudf::size_type numKeyColumns,
     rmm::cuda_stream_view stream,
     int64_t& summaryRows) {
   std::vector<std::unique_ptr<cudf::table>> summaries;
@@ -187,45 +281,13 @@ std::vector<std::unique_ptr<cudf::table>> buildMinMaxSummaryTables(
 
   for (auto& inputTable : inputTables) {
     VELOX_CHECK_NOT_NULL(inputTable);
-    auto inputView = inputTable->view();
-    if (inputView.num_rows() == 0) {
-      std::vector<std::unique_ptr<cudf::column>> emptyColumns;
-      emptyColumns.reserve(keyIndices.size() + 2);
-      for (auto keyIndex : keyIndices) {
-        emptyColumns.push_back(cudf::empty_like(inputView.column(keyIndex)));
-      }
-      emptyColumns.push_back(cudf::empty_like(inputView.column(valueIndex)));
-      emptyColumns.push_back(cudf::empty_like(inputView.column(valueIndex)));
-      summaries.push_back(
-          std::make_unique<cudf::table>(std::move(emptyColumns)));
-      inputTable.reset();
-      continue;
-    }
-
-    cudf::groupby::groupby groupByOwner(
-        inputView.select(keyIndices), cudf::null_policy::EXCLUDE);
-    std::vector<cudf::groupby::aggregation_request> requests(1);
-    requests[0].values = inputView.column(valueIndex);
-    requests[0].aggregations.push_back(
-        cudf::make_min_aggregation<cudf::groupby_aggregation>());
-    requests[0].aggregations.push_back(
-        cudf::make_max_aggregation<cudf::groupby_aggregation>());
-
-    auto [summaryKeys, results] =
-        groupByOwner.aggregate(requests, stream, get_output_mr());
-    VELOX_CHECK_EQ(results.size(), 1);
-    VELOX_CHECK_EQ(results[0].results.size(), 2);
-
-    auto summaryColumns = summaryKeys->release();
-    summaryColumns.push_back(std::move(results[0].results[0]));
-    summaryColumns.push_back(std::move(results[0].results[1]));
-    auto summary = std::make_unique<cudf::table>(std::move(summaryColumns));
+    auto summary = compactMinMaxSummaryTable(
+        inputTable->view(), numKeyColumns, stream, get_output_mr());
     summaryRows += static_cast<int64_t>(summary->num_rows());
     summaries.push_back(std::move(summary));
     inputTable.reset();
   }
 
-  stream.synchronize();
   return summaries;
 }
 
@@ -251,6 +313,7 @@ void CudfHashJoinProbe::doClose() {
 void CudfHashJoinBuild::doClose() {
   Operator::close();
   inputs_.clear();
+  minMaxSummaryInputs_.clear();
 }
 
 void CudfHashJoinBridge::setHashTable(
@@ -337,6 +400,17 @@ CudfHashJoinBuild::CudfHashJoinBuild(
     buildKeyIndices_[i] = static_cast<cudf::size_type>(
         buildType->getChildIdx(rightKeys[i]->name()));
   }
+  if (joinNode_->filter() && joinNode_->isLeftSemiProjectJoin() &&
+      buildKeyIndices_.size() == 1) {
+    simpleNotEqual_ = detectSimpleCrossSideNotEqual(
+        joinNode_->filter(),
+        asRowType(joinNode_->sources()[0]->outputType()),
+        asRowType(buildType));
+    if (simpleNotEqual_.has_value()) {
+      minMaxSummaryType_ = makeMinMaxSummaryType(
+          asRowType(buildType), buildKeyIndices_, simpleNotEqual_->second);
+    }
+  }
 
   auto lockedStats = stats_.wlock();
   lockedStats->addRuntimeStat(
@@ -350,7 +424,7 @@ CudfHashJoinBuild::CudfHashJoinBuild(
   lockedStats->addRuntimeStat(
       "trustedUniqueBuildHashJoinCandidate",
       RuntimeCounter(
-          joinNode_->rightKeysUnique() &&
+          (joinNode_->rightKeysUnique() || simpleNotEqual_.has_value()) &&
           usesPrebuiltCudfHashJoin(*joinNode_)));
   lockedStats->addRuntimeStat(
       "distinctCudfHashJoinEnabled",
@@ -358,10 +432,11 @@ CudfHashJoinBuild::CudfHashJoinBuild(
 }
 
 void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
-  // Queue inputs, process all at once.
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
+    buildInputRows_ += input->size();
+    ++buildInputBatches_;
     if (!joinNode_->rightKeysNonNull()) {
       auto const null_count = countNullJoinKeys(
           cudfInput->getTableView(), buildKeyIndices_, cudfInput->stream());
@@ -371,6 +446,30 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
         lockedStats->numNullKeys += null_count;
       }
     }
+
+    if (simpleNotEqual_.has_value()) {
+      VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
+      auto summary = buildMinMaxSummaryTable(
+          cudfInput->getTableView(),
+          buildKeyIndices_,
+          simpleNotEqual_->second,
+          cudfInput->stream(),
+          get_output_mr());
+      const auto summaryRows = summary->num_rows();
+      if (summaryRows > 0) {
+        minMaxInputSummaryRows_ += static_cast<int64_t>(summaryRows);
+        ++minMaxInputSummaryTables_;
+        minMaxSummaryInputs_.push_back(std::make_shared<CudfVector>(
+            pool(),
+            minMaxSummaryType_,
+            static_cast<vector_size_t>(summaryRows),
+            std::move(summary),
+            cudfInput->stream()));
+      }
+      return;
+    }
+
+    // Queue regular build inputs, process all at once.
     inputs_.push_back(std::move(cudfInput));
   }
 }
@@ -397,11 +496,23 @@ void CudfHashJoinBuild::doNoMoreInput() {
     auto op = peer->findOperator(planNodeId());
     auto* build = dynamic_cast<CudfHashJoinBuild*>(op);
     VELOX_CHECK_NOT_NULL(build);
-    inputs_.insert(
-        inputs_.end(),
-        std::make_move_iterator(build->inputs_.begin()),
-        std::make_move_iterator(build->inputs_.end()));
-    build->inputs_.clear();
+    buildInputRows_ += build->buildInputRows_;
+    buildInputBatches_ += build->buildInputBatches_;
+    minMaxInputSummaryRows_ += build->minMaxInputSummaryRows_;
+    minMaxInputSummaryTables_ += build->minMaxInputSummaryTables_;
+    if (simpleNotEqual_.has_value()) {
+      minMaxSummaryInputs_.insert(
+          minMaxSummaryInputs_.end(),
+          std::make_move_iterator(build->minMaxSummaryInputs_.begin()),
+          std::make_move_iterator(build->minMaxSummaryInputs_.end()));
+      build->minMaxSummaryInputs_.clear();
+    } else {
+      inputs_.insert(
+          inputs_.end(),
+          std::make_move_iterator(build->inputs_.begin()),
+          std::make_move_iterator(build->inputs_.end()));
+      build->inputs_.clear();
+    }
   }
 
   SCOPE_EXIT {
@@ -414,7 +525,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
   };
 
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(1) << "CudfHashJoinBuild: build batches count: " << inputs_.size();
+    VLOG(1) << "CudfHashJoinBuild: build batches count: " << buildInputBatches_;
     if (!inputs_.empty()) {
       VLOG(1) << "Build batches number of columns: "
               << inputs_[0]->getTableView().num_columns();
@@ -426,53 +537,60 @@ void CudfHashJoinBuild::doNoMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
-  // Using output_mr here to allow spilling queued up large tables
-  auto tbls = getConcatenatedTableBatched(
-      std::exchange(inputs_, {}),
-      joinNode_->sources()[1]->outputType(),
-      stream,
-      get_output_mr());
-
-  int64_t buildRows = 0;
-  for (auto const& tbl : tbls) {
-    VELOX_CHECK_NOT_NULL(tbl);
-    buildRows += tbl->num_rows();
-  }
-  addRuntimeStat("cudfHashJoinBuildTables", RuntimeCounter(tbls.size()));
-  addRuntimeStat("cudfHashJoinBuildRows", RuntimeCounter(buildRows));
-  if (CudfConfig::getInstance().debugEnabled && !tbls.empty()) {
-    VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
-    for (auto i = 0; i < tbls.size(); i++) {
-      VLOG(1) << "Build table " << i
-              << ": number of rows: " << tbls[i]->num_rows();
-    }
-  }
-
+  std::vector<std::unique_ptr<cudf::table>> tbls;
   auto hashBuildKeyIndices = buildKeyIndices_;
-  std::optional<std::pair<cudf::size_type, cudf::size_type>> simpleNotEqual;
-  if (joinNode_->filter() && joinNode_->isLeftSemiProjectJoin() &&
-      buildKeyIndices_.size() == 1) {
-    simpleNotEqual = detectSimpleCrossSideNotEqual(
-        joinNode_->filter(),
-        asRowType(joinNode_->sources()[0]->outputType()),
-        asRowType(joinNode_->sources()[1]->outputType()));
-  }
-  if (simpleNotEqual.has_value()) {
+  if (simpleNotEqual_.has_value()) {
+    VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
+    auto summaryInputs = getConcatenatedTableBatched(
+        std::exchange(minMaxSummaryInputs_, {}),
+        minMaxSummaryType_,
+        stream,
+        get_output_mr());
     int64_t summaryRows = 0;
-    tbls = buildMinMaxSummaryTables(
-        std::move(tbls),
-        buildKeyIndices_,
-        simpleNotEqual->second,
+    tbls = compactMinMaxSummaryTables(
+        std::move(summaryInputs),
+        static_cast<cudf::size_type>(buildKeyIndices_.size()),
         stream,
         summaryRows);
     hashBuildKeyIndices =
         sequenceIndices(static_cast<cudf::size_type>(buildKeyIndices_.size()));
+    addRuntimeStat(
+        "cudfHashJoinBuildTables", RuntimeCounter(buildInputBatches_));
+    addRuntimeStat("cudfHashJoinBuildRows", RuntimeCounter(buildInputRows_));
+    addRuntimeStat(
+        "cudfLeftSemiProjectMinMaxBuildInputSummaryRows",
+        RuntimeCounter(minMaxInputSummaryRows_));
+    addRuntimeStat(
+        "cudfLeftSemiProjectMinMaxBuildInputSummaryTables",
+        RuntimeCounter(minMaxInputSummaryTables_));
     addRuntimeStat(
         "cudfLeftSemiProjectMinMaxBuildSummaryRows",
         RuntimeCounter(summaryRows));
     addRuntimeStat(
         "cudfLeftSemiProjectMinMaxBuildSummaryTables",
         RuntimeCounter(tbls.size()));
+  } else {
+    // Using output_mr here to allow spilling queued up large tables.
+    tbls = getConcatenatedTableBatched(
+        std::exchange(inputs_, {}),
+        joinNode_->sources()[1]->outputType(),
+        stream,
+        get_output_mr());
+
+    int64_t buildRows = 0;
+    for (auto const& tbl : tbls) {
+      VELOX_CHECK_NOT_NULL(tbl);
+      buildRows += tbl->num_rows();
+    }
+    addRuntimeStat("cudfHashJoinBuildTables", RuntimeCounter(tbls.size()));
+    addRuntimeStat("cudfHashJoinBuildRows", RuntimeCounter(buildRows));
+  }
+  if (CudfConfig::getInstance().debugEnabled && !tbls.empty()) {
+    VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
+    for (auto i = 0; i < tbls.size(); i++) {
+      VLOG(1) << "Build table " << i
+              << ": number of rows: " << tbls[i]->num_rows();
+    }
   }
 
   // Construct hash_join object for join types that use hb->inner_join() or
@@ -482,7 +600,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
   // lookup state internally.
   const bool buildHashJoin = usesPrebuiltCudfHashJoin(*joinNode_);
   const bool preferDistinctHashJoin = buildHashJoin &&
-      (joinNode_->rightKeysUnique() || simpleNotEqual.has_value()) &&
+      (joinNode_->rightKeysUnique() || simpleNotEqual_.has_value()) &&
       CudfConfig::getInstance().distinctHashJoinEnabled;
   const bool preferProbeUniqueInnerJoin =
       buildHashJoin && useProbeUniqueInnerJoin(*joinNode_);

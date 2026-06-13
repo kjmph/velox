@@ -35,6 +35,8 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <optional>
+#include <utility>
 
 namespace facebook::velox::cudf_velox {
 
@@ -123,7 +125,14 @@ class CudfHashJoinBuild : public CudfOperatorBase {
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<cudf::size_type> buildKeyIndices_;
+  std::optional<std::pair<cudf::size_type, cudf::size_type>> simpleNotEqual_;
+  RowTypePtr minMaxSummaryType_;
   std::vector<CudfVectorPtr> inputs_;
+  std::vector<CudfVectorPtr> minMaxSummaryInputs_;
+  int64_t buildInputRows_{0};
+  int64_t buildInputBatches_{0};
+  int64_t minMaxInputSummaryRows_{0};
+  int64_t minMaxInputSummaryTables_{0};
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 

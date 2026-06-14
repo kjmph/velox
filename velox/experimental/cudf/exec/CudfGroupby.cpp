@@ -28,6 +28,7 @@
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
 
+#include <algorithm>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -831,7 +832,17 @@ void CudfGroupby::initialize() {
       outputType_,
       aggregationInput.constants,
       &aggregationInputChannels_);
+  partialAggregationFlushThresholdBytes_ =
+      partialAggregationFlushThresholdBytes();
   streamingEnabled_ = !hasCompanionAggregates(aggregationNode_->aggregates());
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfPartialAggregationFlushThresholdBytes",
+        RuntimeCounter(
+            partialAggregationFlushThresholdBytes_,
+            RuntimeCounter::Unit::kBytes));
+  }
 
   // Make aggregators for intermediate step when streaming is enabled.
   if (streamingEnabled_) {
@@ -1042,6 +1053,28 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
   addPendingGroupbyState(std::move(groupbyOnInput), false);
 }
 
+int64_t CudfGroupby::partialAggregationFlushThresholdBytes() const {
+  // Velox's default partial aggregation threshold is tuned for CPU hash tables.
+  // cuDF grouped state already lives on the GPU and can be much larger; using
+  // the CPU default causes high-cardinality partial aggregations to emit many
+  // mostly-duplicate states that the final aggregation must merge again.
+  constexpr int64_t kTinyExplicitThresholdBytes = 1 << 20;
+  constexpr int64_t kFallbackGpuThresholdBytes = 4LL << 30;
+  constexpr int64_t kMaxGpuThresholdBytes = 8LL << 30;
+
+  if (maxPartialAggregationMemoryUsage_ < kTinyExplicitThresholdBytes) {
+    return maxPartialAggregationMemoryUsage_;
+  }
+
+  int64_t gpuThreshold = kFallbackGpuThresholdBytes;
+  if (auto info = currentDeviceMemoryInfo(); info.has_value()) {
+    gpuThreshold = std::min<int64_t>(
+        kMaxGpuThresholdBytes, static_cast<int64_t>(info->totalBytes / 16));
+  }
+
+  return std::max(maxPartialAggregationMemoryUsage_, gpuThreshold);
+}
+
 void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -1148,7 +1181,7 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   if (isPartialOutput_ && streamingEnabled_) {
     if (bufferedResult_ &&
         bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+            partialAggregationFlushThresholdBytes_) {
       return releaseAndResetBufferedResult();
     }
     if (not noMoreInput_) {

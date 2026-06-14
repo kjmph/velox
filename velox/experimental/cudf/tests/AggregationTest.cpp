@@ -902,6 +902,41 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
+TEST_F(AggregationTest, partialAggregationUsesGpuFlushThreshold) {
+  auto vectors = {
+      makeRowVector({makeFlatVector<int32_t>(
+          100, [](auto row) { return row % 10; }, nullEvery(5))}),
+      makeRowVector({makeFlatVector<int32_t>(
+          110, [](auto row) { return row % 10; }, nullEvery(7))}),
+      makeRowVector({makeFlatVector<int32_t>(
+          90, [](auto row) { return row % 10; }, nullEvery(7))}),
+  };
+
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId aggNodeId;
+  constexpr int64_t maxPartialAggregationMemory = 2 << 20;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(
+              QueryConfig::kMaxPartialAggregationMemory,
+              maxPartialAggregationMemory)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"count(1)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .finalAggregation()
+                  .planNode())
+          .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+
+  const auto thresholdStats =
+      toPlanStats(task->taskStats())
+          .at(aggNodeId)
+          .customStats.at("cudfPartialAggregationFlushThresholdBytes");
+  EXPECT_GT(thresholdStats.max, maxPartialAggregationMemory);
+}
+
 TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(

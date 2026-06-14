@@ -173,6 +173,7 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<CudfVectorPtr>&& states,
       bool projectAggregationInputs,
       CudfVectorPtr existingState = nullptr);
+  int64_t partialAggregationFlushThresholdBytes() const;
 
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
@@ -191,6 +192,7 @@ class CudfGroupby : public CudfOperatorBase {
   // Streaming aggregation is disabled if companion aggregates are present.
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;
+  int64_t partialAggregationFlushThresholdBytes_{0};
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;

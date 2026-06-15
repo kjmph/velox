@@ -37,6 +37,7 @@ velox_add_library(
   SerializedPage.cpp
   Expand.cpp
   FilterProject.cpp
+  GroupedScalarFilter.cpp
   GroupId.cpp
   GroupingSet.cpp
   HashAggregation.cpp
@@ -142,6 +143,7 @@ velox_add_library(
   ExchangeSource.h
   Expand.h
   FilterProject.h
+  GroupedScalarFilter.h
   GroupId.h
   GroupingSet.h
   HashAggregation.h

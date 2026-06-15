@@ -206,6 +206,7 @@ PartitionedOutput::PartitionedOutput(
       keyChannels_(toChannels(planNode->inputType(), planNode->keys())),
       numDestinations_(planNode->numPartitions()),
       replicateNullsAndAny_(planNode->isReplicateNullsAndAny()),
+      replicateNulls_(planNode->isReplicateNulls()),
       partitionFunction_(
           numDestinations_ == 1 ? nullptr
                                 : planNode->partitionFunctionSpec().create(
@@ -352,11 +353,11 @@ void PartitionedOutput::addInput(RowVectorPtr input) {
     destinations_[0]->addRows(IndexRange{0, numInput});
   } else {
     auto singlePartition = partitionFunction_->partition(*input_, partitions_);
-    if (replicateNullsAndAny_) {
+    if (replicateNullsAndAny_ || replicateNulls_) {
       collectNullRows();
 
       vector_size_t start = 0;
-      if (!replicatedAny_) {
+      if (replicateNullsAndAny_ && !replicatedAny_) {
         for (auto& destination : destinations_) {
           destination->addRow(0);
         }

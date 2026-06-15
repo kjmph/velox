@@ -483,6 +483,7 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
       keyChannels_(exec::toChannels(planNode->inputType(), planNode->keys())),
       numDestinations_(planNode->numPartitions()),
       replicateNullsAndAny_(planNode->isReplicateNullsAndAny()),
+      replicateNulls_(planNode->isReplicateNulls()),
       partitionFunction_(
           numDestinations_ == 1 ? nullptr
                                 : planNode->partitionFunctionSpec().create(
@@ -639,10 +640,10 @@ void UcxCpuRowPartitionedOutput::addInput(RowVectorPtr input) {
   } else {
     const auto singlePartition =
         partitionFunction_->partition(*input_, partitions_);
-    if (replicateNullsAndAny_) {
+    if (replicateNullsAndAny_ || replicateNulls_) {
       collectNullRows();
       vector_size_t start = 0;
-      if (!replicatedAny_) {
+      if (replicateNullsAndAny_ && !replicatedAny_) {
         for (auto& destination : destinations_) {
           destination->addRow(0);
         }

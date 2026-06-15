@@ -171,6 +171,7 @@ core::PlanNodePtr PartitionedOutputReplayer::createPlanNode(
       originalNode->keys(),
       originalNode->numPartitions(),
       originalNode->isReplicateNullsAndAny(),
+      originalNode->isReplicateNulls(),
       originalNode->partitionFunctionSpecPtr(),
       originalNode->outputType(),
       serdeKind_,

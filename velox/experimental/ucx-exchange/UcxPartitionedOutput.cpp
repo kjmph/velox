@@ -25,19 +25,22 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
 
+#include <folly/ScopeGuard.h>
 #include <algorithm>
 #include <atomic>
 #include <limits>
 #include <new>
 #include <optional>
 #include <utility>
-#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
@@ -75,6 +78,39 @@ std::atomic<uint64_t>& inProcessGpuMaterializationReservationBytes() {
 
 uint64_t effectiveFreeBytes(const CudfDeviceMemoryInfo& info) {
   return addSaturated(info.freeBytes, info.poolReusableBytes);
+}
+
+std::vector<cudf::size_type> toCudfIndices(
+    const std::vector<column_index_t>& indices) {
+  std::vector<cudf::size_type> result;
+  result.reserve(indices.size());
+  for (const auto& index : indices) {
+    result.push_back(static_cast<cudf::size_type>(index));
+  }
+  return result;
+}
+
+std::unique_ptr<cudf::column> createKeyNullMask(
+    cudf::table_view tableView,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(!partitionKeyIndices.empty());
+
+  auto result =
+      cudf::is_null(tableView.column(partitionKeyIndices[0]), stream, mr);
+  for (size_t i = 1; i < partitionKeyIndices.size(); ++i) {
+    auto keyIsNull =
+        cudf::is_null(tableView.column(partitionKeyIndices[i]), stream, mr);
+    result = cudf::binary_operation(
+        result->view(),
+        keyIsNull->view(),
+        cudf::binary_operator::BITWISE_OR,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+  }
+  return result;
 }
 } // namespace
 
@@ -114,6 +150,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           fmt::format("[{}]", planNode->id())),
       queueManager_(UcxOutputQueueManager::getInstanceRef()),
       numPartitions_(planNode->numPartitions()),
+      replicateNulls_(planNode->isReplicateNulls()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
@@ -122,6 +159,12 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       initialPayloadBytes_(
           std::max<uint64_t>(ctx->queryConfig().maxOutputBufferSize(), 1)) {
   this->initPartitionKeys(planNode);
+  if (replicateNulls_) {
+    VELOX_USER_CHECK_EQ(
+        partitionKeyIndices_.size(),
+        1,
+        "UcxPartitionedOutput replicateNulls requires exactly one partition key");
+  }
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
   inNames.reserve(planNode->inputType()->size());
@@ -213,8 +256,8 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
   if (needsPartitionMaterialization) {
     const auto estimatedMaterializationBytes =
         static_cast<uint64_t>(estimatedBytes);
-    const auto producerHeadroomBytes = std::max<uint64_t>(
-        estimatedMaterializationBytes, initialPayloadBytes_);
+    const auto producerHeadroomBytes =
+        std::max<uint64_t>(estimatedMaterializationBytes, initialPayloadBytes_);
     if (const auto memoryInfo = currentDeviceMemoryInfo()) {
       const auto freeBytes = effectiveFreeBytes(*memoryInfo);
       const auto inProcessReserved =
@@ -399,8 +442,9 @@ bool UcxPartitionedOutput::shouldFlushPending() const {
 }
 
 bool UcxPartitionedOutput::shouldDrainPending() const {
-  return pendingPartitionedBatch_.has_value() || pendingInputBatch_.has_value() ||
-      shouldFlushPending() || (noMoreInput_ && !pendingInputs_.empty());
+  return pendingPartitionedBatch_.has_value() ||
+      pendingInputBatch_.has_value() || shouldFlushPending() ||
+      (noMoreInput_ && !pendingInputs_.empty());
 }
 
 bool UcxPartitionedOutput::usesHashPartitioning() const {
@@ -424,9 +468,8 @@ void UcxPartitionedOutput::initPartitionKeys(
   // indices because we're going to merge all the incoming streams together.
 
   // Get partition function specification string
-  isGatherPartition_ =
-      dynamic_cast<const core::GatherPartitionFunctionSpec*>(
-          &planNode->partitionFunctionSpec()) != nullptr;
+  isGatherPartition_ = dynamic_cast<const core::GatherPartitionFunctionSpec*>(
+                           &planNode->partitionFunctionSpec()) != nullptr;
   spec_ = planNode->partitionFunctionSpec().toString();
 
   // Only parse keys if it's a hash function
@@ -469,10 +512,31 @@ void UcxPartitionedOutput::hashPartition(
   VLOG(3) << "@" << taskId() << "#" << pipelineId_ << "/" << driverId_
           << " Hashing and partitioning into " << numPartitions_ << " chunks";
 
-  // Use cudf hash partitioning
-  std::vector<cudf::size_type> partitionKeyIndices;
-  for (const auto& idx : partitionKeyIndices_) {
-    partitionKeyIndices.push_back(static_cast<cudf::size_type>(idx));
+  auto partitionKeyIndices = toCudfIndices(partitionKeyIndices_);
+
+  std::unique_ptr<cudf::table> replicatedNullRows;
+  std::vector<cudf::size_type> nativeNullPartitionOffsets;
+  if (replicateNulls_) {
+    auto nullMask = createKeyNullMask(
+        tableView,
+        partitionKeyIndices,
+        stream,
+        cudf::get_current_device_resource_ref());
+    replicatedNullRows = cudf::apply_boolean_mask(
+        tableView,
+        nullMask->view(),
+        stream,
+        cudf::get_current_device_resource_ref());
+    if (replicatedNullRows->num_rows() > 0) {
+      auto nullPartitionResult = cudf::hash_partition(
+          replicatedNullRows->view(),
+          partitionKeyIndices,
+          numPartitions_,
+          cudf::hash_id::HASH_MURMUR3,
+          cudf::DEFAULT_HASH_SEED,
+          stream);
+      nativeNullPartitionOffsets = std::move(nullPartitionResult.second);
+    }
   }
 
   auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
@@ -482,6 +546,11 @@ void UcxPartitionedOutput::hashPartition(
       cudf::hash_id::HASH_MURMUR3,
       cudf::DEFAULT_HASH_SEED,
       stream);
+
+  if (replicatedNullRows && replicatedNullRows->num_rows() > 0) {
+    enqueueReplicatedNullRows(
+        replicatedNullRows->view(), nativeNullPartitionOffsets, stream);
+  }
 
   VELOX_CHECK_EQ(partitionOffsets.size(), numPartitions_ + 1);
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
@@ -500,6 +569,32 @@ void UcxPartitionedOutput::hashPartition(
       {},
       {},
       0});
+}
+
+void UcxPartitionedOutput::enqueueReplicatedNullRows(
+    cudf::table_view nullRows,
+    const std::vector<cudf::size_type>& nativeNullPartitionOffsets,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK_EQ(nativeNullPartitionOffsets.size(), numPartitions_ + 1);
+  auto queueManager = sharedQueueManager();
+
+  for (size_t partition = 0; partition < numPartitions_; ++partition) {
+    if (nativeNullPartitionOffsets[partition] <
+        nativeNullPartitionOffsets[partition + 1]) {
+      continue;
+    }
+
+    auto packedCols =
+        cudf::pack(nullRows, stream, cudf::get_current_device_resource_ref());
+    stream.synchronize();
+    auto packedColsPtr = std::make_unique<cudf::packed_columns>(
+        std::move(packedCols.metadata), std::move(packedCols.gpu_data));
+    queueManager->enqueue(
+        this->taskId(),
+        partition,
+        std::move(packedColsPtr),
+        nullRows.num_rows());
+  }
 }
 
 void UcxPartitionedOutput::equalPartition(
@@ -548,8 +643,7 @@ uint64_t UcxPartitionedOutput::estimatedPartitionBytes(
     return 0;
   }
 
-  const auto estimatedBytes =
-      static_cast<long double>(batch.estimatedBytes) *
+  const auto estimatedBytes = static_cast<long double>(batch.estimatedBytes) *
       static_cast<long double>(partitionRows) /
       static_cast<long double>(totalRows);
   if (estimatedBytes >=
@@ -558,9 +652,8 @@ uint64_t UcxPartitionedOutput::estimatedPartitionBytes(
   }
 
   const auto wholeBytes = static_cast<uint64_t>(estimatedBytes);
-  return estimatedBytes > static_cast<long double>(wholeBytes)
-      ? wholeBytes + 1
-      : wholeBytes;
+  return estimatedBytes > static_cast<long double>(wholeBytes) ? wholeBytes + 1
+                                                               : wholeBytes;
 }
 
 uint64_t UcxPartitionedOutput::exactPartitionBytes(
@@ -1189,11 +1282,10 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
           batch.drainDeficits[partition] = 0;
           if (queueManager->waitForFullTransferCapacity(
                   this->taskId(),
-                  static_cast<int64_t>(
-                      std::min<uint64_t>(
-                          std::max<uint64_t>(waitBytes, 1),
-                          static_cast<uint64_t>(
-                              std::numeric_limits<int64_t>::max()))),
+                  static_cast<int64_t>(std::min<uint64_t>(
+                      std::max<uint64_t>(waitBytes, 1),
+                      static_cast<uint64_t>(
+                          std::numeric_limits<int64_t>::max()))),
                   &future_)) {
             blockingReason_ = exec::BlockingReason::kWaitForConsumer;
           }
@@ -1208,8 +1300,8 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
                 static_cast<long double>(currentRows) *
                 static_cast<long double>(transferWindow) /
                 static_cast<long double>(exactBytes));
-            adjustedRows = std::clamp<cudf::size_type>(
-                adjustedRows, 1, currentRows - 1);
+            adjustedRows =
+                std::clamp<cudf::size_type>(adjustedRows, 1, currentRows - 1);
             chunkEnd = chunkStart + adjustedRows;
             exactBytes = exactPartitionBytes(batch, chunkStart, chunkEnd);
           }
@@ -1225,8 +1317,7 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
         transferReservationBytes =
             std::min<uint64_t>(transferReservationBytes, maxReservation);
-        reservationLimit =
-            std::min<uint64_t>(reservationLimit, maxReservation);
+        reservationLimit = std::min<uint64_t>(reservationLimit, maxReservation);
 
         if (queueManager->reserveTransferBytes(
                 this->taskId(),

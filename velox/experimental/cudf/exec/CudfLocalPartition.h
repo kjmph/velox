@@ -71,7 +71,8 @@ class CudfLocalPartition : public CudfOperatorBase {
  protected:
   const std::vector<std::shared_ptr<exec::LocalExchangeQueue>> queues_;
   const size_t numPartitions_;
-  PartitionFunctionType partitionFunctionType_;
+  PartitionFunctionType partitionFunctionType_{PartitionFunctionType::kHash};
+  const bool replicateNulls_;
   size_t counter_{0};
 
   std::vector<exec::BlockingReason> blockingReasons_;

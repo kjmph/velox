@@ -175,6 +175,7 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   const std::vector<column_index_t> keyChannels_;
   const int numDestinations_;
   const bool replicateNullsAndAny_;
+  const bool replicateNulls_;
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
   const std::vector<column_index_t> outputChannels_;
   const std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;

@@ -231,6 +231,7 @@ class PartitionedOutput : public Operator {
   const std::vector<column_index_t> keyChannels_;
   const int numDestinations_;
   const bool replicateNullsAndAny_;
+  const bool replicateNulls_;
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
   // Empty if column order in the output is exactly the same as in input.
   const std::vector<column_index_t> outputChannels_;

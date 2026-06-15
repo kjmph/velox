@@ -256,9 +256,13 @@ class LocalPartition : public Operator {
       const std::vector<BufferPtr>& indexBuffers,
       const std::vector<vector_size_t*>& rawIndicesBuffers);
 
+  bool hasNullPartitionKey(const RowVectorPtr& input, vector_size_t row) const;
+
   const std::vector<std::shared_ptr<LocalExchangeQueue>> queues_;
   const size_t numPartitions_;
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
+  const bool replicateNulls_;
+  std::vector<column_index_t> nullKeyChannels_;
 
   std::vector<BlockingReason> blockingReasons_;
   std::vector<ContinueFuture> futures_;

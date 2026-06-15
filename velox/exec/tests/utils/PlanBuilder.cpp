@@ -1498,6 +1498,7 @@ PlanBuilder& PlanBuilder::partitionedOutput(
       exprs(keys, planNode_->outputType()),
       numPartitions,
       replicateNullsAndAny,
+      false,
       std::move(partitionFunctionSpec),
       outputType,
       serdeKind,

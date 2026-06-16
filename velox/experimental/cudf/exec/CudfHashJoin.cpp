@@ -56,6 +56,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <array>
 #include <functional>
 
 namespace facebook::velox::cudf_velox {
@@ -514,13 +515,22 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
 
     if (simpleNotEqual_.has_value()) {
       VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
+      const auto stream = cudfInput->stream();
       auto summary = buildMinMaxSummaryTable(
           cudfInput->getTableView(),
           buildKeyIndices_,
           simpleNotEqual_->second,
-          cudfInput->stream(),
+          stream,
           get_output_mr());
       const auto summaryRows = summary->num_rows();
+      std::array<CudfVectorPtr, 1> inputVectors{cudfInput};
+      std::array<rmm::cuda_stream_view, 1> inputStreams{stream};
+      orderCudfVectorDeallocationsAfterStream(
+          std::span<const CudfVectorPtr>(
+              inputVectors.data(), inputVectors.size()),
+          std::span<const rmm::cuda_stream_view>(
+              inputStreams.data(), inputStreams.size()),
+          stream);
       if (summaryRows > 0) {
         minMaxInputSummaryRows_ += static_cast<int64_t>(summaryRows);
         ++minMaxInputSummaryTables_;
@@ -529,7 +539,7 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
             minMaxSummaryType_,
             static_cast<vector_size_t>(summaryRows),
             std::move(summary),
-            cudfInput->stream()));
+            stream));
       }
       return;
     }

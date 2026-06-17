@@ -54,10 +54,13 @@ class UcxPartitionedOutput : public exec::Operator,
   /// a non-blocked state, otherwise blocked.
   RowVectorPtr getOutput() override;
 
+  void close() override;
+
   /// The caller checks isBlocked before adding input, so this only needs to
   /// report whether the operator can still accept rows once unblocked.
   bool needsInput() const override {
-    return !finished_ && !noMoreInput_ && !shouldDrainPending() &&
+    return !isTaskCancelled() && !finished_ && !noMoreInput_ &&
+        !shouldDrainPending() &&
         blockingReason_ == exec::BlockingReason::kNotBlocked;
   }
 
@@ -168,6 +171,12 @@ class UcxPartitionedOutput : public exec::Operator,
       const std::shared_ptr<UcxOutputQueueManager>& queueManager) const;
 
   void recordAllocationPressure(uint64_t waitBytes);
+
+  bool isTaskCancelled() const;
+
+  bool maybeFinishCancelled();
+
+  void clearPending();
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;

@@ -99,11 +99,9 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
   auto scalarRows =
       cudf::apply_boolean_mask(tableView, scalarMask->view(), stream, get_temp_mr());
   if (scalarRows->num_rows() == 0) {
-    addRuntimeStat("groupedScalarFilterScalarFound", RuntimeCounter(0));
     finished_ = true;
     return nullptr;
   }
-  addRuntimeStat("groupedScalarFilterScalarFound", RuntimeCounter(1));
 
   auto scalarOneRow = cudf::slice(scalarRows->view(), {0, 1}, stream);
   VELOX_CHECK(scalarOneRow.size() == 1);
@@ -126,11 +124,6 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
       filterEvaluator_->eval(augmentedViews, stream, get_temp_mr(), true);
   auto filteredTable = cudf::apply_boolean_mask(
       tableView, asView(filterColumn), stream, get_output_mr());
-
-  addRuntimeStat("groupedScalarFilterInputRows", RuntimeCounter(inputRows));
-  addRuntimeStat(
-      "groupedScalarFilterOutputRows",
-      RuntimeCounter(filteredTable->num_rows()));
 
   finished_ = true;
   if (filteredTable->num_rows() == 0) {

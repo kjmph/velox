@@ -835,14 +835,6 @@ void CudfGroupby::initialize() {
   partialAggregationFlushThresholdBytes_ =
       partialAggregationFlushThresholdBytes();
   streamingEnabled_ = !hasCompanionAggregates(aggregationNode_->aggregates());
-  {
-    auto lockedStats = stats_.wlock();
-    lockedStats->addRuntimeStat(
-        "cudfPartialAggregationFlushThresholdBytes",
-        RuntimeCounter(
-            partialAggregationFlushThresholdBytes_,
-            RuntimeCounter::Unit::kBytes));
-  }
 
   // Make aggregators for intermediate step when streaming is enabled.
   if (streamingEnabled_) {

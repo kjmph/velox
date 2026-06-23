@@ -129,10 +129,6 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   RowTypePtr minMaxSummaryType_;
   std::vector<CudfVectorPtr> inputs_;
   std::vector<CudfVectorPtr> minMaxSummaryInputs_;
-  int64_t buildInputRows_{0};
-  int64_t buildInputBatches_{0};
-  int64_t minMaxInputSummaryRows_{0};
-  int64_t minMaxInputSummaryTables_{0};
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
 

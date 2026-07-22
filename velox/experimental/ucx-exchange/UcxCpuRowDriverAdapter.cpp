@@ -102,13 +102,15 @@ const CpuUcxConfig& cpuUcxConfig() {
   return instance;
 }
 
-// Communicator is a singleton; the adapter lazy-starts it on first driver that
-// opts in. Once running, it stays up for the process lifetime. Detach only
+// Communicator is a singleton. Prestissimo starts it eagerly before announcing
+// the worker, while the adapter retains lazy startup as a fallback for other
+// embedders. Once running, it stays up for the process lifetime. Detach only
 // releases std::thread ownership; it does not stop the Communicator. A graceful
 // service shutdown still needs to call Communicator::stop(). If that does not
 // happen, process exit tears down the detached thread with the rest of the
 // worker.
 std::once_flag communicatorStartedFlag;
+std::atomic<bool> communicatorReady{false};
 
 // Per-(taskId, pipelineId) shared UcxCpuRowExchangeClient. All drivers
 // in the same pipeline of the same task share one client so that splits
@@ -254,6 +256,8 @@ void ensureCommunicatorStarted() {
     if (readyFuture.valid()) {
       std::move(readyFuture).wait();
     }
+    communicatorReady.store(true, std::memory_order_release);
+    LOG(INFO) << "[CPU-UCX] Communicator ready on port " << cfg.port;
   });
 }
 
@@ -399,6 +403,22 @@ void registerCpuUcxDriverAdapter() {
             mergeExchange, taskId, destination);
       });
   LOG(INFO) << "[CPU-UCX] DriverAdapter registered";
+}
+
+bool cpuUcxExchangeEnabled() {
+  return cpuUcxConfig().enabled;
+}
+
+bool startCpuUcxExchange() {
+  if (!cpuUcxConfig().enabled) {
+    return false;
+  }
+
+  // Registration normally happens from cpuUcxAutoRegister() before main(),
+  // but keep the explicit startup API independently safe and idempotent.
+  registerCpuUcxDriverAdapter();
+  ensureCommunicatorStarted();
+  return communicatorReady.load(std::memory_order_acquire);
 }
 
 // __attribute__((constructor)) puts this function pointer in

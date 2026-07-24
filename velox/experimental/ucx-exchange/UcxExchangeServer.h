@@ -150,9 +150,6 @@ class UcxExchangeServer
   /// its fast-completion path, firing the sendComplete() callback on the same
   /// thread while the lock is still held.
   std::recursive_mutex dataMutex_;
-  /// Excludes process() from close() and serializes callback event dispatch.
-  /// Recursive because process() reaches close() in the Done state.
-  std::recursive_mutex processMutex_;
   /// True while the communicator thread is inside process(). Inline UCXX
   /// callbacks defer emergency close until the active send call has returned
   /// and published its Request member.

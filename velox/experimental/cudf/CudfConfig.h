@@ -56,6 +56,18 @@ struct CudfConfig {
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
       "cudf.streaming_groupby_capacity_multiplier"};
+  static constexpr const char* kCudfExchange{"cudf.exchange"};
+  static constexpr const char* kCudfExchangeServerPort{
+      "cudf.exchange.server.port"};
+  static constexpr const char* kCudfIntraNodeExchange{
+      "cudf.intra_node_exchange"};
+  static constexpr const char* kCudfPartitionedOutputBatchRows{
+      "cudf.partitioned_output_batch_rows"};
+  static constexpr const char* kCudfExchangeLogLevel{"cudf.exchange_log_level"};
+  static constexpr const char* kCudfUcxxBlockingPolling{
+      "cudf.ucxx_blocking_polling"};
+  static constexpr const char* kCudfUcxxErrorHandling{
+      "cudf.ucxx_error_handling"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -196,6 +208,13 @@ struct CudfConfig {
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.
   std::optional<int32_t> batchSizeMaxThreshold;
+
+  /// Port used by the cuDF UCX communicator.
+  int32_t exchangeServerPort{30050};
+
+  /// Backward-compatible research spelling of ucxxBlockingProgress.
+  bool ucxxBlockingPolling{false};
+
   // Query config key for the TopN batch size in the cuDF TopN operator.
   int32_t topNBatchSize{5};
 

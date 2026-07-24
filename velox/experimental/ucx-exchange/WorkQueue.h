@@ -51,9 +51,12 @@ class WorkQueue {
   bool erase(std::shared_ptr<T> item) {
     bool erased = false;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = std::find(queue_.begin(), queue_.end(), item);
-    if (it != queue_.end()) {
-      queue_.erase(it);
+    for (auto it = queue_.begin(); it != queue_.end();) {
+      if (*it != item) {
+        ++it;
+        continue;
+      }
+      it = queue_.erase(it);
       erased = true;
     }
     return erased;

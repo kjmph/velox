@@ -440,6 +440,15 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
       vector_size_t numRows,
       std::vector<UcxDataAvailable>& dataAvailableCbs);
 
+  // Publishes one arbitrary page to a waiting destination, or retains it in
+  // the demand-driven shared pool. Logical row counts travel with each page.
+  void enqueueArbitraryOutputLocked(
+      std::shared_ptr<cudf::packed_columns> data,
+      vector_size_t numRows,
+      std::vector<UcxDataAvailable>& dataAvailableCbs);
+
+  void clearArbitraryBufferLocked(std::vector<ContinuePromise>& promises);
+
   /// Releases the extra retained reference used to backfill future broadcast
   /// destinations and wakes producers if it was their limiting retention.
   void clearBroadcastHistoryLocked(std::vector<ContinuePromise>& promises);
@@ -466,6 +475,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   // these GPU buffers remain resident for late broadcast destinations.
   int64_t broadcastHistoryBytes_{0};
   int64_t broadcastHistoryPackedColumns_{0};
+
+  std::deque<std::pair<std::shared_ptr<cudf::packed_columns>, vector_size_t>>
+      arbitraryBuffer_;
+  size_t nextArbitraryLoadIndex_{0};
 
   /// If retained queued and in-flight bytes reach 'maxSize_', each producer is
   /// blocked after adding data.

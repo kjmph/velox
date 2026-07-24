@@ -40,7 +40,14 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
-      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"}};
+      {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"},
+      {CudfConfig::kCudfExchange, "true"},
+      {CudfConfig::kCudfExchangeServerPort, "12345"},
+      {CudfConfig::kCudfIntraNodeExchange, "false"},
+      {CudfConfig::kCudfPartitionedOutputBatchRows, "123456"},
+      {CudfConfig::kCudfExchangeLogLevel, "7"},
+      {CudfConfig::kCudfUcxxBlockingPolling, "true"},
+      {CudfConfig::kCudfUcxxErrorHandling, "false"}};
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
@@ -56,6 +63,13 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
   ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
+  ASSERT_EQ(config.exchange, true);
+  ASSERT_EQ(config.exchangeServerPort, 12345);
+  ASSERT_EQ(config.intraNodeExchange, false);
+  ASSERT_EQ(config.partitionedOutputBatchRows, 123456);
+  ASSERT_EQ(config.exchangeLogLevel, 7);
+  ASSERT_EQ(config.ucxxBlockingPolling, true);
+  ASSERT_EQ(config.ucxxErrorHandling, false);
 }
 
 TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {

@@ -163,6 +163,11 @@ option(
   OFF
 )
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
+option(
+  VELOX_ENABLE_UCX_EXCHANGE
+  "Build the experimental UCX exchange library. Requires UCX development libraries."
+  OFF
+)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
@@ -551,6 +556,7 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
     set(VELOX_ENABLE_ARROW ON)
     velox_set_source(cudf)
     velox_resolve_dependency(cudf)
+    add_compile_definitions(VELOX_ENABLE_CUDF)
     if(TARGET aws-cpp-sdk-core)
       # Fix for AWS SDK CPP using hardcoded system curl instead of soft link to curl
       get_target_property(override_curl_lib aws-cpp-sdk-core INTERFACE_LINK_LIBRARIES)
@@ -562,6 +568,15 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
       )
     endif()
   endif()
+endif()
+
+if(VELOX_ENABLE_UCX_EXCHANGE AND NOT TARGET ucxx::ucxx)
+  velox_set_source(ucxx)
+  velox_resolve_dependency(ucxx)
+endif()
+
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  add_compile_definitions(VELOX_ENABLE_UCX_EXCHANGE)
 endif()
 
 # Set after the test of the CUDA compiler. Otherwise, the test fails with

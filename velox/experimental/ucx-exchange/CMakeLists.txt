@@ -12,24 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 set(
-  UCX_EXCHANGE_SOURCES
+  UCX_EXCHANGE_CORE_SOURCES
+  Acceptor.cpp
   CommElement.cpp
+  Communicator.cpp
+  EndpointRef.cpp
+  NetUtil.cpp
+  UcxExchangeProtocol.cpp
+  UcxCpuRowMetadataMsg.cpp
+  UcxCpuRowQueues.cpp
+  UcxCpuRowOutputQueueManager.cpp
+  UcxCpuRowExchangeServer.cpp
+  UcxCpuRowExchangeQueue.cpp
+  UcxCpuRowExchangeSource.cpp
+  UcxCpuRowExchangeClient.cpp
+  UcxCpuRowAcceptor.cpp
+  UcxCpuRowPartitionedOutput.cpp
+  UcxCpuRowExchange.cpp
+  UcxCpuRowDriverAdapter.cpp
+)
+
+set(
+  UCX_EXCHANGE_CUDF_SOURCES
+  UcxCudfDriverAdapter.cpp
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp
   UcxQueues.cpp
   UcxExchange.cpp
-  UcxExchangeProtocol.cpp
   UcxExchangeSource.cpp
   UcxExchangeServer.cpp
   UcxExchangeQueue.cpp
   UcxExchangeClient.cpp
   UcxExchangeRegistration.cpp
-  Communicator.cpp
-  Acceptor.cpp
-  EndpointRef.cpp
-  NetUtil.cpp
   IntraNodeTransferRegistry.cpp
 )
+
+if(VELOX_ENABLE_CUDF)
+  set(
+    UCX_EXCHANGE_SOURCES
+    ${UCX_EXCHANGE_CORE_SOURCES}
+    ${UCX_EXCHANGE_CUDF_SOURCES}
+  )
+else()
+  set(UCX_EXCHANGE_SOURCES ${UCX_EXCHANGE_CORE_SOURCES})
+endif()
 
 # Generate a header containing the module basenames (without .cpp extension)
 # for use by Communicator to set per-file VLOG levels.
@@ -51,12 +77,27 @@ target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR
 
 find_package(ucx REQUIRED)
 
-target_link_libraries(
-  velox_ucx_exchange
-  PUBLIC ucxx::ucxx ucx::ucp nvtx3::nvtx3-cpp
-  PRIVATE cudf::cudf CUDA::cudart CUDA::cuda_driver Folly::folly velox_core ucx::ucs
-)
+if(VELOX_ENABLE_CUDF)
+  target_link_libraries(
+    velox_ucx_exchange
+    PUBLIC ucxx::ucxx ucx::ucp nvtx3::nvtx3-cpp
+    PRIVATE
+      cudf::cudf
+      CUDA::cudart
+      CUDA::cuda_driver
+      Folly::folly
+      nvtx3::nvtx3-cpp
+      velox_core
+      ucx::ucs
+  )
+else()
+  target_link_libraries(
+    velox_ucx_exchange
+    PUBLIC ucxx::ucxx ucx::ucp
+    PRIVATE Folly::folly velox_core ucx::ucs
+  )
+endif()
 
-if(VELOX_BUILD_TESTING)
+if(VELOX_BUILD_TESTING AND VELOX_ENABLE_CUDF)
   add_subdirectory(tests)
 endif()

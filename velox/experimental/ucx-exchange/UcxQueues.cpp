@@ -477,6 +477,13 @@ void UcxOutputQueue::enqueue(
       totalPackedColumnsSent_ =
           checkedAdd(totalPackedColumnsSent_, 1, "totalPackedColumnsSent");
       success = true;
+    } else if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      VELOX_CHECK_EQ(transferReservationBytes, 0);
+      VELOX_CHECK_EQ(destination, 0, "Arbitrary output uses destination 0");
+      enqueueArbitraryOutputLocked(
+          std::move(sharedData), numRows, dataAvailableCallbacks);
+      updateStatsWithEnqueuedLocked(numBytes, numRows);
+      success = true;
     } else {
       VELOX_CHECK_GE(destination, 0);
       VELOX_CHECK_LT(destination, queues_.size());
@@ -834,6 +841,13 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
     // queue can be nullptr here if the task has terminated and results
     // have been removed. In this case, no data is returned.
     if (queue) {
+      if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary &&
+          !arbitraryBuffer_.empty()) {
+        // Keep the shared owner until the destination's enqueue commits.
+        const auto& [payload, numRows] = arbitraryBuffer_.front();
+        queue->enqueueBack(payload, numRows);
+        arbitraryBuffer_.pop_front();
+      }
       // Capture weak_ptr instead of raw `this` to prevent use-after-free.
       // The callback fires outside the lock (from enqueue() or terminate()),
       // and concurrent removeTask() can destroy the UcxOutputQueue while
@@ -895,6 +909,7 @@ void UcxOutputQueue::noMoreDrivers() {
 
 void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
   std::vector<UcxDataAvailable> finished;
+  std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (oneDriverFinished) {
@@ -918,12 +933,38 @@ void UcxOutputQueue::checkIfDone(bool oneDriverFinished) {
               << " avgRowsPerChunk=" << avgRows
               << " totalBytes=" << totalBytesSent_;
     }
+    if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      // Assign the remaining shared pages before publishing EOS. Existing
+      // destination accounting takes ownership without charging global bytes
+      // twice; each page is still sent to exactly one destination.
+      size_t emptyDestinations = 0;
+      while (!arbitraryBuffer_.empty() && !queues_.empty()) {
+        nextArbitraryLoadIndex_ %= queues_.size();
+        auto* queue = queues_[nextArbitraryLoadIndex_].get();
+        nextArbitraryLoadIndex_ =
+            (nextArbitraryLoadIndex_ + 1) % queues_.size();
+        if (queue) {
+          const auto& [payload, numRows] = arbitraryBuffer_.front();
+          queue->enqueueBack(payload, numRows);
+          arbitraryBuffer_.pop_front();
+          emptyDestinations = 0;
+        } else if (++emptyDestinations >= queues_.size()) {
+          break;
+        }
+      }
+      if (activeDestinationCountLocked() == 0) {
+        clearArbitraryBufferLocked(promises);
+      }
+    }
     for (auto& queue : queues_) {
       if (queue != nullptr) {
         queue->enqueueBack(nullptr, /*numRows=*/0);
         finished.push_back(queue->getAndClearNotify());
       }
     }
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
   }
   // Notify outside of mutex.
   for (auto& notification : finished) {
@@ -1078,6 +1119,43 @@ void UcxOutputQueue::enqueueBroadcastOutputLocked(
   }
 }
 
+void UcxOutputQueue::enqueueArbitraryOutputLocked(
+    std::shared_ptr<cudf::packed_columns> data,
+    vector_size_t numRows,
+    std::vector<UcxDataAvailable>& callbacks) {
+  VELOX_DCHECK(callbacks.empty());
+  // Waiting destinations cannot coexist with older shared pages: getData()
+  // consumes a shared page before installing a waiter. Select a waiter in
+  // round-robin order to prevent a fast destination monopolizing arrivals.
+  for (size_t visited = 0; visited < queues_.size(); ++visited) {
+    const auto destination =
+        (nextArbitraryLoadIndex_ + visited) % queues_.size();
+    auto* queue = queues_[destination].get();
+    if (queue && queue->waitingForData()) {
+      VELOX_CHECK(arbitraryBuffer_.empty());
+      queue->enqueueBack(data, numRows);
+      callbacks.emplace_back(queue->getAndClearNotify());
+      nextArbitraryLoadIndex_ = (destination + 1) % queues_.size();
+      return;
+    }
+  }
+  arbitraryBuffer_.emplace_back(std::move(data), numRows);
+}
+
+void UcxOutputQueue::clearArbitraryBufferLocked(
+    std::vector<ContinuePromise>& promises) {
+  int64_t bytes = 0;
+  for (const auto& [data, numRows] : arbitraryBuffer_) {
+    bytes = checkedAdd(
+        bytes, checkedBytes(data->gpu_data->size()), "arbitrary queued bytes");
+  }
+  const auto pages = static_cast<int64_t>(arbitraryBuffer_.size());
+  arbitraryBuffer_.clear();
+  if (pages > 0) {
+    updateStatsWithFreedLocked(bytes, pages, promises);
+  }
+}
+
 void UcxOutputQueue::clearBroadcastHistoryLocked(
     std::vector<ContinuePromise>& promises) {
   if (dataToBroadcast_.empty()) {
@@ -1136,7 +1214,7 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       return;
     }
 
-    VELOX_CHECK_EQ(kind_, Kind::kBroadcast);
+    VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
     if (static_cast<size_t>(numBuffers) > queues_.size()) {
       addOutputBuffersLocked(numBuffers);
     }
@@ -1184,6 +1262,9 @@ void UcxOutputQueue::deleteResults(int destination) {
     queue->finish();
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
+    if (isFinished && kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      clearArbitraryBufferLocked(promises);
+    }
     // update UcxOutputQueue stats
     updateStatsWithFreedLocked(bytes, packedCols, promises);
     transferReservedBytes_[destination] = 0;
@@ -1226,6 +1307,7 @@ void UcxOutputQueue::terminate() {
     }
     terminated_ = true;
     clearBroadcastHistoryLocked(promises);
+    clearArbitraryBufferLocked(promises);
     // Fire all pending getData callbacks with nullptr to signal end-of-stream.
     // This handles the case where a producer task fails or is cancelled before
     // noMoreData() is called, preventing consumers from being orphaned.

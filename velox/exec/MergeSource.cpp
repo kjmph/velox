@@ -17,6 +17,8 @@
 #include "velox/exec/MergeSource.h"
 
 #include <boost/circular_buffer.hpp>
+#include <mutex>
+#include <unordered_map>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Merge.h"
 #include "velox/vector/VectorStream.h"
@@ -25,6 +27,19 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
+
+std::mutex& mergeExchangeSourceFactoryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+using MergeExchangeSourceFactories =
+    std::unordered_map<std::string, MergeSource::MergeExchangeSourceFactory>;
+
+MergeExchangeSourceFactories& mergeExchangeSourceFactories() {
+  static MergeExchangeSourceFactories factories;
+  return factories;
+}
 
 namespace {
 class ScopedPromiseNotification {
@@ -327,9 +342,50 @@ std::shared_ptr<MergeSource> MergeSource::createMergeExchangeSource(
     int destination,
     int64_t maxQueuedBytes,
     memory::MemoryPool* pool,
-    folly::Executor* executor) {
-  return std::make_shared<MergeExchangeSource>(
-      mergeExchange, taskId, destination, maxQueuedBytes, pool, executor);
+    folly::Executor* executor,
+    std::string_view transportKind) {
+  if (transportKind == core::TransportKind::kInMemory) {
+    return std::make_shared<MergeExchangeSource>(
+        mergeExchange, taskId, destination, maxQueuedBytes, pool, executor);
+  }
+
+  MergeExchangeSourceFactory factory;
+  {
+    std::lock_guard<std::mutex> lock(mergeExchangeSourceFactoryMutex());
+    const auto it =
+        mergeExchangeSourceFactories().find(std::string{transportKind});
+    VELOX_CHECK(
+        it != mergeExchangeSourceFactories().end(),
+        "No merge exchange source registered for transport '{}'",
+        transportKind);
+    factory = it->second;
+  }
+
+  auto source = factory(mergeExchange, taskId, destination);
+  VELOX_CHECK_NOT_NULL(
+      source,
+      "Merge exchange source factory for transport '{}' returned null",
+      transportKind);
+  return source;
+}
+
+void MergeSource::registerMergeExchangeSourceFactory(
+    std::string transportKind,
+    MergeExchangeSourceFactory factory) {
+  VELOX_CHECK(!transportKind.empty(), "Transport kind must not be empty");
+  VELOX_CHECK(
+      transportKind != core::TransportKind::kInMemory,
+      "The built-in in-memory merge exchange source cannot be replaced");
+  VELOX_CHECK(factory != nullptr, "Merge exchange source factory is null");
+
+  std::lock_guard<std::mutex> lock(mergeExchangeSourceFactoryMutex());
+  const bool inserted = mergeExchangeSourceFactories()
+                            .emplace(transportKind, std::move(factory))
+                            .second;
+  VELOX_CHECK(
+      inserted,
+      "Merge exchange source transport '{}' is already registered",
+      transportKind);
 }
 
 BlockingReason MergeJoinSource::next(

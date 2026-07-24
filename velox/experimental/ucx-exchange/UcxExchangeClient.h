@@ -23,20 +23,16 @@
 
 namespace facebook::velox::ucx_exchange {
 
-/// Handle for a set of producers reached over UCX, buffering the
-/// cudf::packed_columns they push in a UcxExchangeQueue. This may be shared by
-/// multiple UcxExchange operators, one per consumer thread.
-///
-/// This is the client of the UCX transport (core::TransportKind::kUcx). Its
-/// data plane -- next() and queue() -- is deliberately not part of the
-/// exec::ExchangeClient interface: the payloads are GPU buffers rather than
-/// serialized pages. The UcxExchange operator is registered together with this
-/// client in exec::ExchangeTransportRegistry, so it always knows the concrete
-/// client type and reaches the data plane directly.
-class UcxExchangeClient : public exec::ExchangeClient {
+// Handle for a set of producers. This may be shared by multiple UcxExchanges,
+// one per consumer thread.
+class UcxExchangeClient
+    : public exec::ExchangeClient,
+      public std::enable_shared_from_this<UcxExchangeClient> {
  public:
-  /// Flow control limit on the number of elements buffered in the queue.
+  // used for some primitive type of flow control, limits the size of elements
+  // in the UcxExchangeQueue
   static constexpr int32_t kDefaultMaxQueuedColumns = 32;
+  static constexpr std::chrono::milliseconds kRequestDataMaxWait{100};
 
   /// @param taskId Id of the consuming task, for logging.
   /// @param destination Partition the consuming task reads. Only validated:
@@ -55,25 +51,22 @@ class UcxExchangeClient : public exec::ExchangeClient {
 
   ~UcxExchangeClient() override;
 
-  /// Creates a UCX exchange source and starts fetching data from the upstream
-  /// task identified by 'remoteTaskId'. If close() has been called already,
-  /// creates an exchange source and immediately closes it to notify the
-  /// upstream task that its data is no longer needed. Repeated calls with the
-  /// same 'remoteTaskId' are ignored.
+  // Creates a UCX exchange source and starts fetching data from the specified
+  // upstream task. If 'close' has been called already, creates an exchange
+  // source and immediately closes it to notify the upstream task that data is
+  // no longer needed. Repeated calls with the same 'taskId' are ignored.
   void addRemoteTaskId(std::string_view remoteTaskId) override;
 
   void noMoreRemoteTasks() override;
 
+  // Closes all exchange sources.
   void close() override;
 
+  // Returns runtime statistics aggregated across all of the exchange sources.
+  // ExchangeClient is expected to report background CPU time by including a
+  // runtime metric named Operator::kBackgroundCpuTimeNanos.
   folly::F14FastMap<std::string, RuntimeMetric> stats() const override;
 
-  std::string toString() const override;
-
-  folly::dynamic toJson() const override;
-
-  /// Returns the queue the received packed tables are buffered in. Part of the
-  /// UCX data plane, used by the UcxExchange operator and by UcxExchangeSource.
   const std::shared_ptr<UcxExchangeQueue>& queue() const {
     return queue_;
   }
@@ -83,6 +76,7 @@ class UcxExchangeClient : public exec::ExchangeClient {
   /// If no data is available returns a nullptr and sets 'atEnd' to true if no
   /// more data is expected. If data is still expected, sets 'atEnd' to false
   /// and sets 'future' to a Future that will complete when data arrives.
+  ///
   PackedTableWithStreamPtr
   next(int consumerId, bool* atEnd, ContinueFuture* future);
 
@@ -94,6 +88,10 @@ class UcxExchangeClient : public exec::ExchangeClient {
   /// GPU data is not safe to release (for example, stream synchronization
   /// failed). Safe to call from a CudfVector release callback.
   void failReceive(std::string_view error) noexcept;
+
+  std::string toString() const override;
+
+  folly::dynamic toJson() const override;
 
   bool tracksInFlightReceiveBytes() const {
     return queue_->tracksInFlightReceiveBytes();
@@ -112,6 +110,7 @@ class UcxExchangeClient : public exec::ExchangeClient {
  private:
   // Handy for ad-hoc logging.
   const std::string taskId_;
+  const int destination_;
   const int32_t maxQueuedColumns_;
   const std::chrono::seconds requestDataSizesMaxWaitSec_;
 
@@ -119,8 +118,10 @@ class UcxExchangeClient : public exec::ExchangeClient {
 
   std::unordered_set<std::string> remoteTaskIds_;
   std::vector<std::shared_ptr<UcxExchangeSource>> sources_;
-  // Guarded by queue_->mutex().
   bool closed_{false};
+
+  // Total number of packed_clumns in flight.
+  int64_t totalPendingColumns_{0};
 
   // Diagnostic counters for progress and flow control.
   int64_t totalDequeued_{0};

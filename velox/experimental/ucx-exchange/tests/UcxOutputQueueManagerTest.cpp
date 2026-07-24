@@ -1297,3 +1297,57 @@ TEST_F(UcxOutputQueueManagerTest, broadcastInFlightIsRetained) {
   task->requestAbort().wait();
   queueManager_->removeTask(taskId);
 }
+
+TEST_F(UcxOutputQueueManagerTest, arbitraryPreservesRowsAndTransferAccounting) {
+  const std::string taskId = "adaptive.transport.arbitrary";
+  auto task = initializeTask(
+      taskId, 2, 1, true, core::PartitionedOutputNode::Kind::kArbitrary);
+  std::vector<vector_size_t> received;
+  auto receive = [&](int destination) {
+    queueManager_->getDataWithQueue(
+        taskId,
+        destination,
+        [&, destination](
+            std::shared_ptr<UcxOutputQueue> queue,
+            std::shared_ptr<cudf::packed_columns> data,
+            vector_size_t rows,
+            std::vector<int64_t>) {
+          ASSERT_NE(data, nullptr);
+          received.push_back(rows);
+          queue->releaseInFlightBytes(
+              destination, static_cast<int64_t>(data->gpu_data->size()), 1);
+        });
+  };
+  // A waiting destination receives the first page. The next page is retained
+  // once in the shared pool and can be claimed by either destination.
+  receive(1);
+  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 17);
+  EXPECT_EQ(received, std::vector<vector_size_t>{17});
+  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 23);
+  EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 1);
+  receive(0);
+  EXPECT_EQ(received, (std::vector<vector_size_t>{17, 23}));
+  EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 0);
+  noMoreData(taskId);
+  fetchEndMarker(taskId, 0);
+  fetchEndMarker(taskId, 1);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, arbitraryDrainsSharedPagesBeforeEnd) {
+  const std::string taskId = "adaptive.transport.arbitrary.end";
+  auto task = initializeTask(
+      taskId, 2, 1, true, core::PartitionedOutputNode::Kind::kArbitrary);
+  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 11);
+  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 19);
+  EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 2);
+  noMoreData(taskId);
+  fetch(taskId, 0);
+  fetch(taskId, 1);
+  EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 0);
+  fetchEndMarker(taskId, 0);
+  fetchEndMarker(taskId, 1);
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}

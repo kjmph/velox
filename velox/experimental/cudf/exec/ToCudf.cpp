@@ -111,8 +111,8 @@ bool CompileState::compile(bool allowCpuFallback) {
           static_cast<OperatorAdapter::Properties&>(props) =
               adapter->properties(op, props.planNode, ctx);
         }
-        if (isAnyOf<CudfOperator>(op)) {
-          // CudfOperator is always fully GPU compatible
+        if (isAnyOf<CudfOperator, CudfOperatorBase>(op)) {
+          // cuDF operators are always fully GPU compatible
           // (runs on GPU, accepts GPU input, produces GPU output).
           props.canRunOnGPU = true;
           props.acceptsGpuInput = true;
@@ -239,8 +239,8 @@ bool CompileState::compile(bool allowCpuFallback) {
         isPureCpuOperator = false;
       }
     } else {
-      // special case for CudfOperator
-      if (isAnyOf<CudfOperator>(oper)) {
+      // Special case for cuDF operators inserted by an earlier adapter pass.
+      if (isAnyOf<CudfOperator, CudfOperatorBase>(oper)) {
         isPureCpuOperator = false;
       } else {
         // CPU operator without adapter

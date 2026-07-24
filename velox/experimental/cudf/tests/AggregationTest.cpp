@@ -1061,7 +1061,7 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
-TEST_F(AggregationTest, partialAggregationUsesGpuFlushThreshold) {
+TEST_F(AggregationTest, partialAggregationOmitsDiagnosticFlushThresholdStat) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(
           100, [](auto row) { return row % 10; }, nullEvery(5))}),
@@ -1075,25 +1075,24 @@ TEST_F(AggregationTest, partialAggregationUsesGpuFlushThreshold) {
 
   core::PlanNodeId aggNodeId;
   constexpr int64_t maxPartialAggregationMemory = 2 << 20;
-  auto task =
-      AssertQueryBuilder(duckDbQueryRunner_)
-          .config(
-              QueryConfig::kMaxPartialAggregationMemory,
-              maxPartialAggregationMemory)
-          .plan(
-              PlanBuilder()
-                  .values(vectors)
-                  .partialAggregation({"c0"}, {"count(1)"})
-                  .capturePlanNodeId(aggNodeId)
-                  .finalAggregation()
-                  .planNode())
-          .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config(
+                      QueryConfig::kMaxPartialAggregationMemory,
+                      maxPartialAggregationMemory)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"count(1)"})
+                          .capturePlanNodeId(aggNodeId)
+                          .finalAggregation()
+                          .planNode())
+                  .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
 
-  const auto thresholdStats =
+  EXPECT_EQ(
+      0,
       toPlanStats(task->taskStats())
           .at(aggNodeId)
-          .customStats.at("cudfPartialAggregationFlushThresholdBytes");
-  EXPECT_GT(thresholdStats.max, maxPartialAggregationMemory);
+          .customStats.count("cudfPartialAggregationFlushThresholdBytes"));
 }
 
 TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
@@ -2448,6 +2447,38 @@ TEST_F(AggregationTest, avgAllNullsPartialFinal) {
                  .planNode();
 
   assertQuery(op2, "SELECT c0, avg(c2) FROM tmp GROUP BY c0");
+}
+
+TEST_F(AggregationTest, partialSumReuseWithAvg) {
+  std::vector<RowVectorPtr> vectors = {
+      makeRowVector({
+          makeFlatVector<int64_t>({0, 0, 1, 2, 3}),
+          makeNullableFlatVector<double>(
+              {1.0, std::nullopt, std::nullopt, 5.0, std::nullopt}),
+          makeNullableFlatVector<double>(
+              {std::nullopt, 2.0, 10.0, std::nullopt, std::nullopt}),
+      }),
+      makeRowVector({
+          makeFlatVector<int64_t>({0, 1, 1, 2, 3}),
+          makeNullableFlatVector<double>(
+              {3.0, std::nullopt, std::nullopt, 7.0, std::nullopt}),
+          makeNullableFlatVector<double>(
+              {4.0, 14.0, std::nullopt, std::nullopt, std::nullopt}),
+      }),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation(
+                      {"c0"}, {"sum(c1)", "avg(c1)", "avg(c2)", "sum(c2)"})
+                  .finalAggregation()
+                  .planNode();
+
+  assertQuery(
+      plan,
+      "SELECT c0, sum(c1), avg(c1), avg(c2), sum(c2) "
+      "FROM tmp GROUP BY c0");
 }
 
 // Test avg with NaN inputs preserves NaN (does not convert to NULL)

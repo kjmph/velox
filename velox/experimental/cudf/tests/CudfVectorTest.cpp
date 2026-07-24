@@ -84,6 +84,8 @@ class TestCudaStream {
 struct RecordingAsyncResourceState {
   cudaStream_t lastDeallocationStream{nullptr};
   std::size_t deallocationCount{0};
+  std::array<const void*, 64> deallocatedPointers{};
+  std::size_t deallocatedPointerCount{0};
 };
 
 class RecordingAsyncDeviceResource {
@@ -102,6 +104,9 @@ class RecordingAsyncDeviceResource {
       std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept {
     state_->lastDeallocationStream = stream.get();
     ++state_->deallocationCount;
+    if (state_->deallocatedPointerCount < state_->deallocatedPointers.size()) {
+      state_->deallocatedPointers[state_->deallocatedPointerCount++] = ptr;
+    }
     asyncUpstream_.deallocate(stream, ptr, bytes, alignment);
   }
 
@@ -121,6 +126,8 @@ class RecordingAsyncDeviceResource {
   void reset() {
     state_->lastDeallocationStream = nullptr;
     state_->deallocationCount = 0;
+    state_->deallocatedPointers = {};
+    state_->deallocatedPointerCount = 0;
   }
 
   std::size_t deallocationCount() const {
@@ -129,6 +136,15 @@ class RecordingAsyncDeviceResource {
 
   cudaStream_t lastDeallocationStream() const {
     return state_->lastDeallocationStream;
+  }
+
+  bool wasDeallocated(const void* ptr) const {
+    for (std::size_t i = 0; i < state_->deallocatedPointerCount; ++i) {
+      if (state_->deallocatedPointers[i] == ptr) {
+        return true;
+      }
+    }
+    return false;
   }
 
   bool operator==(const RecordingAsyncDeviceResource& other) const noexcept {
@@ -210,6 +226,121 @@ class CudfVectorTest : public ::testing::Test, public VectorTestBase {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
+
+TEST_F(
+    CudfVectorTest,
+    ownedTableEstimateUsesLogicalFixedWidthAndNullMaskSizes) {
+  TestCudaStream stream;
+  constexpr cudf::size_type kNumRows = 65;
+  const auto dataBytes = static_cast<std::size_t>(kNumRows) * sizeof(int32_t);
+  const auto nullMaskBytes = cudf::bitmask_allocation_size_bytes(kNumRows);
+
+  // Deliberately oversize both allocations. estimateFlatSize() describes the
+  // logical column, rather than exposing allocator padding or capacity.
+  rmm::device_buffer data(
+      dataBytes + 128, stream.view(), cudf::get_current_device_resource_ref());
+  rmm::device_buffer nullMask(
+      nullMaskBytes + 128,
+      stream.view(),
+      cudf::get_current_device_resource_ref());
+  const void* originalData = data.data();
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          kNumRows,
+          std::move(data),
+          std::move(nullMask),
+          0));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      kNumRows,
+      std::move(table),
+      stream.view());
+
+  EXPECT_EQ(vector.estimateFlatSize(), dataBytes + nullMaskBytes);
+  EXPECT_EQ(vector.getTableView().column(0).head(), originalData);
+}
+
+TEST_F(CudfVectorTest, ownedTableEstimateIncludesStringAndNestedChildren) {
+  TestCudaStream stream;
+  constexpr cudf::size_type kNumLists = 2;
+  constexpr cudf::size_type kNumStrings = 3;
+  constexpr cudf::size_type kNumChars = 9;
+
+  const auto listNullMaskBytes = cudf::bitmask_allocation_size_bytes(kNumLists);
+  const auto listOffsetsBytes =
+      static_cast<std::size_t>(kNumLists + 1) * sizeof(cudf::size_type);
+  const auto stringOffsetsBytes =
+      static_cast<std::size_t>(kNumStrings + 1) * sizeof(cudf::size_type);
+  const auto charsBytes = static_cast<std::size_t>(kNumChars);
+
+  auto makeOversizedBuffer = [&](std::size_t logicalBytes) {
+    return rmm::device_buffer(
+        logicalBytes + 128,
+        stream.view(),
+        cudf::get_current_device_resource_ref());
+  };
+
+  std::vector<std::unique_ptr<cudf::column>> stringChildren;
+  stringChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          kNumStrings + 1,
+          makeOversizedBuffer(stringOffsetsBytes),
+          rmm::device_buffer{},
+          0));
+  stringChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT8},
+          kNumChars,
+          makeOversizedBuffer(charsBytes),
+          rmm::device_buffer{},
+          0));
+  auto strings = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::STRING},
+      kNumStrings,
+      rmm::device_buffer{},
+      rmm::device_buffer{},
+      0,
+      std::move(stringChildren));
+
+  std::vector<std::unique_ptr<cudf::column>> listChildren;
+  listChildren.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          kNumLists + 1,
+          makeOversizedBuffer(listOffsetsBytes),
+          rmm::device_buffer{},
+          0));
+  listChildren.push_back(std::move(strings));
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+      std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::LIST},
+          kNumLists,
+          rmm::device_buffer{},
+          makeOversizedBuffer(listNullMaskBytes),
+          0,
+          std::move(listChildren)));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {ARRAY(VARCHAR())}),
+      kNumLists,
+      std::move(table),
+      stream.view());
+
+  EXPECT_EQ(
+      vector.estimateFlatSize(),
+      listNullMaskBytes + listOffsetsBytes + stringOffsetsBytes + charsBytes);
+}
 
 TEST_F(CudfVectorTest, retainedSizeReportsDeviceStorage) {
   TestCudaStream stream;

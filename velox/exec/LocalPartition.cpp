@@ -16,6 +16,7 @@
 
 #include "velox/exec/LocalPartition.h"
 #include "velox/common/Casts.h"
+#include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/Task.h"
 #include "velox/vector/EncodedVectorCopy.h"
@@ -343,6 +344,7 @@ LocalPartition::LocalPartition(
                               : planNode->partitionFunctionSpec().create(
                                     numPartitions_,
                                     /*localExchange=*/true)),
+      replicateNulls_(planNode->isReplicateNulls()),
       singlePartitionBufferSize_{
           (numPartitions_ <
                ctx->queryConfig()
@@ -353,6 +355,17 @@ LocalPartition::LocalPartition(
       partitionBufferPreserveEncoding_{
           ctx->queryConfig().localExchangePartitionBufferPreserveEncoding()} {
   VELOX_CHECK(numPartitions_ == 1 || partitionFunction_ != nullptr);
+  if (replicateNulls_) {
+    const auto* hashSpec = dynamic_cast<const HashPartitionFunctionSpec*>(
+        &planNode->partitionFunctionSpec());
+    VELOX_USER_CHECK_NOT_NULL(
+        hashSpec,
+        "LocalPartition replicateNulls requires a hash partition function");
+    nullKeyChannels_ = hashSpec->keyChannels();
+    VELOX_USER_CHECK(
+        !nullKeyChannels_.empty(),
+        "LocalPartition replicateNulls requires at least one partition key");
+  }
   for (auto& queue : queues_) {
     queue->addProducer();
   }
@@ -586,7 +599,7 @@ void LocalPartition::addInput(RowVectorPtr input) {
   const auto singlePartition = numPartitions_ == 1
       ? 0
       : partitionFunction_->partition(*input, partitions_);
-  if (singlePartition.has_value()) {
+  if (!replicateNulls_ && singlePartition.has_value()) {
     ContinueFuture future;
     auto blockingReason = queues_[singlePartition.value()]->enqueue(
         input, input->retainedSize(), &future);
@@ -599,19 +612,71 @@ void LocalPartition::addInput(RowVectorPtr input) {
 
   const auto numInput = input->size();
   std::vector<vector_size_t> maxIndex(numPartitions_, 0);
+  std::vector<bool> nullRows;
+  bool hasNullRows = false;
+  if (replicateNulls_ && numPartitions_ > 1) {
+    nullRows.resize(numInput);
+  }
+
   for (auto i = 0; i < numInput; ++i) {
-    ++maxIndex[partitions_[i]];
+    const bool nullRow =
+        replicateNulls_ && numPartitions_ > 1 && hasNullPartitionKey(input, i);
+    if (nullRow) {
+      hasNullRows = true;
+      nullRows[i] = true;
+      for (auto partition = 0; partition < numPartitions_; ++partition) {
+        ++maxIndex[partition];
+      }
+    } else {
+      const auto partition =
+          singlePartition.has_value() ? singlePartition.value() : partitions_[i];
+      ++maxIndex[partition];
+    }
+  }
+
+  if (replicateNulls_ && singlePartition.has_value() && !hasNullRows) {
+    ContinueFuture future;
+    auto blockingReason = queues_[singlePartition.value()]->enqueue(
+        input, input->retainedSize(), &future);
+    if (blockingReason != BlockingReason::kNotBlocked) {
+      blockingReasons_.push_back(blockingReason);
+      futures_.push_back(std::move(future));
+    }
+    return;
   }
   allocateIndexBuffers(maxIndex);
 
   std::fill(maxIndex.begin(), maxIndex.end(), 0);
   for (auto i = 0; i < numInput; ++i) {
-    auto partition = partitions_[i];
-    rawIndices_[partition][maxIndex[partition]] = i;
-    ++maxIndex[partition];
+    if (replicateNulls_ && numPartitions_ > 1 && nullRows[i]) {
+      for (auto partition = 0; partition < numPartitions_; ++partition) {
+        rawIndices_[partition][maxIndex[partition]] = i;
+        ++maxIndex[partition];
+      }
+    } else {
+      const auto partition =
+          singlePartition.has_value() ? singlePartition.value() : partitions_[i];
+      rawIndices_[partition][maxIndex[partition]] = i;
+      ++maxIndex[partition];
+    }
   }
 
   populateAndEnqueuePartitions(input, maxIndex, indexBuffers_, rawIndices_);
+}
+
+bool LocalPartition::hasNullPartitionKey(
+    const RowVectorPtr& input,
+    vector_size_t row) const {
+  for (const auto channel : nullKeyChannels_) {
+    if (channel == kConstantChannel) {
+      continue;
+    }
+    const auto& child = input->childAt(channel);
+    if (child->mayHaveNulls() && child->isNullAt(row)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void LocalPartition::prepareForInput(RowVectorPtr& input) {

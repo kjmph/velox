@@ -22,6 +22,7 @@ add_library(
   CudfDistinct.cpp
   CudfEnforceSingleRow.cpp
   CudfFilterProject.cpp
+  CudfGroupedScalarFilter.cpp
   CudfGroupId.cpp
   CudfGroupby.cpp
   CudfHashJoin.cpp

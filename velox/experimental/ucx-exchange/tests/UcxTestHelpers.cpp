@@ -115,7 +115,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     const std::unordered_map<std::string, std::string>& extraConfig,
     bool replicateNullsAndAny,
     core::PartitionFunctionSpecPtr partitionFunctionSpecOverride,
-    RowTypePtr outputTypeOverride) {
+    RowTypePtr outputTypeOverride,
+    bool replicateNulls) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -139,12 +140,13 @@ std::shared_ptr<Task> createPartitionedOutputTask(
           .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
           .planFragment();
   if (outputTypeOverride != nullptr ||
-      partitionFunctionSpecOverride != nullptr) {
+      partitionFunctionSpecOverride != nullptr || replicateNulls) {
     const auto partitionedOutput =
         std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
             planFragment.planNode);
     VELOX_CHECK_NOT_NULL(partitionedOutput);
     core::PartitionedOutputNode::Builder builder(*partitionedOutput);
+    builder.replicateNulls(replicateNulls);
     if (outputTypeOverride != nullptr) {
       builder.outputType(std::move(outputTypeOverride));
     }

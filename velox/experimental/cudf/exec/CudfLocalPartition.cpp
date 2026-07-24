@@ -24,8 +24,13 @@
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/Task.h"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/unary.hpp>
+
+#include <algorithm>
 
 #include <limits>
 
@@ -51,10 +56,51 @@ int64_t retainedBytes(const CudfVector& vector) {
       "CudfVector is too large for local exchange byte accounting");
   return static_cast<int64_t>(bytes);
 }
+
+std::vector<cudf::size_type> toCudfIndices(
+    const std::vector<column_index_t>& indices) {
+  std::vector<cudf::size_type> result;
+  result.reserve(indices.size());
+  for (const auto& index : indices) {
+    result.push_back(static_cast<cudf::size_type>(index));
+  }
+  return result;
+}
+
+std::unique_ptr<cudf::column> createKeyNullMask(
+    cudf::table_view tableView,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(!partitionKeyIndices.empty());
+
+  auto result =
+      cudf::is_null(tableView.column(partitionKeyIndices[0]), stream, mr);
+  for (size_t i = 1; i < partitionKeyIndices.size(); ++i) {
+    auto keyIsNull =
+        cudf::is_null(tableView.column(partitionKeyIndices[i]), stream, mr);
+    result = cudf::binary_operation(
+        result->view(),
+        keyIsNull->view(),
+        cudf::binary_operator::BITWISE_OR,
+        cudf::data_type{cudf::type_id::BOOL8},
+        stream,
+        mr);
+  }
+  return result;
+}
 } // namespace
 
 bool CudfLocalPartition::shouldReplace(
     const std::shared_ptr<const core::LocalPartitionNode>& planNode) {
+  if (planNode->isReplicateNulls() &&
+      !isAnyOf<exec::HashPartitionFunctionSpec>(
+          &planNode->partitionFunctionSpec())) {
+    LOG(WARNING)
+        << "CudfLocalPartition replicateNulls requires hash partitioning";
+    return false;
+  }
+
   // Only replace for Hash, Round Robin, and Round Robin Row-Wise Partitioning.
   if (isAnyOf<
           exec::HashPartitionFunctionSpec,
@@ -87,7 +133,8 @@ CudfLocalPartition::CudfLocalPartition(
           planNode),
       queues_{
           ctx->task->getLocalExchangeQueues(ctx->splitGroupId, planNode->id())},
-      numPartitions_{queues_.size()} {
+      numPartitions_{queues_.size()},
+      replicateNulls_{planNode->isReplicateNulls()} {
   // Following is IMO a hacky way to get the partition key indices. It is to
   // workaround the fact that the partition spec constructs the hash function
   // directly and has no public methods to get the partition key indices.
@@ -136,6 +183,12 @@ CudfLocalPartition::CudfLocalPartition(
       }
     }
     partitionFunctionType_ = PartitionFunctionType::kHash;
+    if (replicateNulls_) {
+      VELOX_USER_CHECK_EQ(
+          partitionKeyIndices_.size(),
+          1,
+          "CudfLocalPartition replicateNulls requires exactly one partition key");
+    }
   } else if (
       dynamic_cast<const exec::RoundRobinPartitionFunctionSpec*>(
           &planNode->partitionFunctionSpec()) &&
@@ -210,13 +263,33 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
       enqueuePartition(partition, cudfVector);
       return;
     }
+    std::shared_ptr<cudf::table> replicatedNullRowsOwner;
+    std::vector<cudf::size_type> nativeNullPartitionOffsets;
+
     auto [partitionedTable, partitionOffsets] = [&]() {
       auto tableView = cudfVector->getTableView();
       // Use cudf hash partitioning
       if (partitionFunctionType_ == PartitionFunctionType::kHash) {
-        std::vector<cudf::size_type> partitionKeyIndices;
-        for (const auto& idx : partitionKeyIndices_) {
-          partitionKeyIndices.push_back(static_cast<cudf::size_type>(idx));
+        auto partitionKeyIndices = toCudfIndices(partitionKeyIndices_);
+
+        if (replicateNulls_) {
+          auto nullMask = createKeyNullMask(
+              tableView, partitionKeyIndices, stream, get_temp_mr());
+          auto replicatedNullRows = cudf::apply_boolean_mask(
+              tableView, nullMask->view(), stream, get_temp_mr());
+          if (replicatedNullRows->num_rows() > 0) {
+            auto nullPartitionResult = cudf::hash_partition(
+                replicatedNullRows->view(),
+                partitionKeyIndices,
+                numPartitions_,
+                cudf::hash_id::HASH_MURMUR3,
+                cudf::DEFAULT_HASH_SEED,
+                stream,
+                get_temp_mr());
+            nativeNullPartitionOffsets = std::move(nullPartitionResult.second);
+            replicatedNullRowsOwner =
+                std::shared_ptr<cudf::table>(std::move(replicatedNullRows));
+          }
         }
 
         return cudf::hash_partition(
@@ -251,24 +324,54 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
     auto partitionedTables =
         cudf::split(partitionedTable->view(), partitionOffsets, stream);
 
-    // DM: We should investigate if keeping partitionedTables alive and using
-    // the table view in partitionData is more efficient than creating a new
-    // table each time. Currently out of scope because it would need a new
-    // type of RowVector that can hold a table view and shared_ptr to the
-    // table.
+    auto partitionedTableOwner =
+        std::shared_ptr<cudf::table>(std::move(partitionedTable));
+    const auto inputBytes = cudfVector->estimateFlatSize();
+    const auto inputRows = std::max<vector_size_t>(cudfVector->size(), 1);
     for (int i = 0; i < numPartitions_; ++i) {
       auto partitionData = partitionedTables[i];
       if (partitionData.num_rows() == 0) {
         continue;
       }
 
+      auto partitionBytes = inputBytes *
+          static_cast<uint64_t>(partitionData.num_rows()) /
+          static_cast<uint64_t>(inputRows);
+      if (partitionBytes == 0) {
+        partitionBytes = 1;
+      }
       auto partitionCudfVector = std::make_shared<CudfVector>(
           pool(),
           outputType_,
           partitionData.num_rows(),
-          std::make_unique<cudf::table>(partitionData, stream, get_output_mr()),
-          stream);
+          partitionData,
+          partitionedTableOwner,
+          stream,
+          partitionBytes);
       enqueuePartition(i, partitionCudfVector);
+    }
+
+    if (replicatedNullRowsOwner) {
+      VELOX_CHECK_EQ(nativeNullPartitionOffsets.size(), numPartitions_ + 1);
+      const auto nullRowsView = replicatedNullRowsOwner->view();
+      const auto nullRowsBytes = std::max<uint64_t>(
+          1,
+          inputBytes * static_cast<uint64_t>(nullRowsView.num_rows()) /
+              static_cast<uint64_t>(inputRows));
+      for (int i = 0; i < numPartitions_; ++i) {
+        if (nativeNullPartitionOffsets[i] < nativeNullPartitionOffsets[i + 1]) {
+          continue;
+        }
+        auto nullRowsCudfVector = std::make_shared<CudfVector>(
+            pool(),
+            outputType_,
+            nullRowsView.num_rows(),
+            nullRowsView,
+            replicatedNullRowsOwner,
+            stream,
+            nullRowsBytes);
+        enqueuePartition(i, nullRowsCudfVector);
+      }
     }
   } else {
     // Single partition case.

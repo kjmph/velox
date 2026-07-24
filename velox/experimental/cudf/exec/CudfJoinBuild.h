@@ -50,6 +50,12 @@ class CudfJoinBuild : public CudfOperatorBase {
   // Records per-input statistics before accumulation; no-op by default.
   virtual void recordInputStats(const CudfVector& input) {}
 
+  // Optionally summarize an input before retaining it. Called after recording
+  // statistics from the original batch; null skips an empty summary.
+  virtual CudfVectorPtr prepareInput(CudfVectorPtr input) {
+    return input;
+  }
+
   // Consumes accumulated inputs and publishes the build result to the bridge.
   virtual void buildAndPublish(std::vector<CudfVectorPtr> inputs) = 0;
 

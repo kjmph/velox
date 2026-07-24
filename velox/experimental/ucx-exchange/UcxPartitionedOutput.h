@@ -257,6 +257,7 @@ class UcxPartitionedOutput : public exec::Operator,
   /// transfer reservations.
   const bool isPartitionedKind_;
   const bool replicateNullsAndAny_;
+  const bool replicateNulls_;
 
   // Set once the arbitrary row has been replicated. Matches
   // exec::PartitionedOutput: one arbitrary row is replicated once per

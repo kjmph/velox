@@ -68,7 +68,10 @@ void CudfJoinBuild::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
   recordInputStats(*cudfInput);
-  inputs_.push_back(std::move(cudfInput));
+  cudfInput = prepareInput(std::move(cudfInput));
+  if (cudfInput != nullptr) {
+    inputs_.push_back(std::move(cudfInput));
+  }
 }
 
 RowVectorPtr CudfJoinBuild::doGetOutput() {

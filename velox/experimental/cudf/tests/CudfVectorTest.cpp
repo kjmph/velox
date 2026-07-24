@@ -22,6 +22,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -40,6 +41,14 @@
 using namespace facebook::velox;
 using namespace facebook::velox::cudf_velox;
 using namespace facebook::velox::test;
+
+namespace facebook::velox::cudf_velox {
+
+rmm::device_async_resource_ref get_output_mr() {
+  return cudf::get_current_device_resource_ref();
+}
+
+} // namespace facebook::velox::cudf_velox
 
 namespace {
 
@@ -179,6 +188,22 @@ std::unique_ptr<cudf::packed_table> makePackedTable(
       cudf::packed_table{tableView, std::move(packedColumns)});
 }
 
+std::unique_ptr<cudf::packed_table> makePackedTable(
+    cuda::stream_ref stream,
+    RecordingAsyncDeviceResource& resource) {
+  auto table = makeTable(stream, cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream,
+      rmm::to_device_async_resource_ref_checked(&resource));
+  // CudfVector does not join producer streams. Synchronize the packing stream
+  // before handing the packed table to CudfVector.
+  stream.sync();
+  auto tableView = cudf::unpack(packedColumns);
+  return std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+}
+
 class CudfVectorTest : public ::testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
@@ -225,7 +250,7 @@ TEST_F(CudfVectorTest, rebindOwnedTableDeallocationStream) {
   vector.reset();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
 }
 
 TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
@@ -251,7 +276,7 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
   vector.reset();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
@@ -274,10 +299,117 @@ TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
   auto materialized = vector.release();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
   targetStream.view().sync();
   EXPECT_EQ(materialized->num_columns(), 1);
   EXPECT_EQ(materialized->num_rows(), 4);
+}
+
+TEST_F(CudfVectorTest, packedTableReleaseRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table =
+      makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      packedTable->table.num_rows(),
+      std::move(packedTable),
+      stream.view(),
+      [&](std::exception_ptr error) {
+        EXPECT_FALSE(error);
+        callbackSawBackingStorageReleased.store(
+            resource.wasDeallocated(packedData), std::memory_order_relaxed);
+      });
+
+  auto materialized = vector.release();
+
+  ASSERT_TRUE(
+      callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
+}
+
+TEST_F(
+    CudfVectorTest,
+    packedTableDestructorRunsCallbackAfterBackingStorageReset) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  auto table =
+      makeTable(stream.view(), cudf::get_current_device_resource_ref());
+  auto packedColumns = cudf::pack(
+      table->view(),
+      stream.view(),
+      rmm::to_device_async_resource_ref_checked(&resource));
+  stream.view().synchronize();
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  void* packedData = packedTable->data.gpu_data->data();
+
+  resource.reset();
+  std::atomic<bool> callbackSawBackingStorageReleased{false};
+  {
+    CudfVector vector(
+        pool_.get(),
+        ROW({"c0"}, {INTEGER()}),
+        packedTable->table.num_rows(),
+        std::move(packedTable),
+        stream.view(),
+        [&](std::exception_ptr error) {
+          EXPECT_FALSE(error);
+          callbackSawBackingStorageReleased.store(
+              resource.wasDeallocated(packedData), std::memory_order_relaxed);
+        });
+  }
+
+  ASSERT_TRUE(
+      callbackSawBackingStorageReleased.load(std::memory_order_relaxed));
+}
+
+TEST_F(CudfVectorTest, sharedOwnerReleaseDropsOwnerAfterMaterializing) {
+  TestCudaStream stream;
+  RecordingAsyncDeviceResource resource;
+
+  std::shared_ptr<cudf::table> owner(
+      makeTable(
+          stream.view(), rmm::to_device_async_resource_ref_checked(&resource))
+          .release());
+  stream.view().synchronize();
+
+  auto tableView = owner->view();
+  const auto numRows = owner->num_rows();
+  const void* sourceData = owner->get_column(0).view().data<int32_t>();
+  resource.reset();
+
+  CudfVector vector(
+      pool_.get(),
+      ROW({"c0"}, {INTEGER()}),
+      numRows,
+      tableView,
+      std::move(owner),
+      stream.view(),
+      0);
+
+  auto materialized = vector.release();
+
+  EXPECT_TRUE(resource.wasDeallocated(sourceData));
+  EXPECT_EQ(materialized->num_rows(), 4);
+  EXPECT_EQ(materialized->num_columns(), 1);
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseCallbackRunsExactlyOnce) {

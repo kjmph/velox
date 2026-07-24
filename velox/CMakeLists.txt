@@ -76,23 +76,15 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   add_subdirectory(experimental/gpu)
   if(${VELOX_ENABLE_CUDF})
     add_subdirectory(experimental/cudf)
-    # VELOX_ENABLE_UCX_EXCHANGE is declared and documented in
-    # CMake/resolve_dependency_modules/cudf.cmake.
-    if(VELOX_ENABLE_UCX_EXCHANGE)
-      # ucxx is fetched only by cudf.cmake, which a preinstalled cuDF skips.
-      if(NOT cudf_SOURCE STREQUAL "BUNDLED")
-        message(
-          FATAL_ERROR
-          "VELOX_ENABLE_UCX_EXCHANGE=ON requires a cuDF that Velox builds from source (cudf_SOURCE=BUNDLED), but cudf_SOURCE is ${cudf_SOURCE}."
-        )
-      endif()
-      add_subdirectory(experimental/ucx-exchange)
-    endif()
   endif()
   if(${VELOX_ENABLE_WAVE})
     add_subdirectory(experimental/wave)
     add_subdirectory(external/jitify)
   endif()
+endif()
+
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  add_subdirectory(experimental/ucx-exchange)
 endif()
 
 if(VELOX_ENABLE_TORCHWAVE)

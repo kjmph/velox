@@ -72,6 +72,7 @@ void EndpointRef::closeAndDrainCommunicators() {
   // Now iterate the local copy -- no lock held, no contention.
   for (auto& weakElem : localCopy) {
     if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
+      std::lock_guard<std::recursive_mutex> lock(spt->processMutex_);
       spt->close();
     }
   }

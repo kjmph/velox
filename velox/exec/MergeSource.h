@@ -15,6 +15,11 @@
  */
 #pragma once
 
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+
 #include "velox/exec/Driver.h"
 
 namespace facebook::velox::exec {
@@ -23,6 +28,11 @@ class MergeExchange;
 
 class MergeSource {
  public:
+  using MergeExchangeSourceFactory = std::function<std::shared_ptr<MergeSource>(
+      MergeExchange* mergeExchange,
+      const std::string& taskId,
+      int destination)>;
+
   static constexpr int32_t kMaxQueuedBytesUpperLimit = 32 << 20; // 32 MB.
   static constexpr int32_t kMaxQueuedBytesLowerLimit = 1 << 20; // 1 MB.
 
@@ -57,7 +67,12 @@ class MergeSource {
       int destination,
       int64_t maxQueuedBytes,
       memory::MemoryPool* pool,
-      folly::Executor* executor);
+      folly::Executor* executor,
+      std::string_view transportKind);
+
+  static void registerMergeExchangeSourceFactory(
+      std::string transportKind,
+      MergeExchangeSourceFactory factory);
 };
 
 /// Coordinates data transfer between single producer and single consumer. Used

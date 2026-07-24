@@ -27,6 +27,7 @@ UcxExchangeClient::UcxExchangeClient(
     uint64_t receiveHighWaterBytes,
     int32_t requestDataSizesMaxWaitSec)
     : taskId_{std::move(taskId)},
+      destination_(destination),
       maxQueuedColumns_(kDefaultMaxQueuedColumns),
       requestDataSizesMaxWaitSec_(requestDataSizesMaxWaitSec),
       queue_(
@@ -163,11 +164,9 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
       return data;
     }
 
-    // TODO: Review this primitive form of flow control.
-    // Maybe need to inspect the #bytes rather than the #tables?
     // Don't request more data when queue size exceeds the configured limit.
     // NOTE: This check is currently a no-op because the UCX exchange is
-    // push-based — there is no mechanism to "request" or "not request" more
+    // push-based: there is no mechanism to "request" or "not request" more
     // data. The server pushes unconditionally. Real backpressure is
     // implemented in UcxExchangeSource::process() (ReadyToReceive state).
     if (data != nullptr && queue_->size() > maxQueuedColumns_) {

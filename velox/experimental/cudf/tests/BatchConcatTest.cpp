@@ -29,6 +29,9 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <optional>
+#include <utility>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -171,6 +174,15 @@ class CudfBatchConcatTest : public OperatorTestBase {
     }
     // Move out: planStats is destroyed on return.
     return std::move(opIt->second);
+  }
+  std::optional<std::pair<vector_size_t, vector_size_t>> getConcatVectorStats(
+      const std::shared_ptr<Task>& task,
+      const core::PlanNodeId& aggNodeId) {
+    auto stats = getConcatStats(task, aggNodeId);
+    if (!stats) {
+      return std::nullopt;
+    }
+    return std::pair{stats->inputVectors, stats->outputVectors};
   }
 };
 
@@ -337,6 +349,24 @@ TEST_F(CudfBatchConcatTest, zeroColumnVectorsUseRowFallback) {
   ASSERT_NE(output, nullptr);
   EXPECT_EQ(output->size(), 2 * kRowsPerBatch);
   concat.close();
+}
+
+TEST_F(CudfBatchConcatTest, rejectsZeroRowCpuInput) {
+  auto input = makeRowVector({makeFlatVector<int32_t>(std::vector<int32_t>{})});
+  auto planNode = PlanBuilder().values({input}).project({"c0"}).planNode();
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "CudfBatchConcatTest",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  CudfBatchConcat concat(0, &driverCtx, planNode, 10);
+
+  VELOX_ASSERT_THROW(
+      concat.addInput(input), "CudfBatchConcat expects CudfVector input");
 }
 
 // Verifies that CudfBatchConcat is inserted before aggregation and reduces
@@ -552,11 +582,10 @@ TEST_F(CudfBatchConcatTest, finalAggregationUsesDedicatedConcatThreshold) {
         std::vector<core::PlanNodePtr> partialSources;
         partialSources.reserve(vectors.size());
         for (const auto& vector : vectors) {
-          partialSources.push_back(
-              PlanBuilder(generator)
-                  .values({vector})
-                  .partialAggregation({"c0"}, {"sum(c1)"})
-                  .planNode());
+          partialSources.push_back(PlanBuilder(generator)
+                                       .values({vector})
+                                       .partialAggregation({"c0"}, {"sum(c1)"})
+                                       .planNode());
         }
 
         core::PlanNodeId finalAggNodeId;
@@ -570,14 +599,12 @@ TEST_F(CudfBatchConcatTest, finalAggregationUsesDedicatedConcatThreshold) {
             AssertQueryBuilder(duckDbQueryRunner_)
                 .plan(plan)
                 .maxDrivers(1)
-                .config(
-                    core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
+                .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
                 .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 
-        const auto* concatStats = getConcatStats(task, finalAggNodeId);
-        VELOX_CHECK_NOT_NULL(concatStats);
-        return std::pair{
-            concatStats->inputVectors, concatStats->outputVectors};
+        const auto concatStats = getConcatVectorStats(task, finalAggNodeId);
+        VELOX_CHECK(concatStats.has_value());
+        return concatStats.value();
       };
 
   const auto genericThresholdStats =

@@ -102,10 +102,6 @@ uint64_t CudfBatchConcat::estimateBytes(const CudfVector& vector) const {
 }
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
-  if (input->size() == 0) {
-    return;
-  }
-
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
 

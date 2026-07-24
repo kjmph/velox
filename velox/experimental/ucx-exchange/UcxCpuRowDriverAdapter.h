@@ -45,11 +45,19 @@ constexpr const char* kCpuExchangePortEnv = "VELOX_UCX_CPU_PORT";
 /// the cudf path's `cudf.exchange.server.port` default (30050).
 constexpr uint16_t kDefaultCpuExchangePort = 30060;
 
+/// Returns whether VELOX_UCX_CPU_EXCHANGE enables the CPU-row UCX path.
+bool cpuUcxExchangeEnabled();
+
+/// Starts the process-wide CPU-row UCX communicator and blocks until its
+/// listener and progress thread are ready. Returns false when CPU UCX is
+/// disabled or the communicator could not be started.
+bool startCpuUcxExchange();
+
 /// Registers the CPU UCX DriverAdapter with `exec::DriverFactory`. Idempotent.
 ///
-/// Called automatically at library load via a static initializer. Exposed
-/// as a function too so callers (tests, an explicit Prestissimo hook)
-/// can force-init in a deterministic order.
+/// Called automatically at library load via a static initializer. Exposed as a
+/// function too so tests and other embedders can register deterministically;
+/// Prestissimo should use startCpuUcxExchange() for its startup barrier.
 void registerCpuUcxDriverAdapter();
 
 } // namespace facebook::velox::ucx_exchange

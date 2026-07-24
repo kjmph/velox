@@ -242,10 +242,10 @@ class Communicator {
   // the communicator thread.
   WorkQueue<CommElement> workQueue_;
 
-  // Protects endpoints_. Must be recursive because removeEndpointRef() holds
-  // the lock and calls closeBlocking(), which progresses the worker and can
-  // fire listenerCallback() re-entrantly. That callback also locks this mutex.
-  std::recursive_mutex endpointsMutex_;
+  // Protects endpoints_ and workerAddressEndpoints_. Never hold this mutex
+  // while waiting for UCXX progress: listener callbacks also update these
+  // maps from the UCXX progress thread.
+  std::mutex endpointsMutex_;
 
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;

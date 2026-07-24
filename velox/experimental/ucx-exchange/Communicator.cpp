@@ -415,7 +415,28 @@ void Communicator::run() {
       // Periodic heartbeat for diagnostic logging.
       auto now = std::chrono::steady_clock::now();
       if (now - lastHeartbeat_ >= std::chrono::seconds(5)) {
-        std::lock_guard<std::mutex> lock(elemMutex_);
+        size_t numElements;
+
+#ifdef VELOX_ENABLE_CUDF
+        int numServers = 0;
+        int numSources = 0;
+#endif
+        {
+          std::lock_guard<std::mutex> lock(elemMutex_);
+          numElements = elements_.size();
+#ifdef VELOX_ENABLE_CUDF
+          // Count ExSrv vs ExSrc elements (cudf path only; the CPU path
+          // uses different CommElement subclasses and we don't have a
+          // typed dynamic_cast hook here for them yet).
+          for (const auto& elem : elements_) {
+            if (dynamic_cast<UcxExchangeServer*>(elem.get())) {
+              ++numServers;
+            } else if (dynamic_cast<UcxExchangeSource*>(elem.get())) {
+              ++numSources;
+            }
+          }
+#endif
+        }
 
 #ifdef VELOX_ENABLE_CUDF
         // GPU memory usage via CUDA runtime.
@@ -428,34 +449,30 @@ void Communicator::run() {
         size_t gpuUsedMB = (gpuTotal - gpuFree) / (1024 * 1024);
         size_t gpuFreeMB = gpuFree / (1024 * 1024);
         size_t gpuTotalMB = gpuTotal / (1024 * 1024);
-
-        // Count ExSrv vs ExSrc elements (cudf path only; the CPU path
-        // uses different CommElement subclasses and we don't have a
-        // typed dynamic_cast hook here for them yet).
-        int numServers = 0, numSources = 0;
-        for (const auto& elem : elements_) {
-          if (dynamic_cast<UcxExchangeServer*>(elem.get())) {
-            ++numServers;
-          } else if (dynamic_cast<UcxExchangeSource*>(elem.get())) {
-            ++numSources;
-          }
-        }
 #endif
 
         size_t numEndpoints;
+        size_t numWorkerAddressEndpoints;
         {
-          std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+          std::lock_guard<std::mutex> lock(endpointsMutex_);
           numEndpoints = endpoints_.size();
+          numWorkerAddressEndpoints = workerAddressEndpoints_.size();
+        }
+        size_t numDeferredRequests;
+        {
+          std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+          numDeferredRequests = deferredRequests_.size();
         }
         VLOG(2) << "[COMM-HEARTBEAT] workQueue=" << workQueue_.size()
-                << " elements=" << elements_.size()
+                << " elements=" << numElements
 #ifdef VELOX_ENABLE_CUDF
                 << " (servers=" << numServers << " sources=" << numSources
                 << ")"
 #endif
                 << " endpoints=" << numEndpoints
+                << " workerAddressEndpoints=" << numWorkerAddressEndpoints
                 << " deferredCleanup=" << deferredEndpointCleanup_.size()
-                << " deferredRequests=" << deferredRequests_.size()
+                << " deferredRequests=" << numDeferredRequests
                 << " workItemsProcessed="
                 << workItemsProcessed_.exchange(0, std::memory_order_relaxed)
 #ifdef VELOX_ENABLE_CUDF
@@ -570,7 +587,7 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
     std::shared_ptr<CommElement> comms,
     HostPort hostPort) {
   {
-    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
     auto it = endpoints_.find(hostPort);
     if (it != endpoints_.end()) {
       std::shared_ptr<EndpointRef> ep = it->second;
@@ -611,7 +628,7 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
   }
 
   {
-    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
     auto [it, inserted] = endpoints_.insert(std::pair{hostPort, epRef});
     if (!inserted) {
       std::shared_ptr<EndpointRef> existing = it->second;
@@ -641,7 +658,7 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
 
   std::string key{workerAddress};
   {
-    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
     auto it = workerAddressEndpoints_.find(key);
     if (it != workerAddressEndpoints_.end()) {
       return it->second;
@@ -680,7 +697,7 @@ Communicator::createSameHostEndpointRefFromWorkerAddress(
   }
 
   {
-    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
     auto [it, inserted] = workerAddressEndpoints_.emplace(key, epRef);
     if (!inserted) {
       return it->second;
@@ -714,24 +731,37 @@ std::string Communicator::getWorkerAddress() const {
 }
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
-  std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
   VLOG(3) << "In Communicator::removeEndpointRef for Communicator with port = "
           << Communicator::getInstance()->port_;
 
-  // Close the endpoint if it's still alive.
-  // With the UCXX progress thread running, closeBlocking() schedules close
-  // work on that thread and waits for completion. Do not call it from a UCX
-  // callback; callbacks defer cleanup to this communicator loop instead.
+  // Stop new users from finding this endpoint before closing it. Keep the
+  // caller's shared_ptr alive so erasing the final map entry cannot destroy
+  // the UCXX endpoint while the mutex is held.
+  {
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
+    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
+      if (it->second == ep) {
+        it = endpoints_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = workerAddressEndpoints_.begin();
+         it != workerAddressEndpoints_.end();) {
+      if (it->second == ep) {
+        it = workerAddressEndpoints_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // UCXX closeBlocking() submits work to the UCXX progress thread and waits
+  // for it. Listener callbacks run on that thread and also take
+  // endpointsMutex_, so this call must remain outside the map lock.
   if (ep->endpoint_ && ep->endpoint_->isAlive()) {
     VLOG(3) << "In Communicator::removeEndpointRef call closeBlocking";
     ep->endpoint_->closeBlocking();
-  }
-  for (auto it = endpoints_.begin(); it != endpoints_.end();) {
-    if (it->second == ep) {
-      it = endpoints_.erase(it);
-    } else {
-      ++it;
-    }
   }
   VLOG(3) << "- Communicator::removeEndpointRef";
 }
@@ -853,7 +883,7 @@ void Communicator::listenerCallback(ucp_conn_request_h conn_request) {
   uint16_t port = static_cast<uint16_t>(val);
   HostPort hp(ip_str, port);
   {
-    std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+    std::lock_guard<std::mutex> lock(endpointsMutex_);
     auto res = endpoints_.insert(std::pair{hp, epRef});
     if (!res.second) {
       LOG(ERROR) << "listenerCallback: endpoint already exists for " << ip_str

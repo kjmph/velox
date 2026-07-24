@@ -20,6 +20,7 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/Task.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -31,13 +32,14 @@
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
 
+#include <folly/ScopeGuard.h>
+#include <folly/Unit.h>
 #include <algorithm>
 #include <atomic>
 #include <limits>
 #include <new>
 #include <optional>
 #include <utility>
-#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
@@ -164,6 +166,9 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
 }
 
 void UcxPartitionedOutput::recordAllocationPressure(uint64_t waitBytes) {
+  if (maybeFinishCancelled()) {
+    return;
+  }
   auto queueManager = sharedQueueManager();
   queueManager->recordFullTransferCongestion(this->taskId());
 
@@ -194,6 +199,9 @@ void UcxPartitionedOutput::recordAllocationPressure(uint64_t waitBytes) {
 }
 
 void UcxPartitionedOutput::partitionPendingInputBatch() {
+  if (maybeFinishCancelled()) {
+    return;
+  }
   VELOX_CHECK(pendingInputBatch_.has_value());
 
   auto& input = pendingInputBatch_.value();
@@ -274,6 +282,9 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
 }
 
 void UcxPartitionedOutput::flushPending() {
+  if (maybeFinishCancelled()) {
+    return;
+  }
   if (pendingPartitionedBatch_) {
     drainPendingPartitionedBatch();
     return;
@@ -347,6 +358,9 @@ void UcxPartitionedOutput::flushPending() {
 }
 
 exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
+  if (maybeFinishCancelled()) {
+    return exec::BlockingReason::kNotBlocked;
+  }
   if (blockingReason_ != exec::BlockingReason::kNotBlocked) {
     *future = std::move(future_);
     blockingReason_ = exec::BlockingReason::kNotBlocked;
@@ -364,11 +378,14 @@ exec::BlockingReason UcxPartitionedOutput::isBlocked(ContinueFuture* future) {
 
 RowVectorPtr UcxPartitionedOutput::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
-  if (finished_) {
+  if (maybeFinishCancelled() || finished_) {
     return nullptr;
   }
   if (shouldDrainPending()) {
     flushPending();
+    if (maybeFinishCancelled()) {
+      return nullptr;
+    }
     if (shouldDrainPending() ||
         blockingReason_ != exec::BlockingReason::kNotBlocked) {
       return nullptr;
@@ -382,7 +399,15 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
 }
 
 bool UcxPartitionedOutput::isFinished() {
+  if (maybeFinishCancelled()) {
+    return true;
+  }
   return finished_;
+}
+
+void UcxPartitionedOutput::close() {
+  clearPending();
+  Operator::close();
 }
 
 std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
@@ -391,6 +416,30 @@ UcxPartitionedOutput::sharedQueueManager() {
   VELOX_CHECK_NOT_NULL(
       shared_queueManager, "OutputQueueManager was already destructed");
   return shared_queueManager;
+}
+
+bool UcxPartitionedOutput::isTaskCancelled() const {
+  return operatorCtx_->task()->isCancelled();
+}
+
+bool UcxPartitionedOutput::maybeFinishCancelled() {
+  if (!isTaskCancelled()) {
+    return false;
+  }
+  finished_ = true;
+  blockingReason_ = exec::BlockingReason::kNotBlocked;
+  future_ = ContinueFuture{folly::Unit{}};
+  return true;
+}
+
+void UcxPartitionedOutput::clearPending() {
+  pendingInputs_.clear();
+  pendingInputBatch_.reset();
+  pendingPartitionedBatch_.reset();
+  pendingRows_ = 0;
+  pendingBytes_ = 0;
+  blockingReason_ = exec::BlockingReason::kNotBlocked;
+  future_ = ContinueFuture{folly::Unit{}};
 }
 
 bool UcxPartitionedOutput::shouldFlushPending() const {
@@ -701,6 +750,9 @@ void UcxPartitionedOutput::initializePartitionDrainState(
 
 bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
     PendingPartitionedBatch& batch) {
+  if (maybeFinishCancelled()) {
+    return false;
+  }
   if (!batch.nextRows.empty() || batch.tableView.num_rows() == 0) {
     return false;
   }
@@ -809,6 +861,9 @@ bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
 
   bool madeProgress = false;
   for (size_t runStart = 0; runStart < numPartitions_;) {
+    if (maybeFinishCancelled()) {
+      return false;
+    }
     while (runStart < numPartitions_ && !eligible[runStart]) {
       ++runStart;
     }
@@ -849,7 +904,13 @@ bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
 
     // UCXX/UCX is not stream-aware, so the packed payloads must be complete
     // before exposing their raw device pointers to the exchange server.
+    if (maybeFinishCancelled()) {
+      return false;
+    }
     batch.stream.synchronize();
+    if (maybeFinishCancelled()) {
+      return false;
+    }
 
     VELOX_CHECK_EQ(contiguousTables.size(), runEnd - runStart + 1);
     for (size_t index = 0; index < contiguousTables.size(); ++index) {
@@ -955,6 +1016,9 @@ bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
 
 bool UcxPartitionedOutput::tryDrainWithFullContiguousSplit(
     PendingPartitionedBatch& batch) {
+  if (maybeFinishCancelled()) {
+    return false;
+  }
   if (!batch.nextRows.empty() || batch.tableView.num_rows() == 0) {
     return false;
   }
@@ -1050,7 +1114,13 @@ bool UcxPartitionedOutput::tryDrainWithFullContiguousSplit(
 
   // UCXX/UCX is not stream-aware, so the packed payloads must be complete
   // before exposing their raw device pointers to the exchange server.
+  if (maybeFinishCancelled()) {
+    return false;
+  }
   batch.stream.synchronize();
+  if (maybeFinishCancelled()) {
+    return false;
+  }
 
   VELOX_CHECK_EQ(contiguousTables.size(), numPartitions_);
   for (size_t partition = 0; partition < numPartitions_; ++partition) {
@@ -1114,6 +1184,9 @@ bool UcxPartitionedOutput::tryDrainWithFullContiguousSplit(
 }
 
 bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
+  if (maybeFinishCancelled()) {
+    return false;
+  }
   VELOX_CHECK(pendingPartitionedBatch_.has_value());
 
   auto queueManager = sharedQueueManager();
@@ -1121,11 +1194,17 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
   if (tryDrainWithFullContiguousSplit(batch)) {
     return true;
   }
+  if (maybeFinishCancelled() || !pendingPartitionedBatch_.has_value()) {
+    return false;
+  }
   if (blockingReason_ != exec::BlockingReason::kNotBlocked) {
     return false;
   }
   if (tryDrainWithContiguousSplit(batch)) {
     return true;
+  }
+  if (maybeFinishCancelled() || !pendingPartitionedBatch_.has_value()) {
+    return false;
   }
   initializePartitionDrainState(batch);
 
@@ -1133,6 +1212,9 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
       batch.offsets.size(), numPartitions_ + 1, "mismatch in numPartitions_");
 
   while (batch.remainingPartitions > 0) {
+    if (maybeFinishCancelled()) {
+      return false;
+    }
     int waitPartition = -1;
     bool madeProgress = false;
 
@@ -1153,6 +1235,9 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
           std::min<uint64_t>(batch.nextPayloadBytes[partition], transferWindow);
 
       while (batch.nextRows[partition] < batch.offsets[partition + 1]) {
+        if (maybeFinishCancelled()) {
+          return false;
+        }
         if (queueManager->checkTransferCapacity(
                 this->taskId(), partition, transferWindow, nullptr)) {
           if (waitPartition < 0) {
@@ -1261,7 +1346,13 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
 
         // UCXX/UCX is not stream-aware, so the packed payload must be complete
         // before exposing its raw device pointer to the exchange server.
+        if (maybeFinishCancelled()) {
+          return false;
+        }
         batch.stream.synchronize();
+        if (maybeFinishCancelled()) {
+          return false;
+        }
 
         auto packedColsPtr = std::make_unique<cudf::packed_columns>(
             std::move(packedCols->metadata), std::move(packedCols->gpu_data));

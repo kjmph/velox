@@ -75,7 +75,9 @@ add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES})
 # Communicator.cpp includes the generated module header by its basename.
 target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-find_package(ucx REQUIRED)
+if(NOT TARGET ucx::ucp)
+  find_package(ucx REQUIRED)
+endif()
 
 if(VELOX_ENABLE_CUDF)
   target_link_libraries(

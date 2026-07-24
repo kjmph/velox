@@ -394,6 +394,7 @@ core::PlanNodePtr getTraceNode(
         partitionedOutputNode->keys(),
         partitionedOutputNode->numPartitions(),
         partitionedOutputNode->isReplicateNullsAndAny(),
+        partitionedOutputNode->isReplicateNulls(),
         partitionedOutputNode->partitionFunctionSpecPtr(),
         partitionedOutputNode->outputType(),
         "Presto",

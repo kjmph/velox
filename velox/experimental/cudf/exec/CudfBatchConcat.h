@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <cstddef>
 #include <queue>
 
 namespace facebook::velox::cudf_velox {
@@ -33,7 +34,8 @@ class CudfBatchConcat : public CudfOperatorBase {
   CudfBatchConcat(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      std::shared_ptr<const core::PlanNode> planNode);
+      std::shared_ptr<const core::PlanNode> planNode,
+      size_t targetRows = 0);
 
   bool needsInput() const override {
     return !noMoreInput_ && outputQueue_.empty() && !targetReached();

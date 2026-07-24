@@ -57,11 +57,31 @@ using cudf_velox::CountInputKind;
 using cudf_velox::finalizeDecimalAverage;
 using cudf_velox::get_output_mr;
 using cudf_velox::get_temp_mr;
+using cudf_velox::GroupbyAggregationRequestBuilder;
+using cudf_velox::GroupbyAggregationResultRef;
+using cudf_velox::GroupbyPartialMeanResultRefs;
 using cudf_velox::GroupbyAggregator;
 using cudf_velox::ResolvedAggregateInfo;
 using cudf_velox::serializeDecimalPartialOrIntermediateState;
 using cudf_velox::StreamingGroupbyAggregator;
 using cudf_velox::validateIntermediateColumnType;
+
+std::unique_ptr<cudf::column> takeGroupbyResultColumn(
+    std::vector<cudf::groupby::aggregation_result>& results,
+    const GroupbyAggregationResultRef& ref,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK_LT(ref.requestIndex, results.size());
+  VELOX_CHECK_LT(ref.resultIndex, results[ref.requestIndex].results.size());
+
+  auto& result = results[ref.requestIndex].results[ref.resultIndex];
+  VELOX_CHECK_NOT_NULL(result);
+  if (ref.shared != nullptr && *ref.shared) {
+    return std::make_unique<cudf::column>(
+        result->view(), stream, mr);
+  }
+  return std::move(result);
+}
 
 size_t streamingGroupbySafeCapacity() {
   // libcudf encodes an in-flight row as max_distinct_keys + row_index in a
@@ -309,11 +329,31 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
     request.aggregations.push_back(MakeAggregation());
   }
 
+  void addGroupbyRequest(
+      GroupbyAggregationRequestBuilder& builder,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    outputRef_.reset();
+    if constexpr (
+        MakeAggregation ==
+        &cudf::make_sum_aggregation<cudf::groupby_aggregation>) {
+      if (step == core::AggregationNode::Step::kPartial && !maskIndex) {
+        VELOX_CHECK_NULL(constant);
+        outputRef_ = builder.addSum(inputIndex, reusableInputKey, step);
+        return;
+      }
+    }
+    addGroupbyRequest(builder.tableView(), builder.requests(), stream, mr);
+  }
+
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override {
-    return castResult(std::move(results[outputIndex_].results[0]), stream, mr);
+    auto column = outputRef_
+        ? takeGroupbyResultColumn(results, *outputRef_, stream, mr)
+        : std::move(results[outputIndex_].results[0]);
+    return castResult(std::move(column), stream, mr);
   }
 
   std::unique_ptr<cudf::column> finalize(
@@ -337,6 +377,7 @@ struct SimpleGroupbyAggregator final : GroupbyAggregator {
   }
 
   uint32_t outputIndex_{0};
+  std::optional<GroupbyAggregationResultRef> outputRef_;
 };
 
 using GroupbySumAggregator = SimpleGroupbyAggregator<
@@ -813,6 +854,18 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
     }
   }
 
+  void addGroupbyRequest(
+      GroupbyAggregationRequestBuilder& builder,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) override {
+    partialRefs_.reset();
+    if (step == core::AggregationNode::Step::kPartial && !maskIndex) {
+      partialRefs_ = builder.addPartialMean(inputIndex, reusableInputKey);
+      return;
+    }
+    addGroupbyRequest(builder.tableView(), builder.requests(), stream, mr);
+  }
+
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       cuda::stream_ref stream,
@@ -822,8 +875,12 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
       case core::AggregationNode::Step::kSingle:
         return std::move(results[meanIdx_].results[0]);
       case core::AggregationNode::Step::kPartial: {
-        auto sum = std::move(results[sumIdx_].results[0]);
-        auto count = std::move(results[sumIdx_].results[1]);
+        auto sum = partialRefs_
+            ? takeGroupbyResultColumn(results, partialRefs_->sum, stream, mr)
+            : std::move(results[sumIdx_].results[0]);
+        auto count = partialRefs_
+            ? takeGroupbyResultColumn(results, partialRefs_->count, stream, mr)
+            : std::move(results[sumIdx_].results[1]);
 
         auto const size = sum->size();
         auto const cudfSumType =
@@ -955,6 +1012,7 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
 
   // These indices are used to track where the desired result columns
   // (mean/<sum, count>) are in the output of cudf::groupby::aggregate().
+  std::optional<GroupbyPartialMeanResultRefs> partialRefs_;
   uint32_t meanIdx_;
   uint32_t sumIdx_;
   uint32_t countIdx_;
@@ -1319,19 +1377,118 @@ cudf::column_view GroupbyAggregator::materializeMaskedInput(
   return maskedValues_->view();
 }
 
+GroupbyAggregationRequestBuilder::GroupbyAggregationRequestBuilder(
+    cudf::table_view const& tbl,
+    std::vector<cudf::groupby::aggregation_request>& requests)
+    : tableView_(tbl), requests_(requests) {}
+
+GroupbyAggregationResultRef
+GroupbyAggregationRequestBuilder::addAggregationForValues(
+    cudf::column_view values,
+    std::unique_ptr<cudf::groupby_aggregation> aggregation) {
+  auto& request = requests_.emplace_back();
+  request.values = values;
+  request.aggregations.push_back(std::move(aggregation));
+  return {
+      static_cast<uint32_t>(requests_.size() - 1),
+      0,
+      std::make_shared<bool>(false)};
+}
+
+GroupbyAggregationResultRef
+GroupbyAggregationRequestBuilder::addAggregationForColumn(
+    uint32_t inputIndex,
+    std::unique_ptr<cudf::groupby_aggregation> aggregation) {
+  return addAggregationForValues(
+      tableView_.column(inputIndex), std::move(aggregation));
+}
+
+GroupbyAggregationResultRef
+GroupbyAggregationRequestBuilder::addReusablePartialSum(
+    uint32_t inputIndex,
+    uint32_t reusableInputKey) {
+  auto it = reusablePartialSums_.find(reusableInputKey);
+  if (it != reusablePartialSums_.end()) {
+    *it->second.shared = true;
+    return it->second;
+  }
+
+  auto ref = addAggregationForColumn(
+      inputIndex, cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  reusablePartialSums_.emplace(reusableInputKey, ref);
+  return ref;
+}
+
+GroupbyAggregationResultRef GroupbyAggregationRequestBuilder::addSum(
+    uint32_t inputIndex,
+    uint32_t reusableInputKey,
+    core::AggregationNode::Step step) {
+  if (step == core::AggregationNode::Step::kPartial) {
+    return addReusablePartialSum(inputIndex, reusableInputKey);
+  }
+  return addAggregationForColumn(
+      inputIndex, cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+}
+
+GroupbyPartialMeanResultRefs GroupbyAggregationRequestBuilder::addPartialMean(
+    uint32_t inputIndex,
+    uint32_t reusableInputKey) {
+  auto it = reusablePartialSums_.find(reusableInputKey);
+  if (it != reusablePartialSums_.end()) {
+    *it->second.shared = true;
+    return {
+        it->second,
+        addAggregationForColumn(
+            inputIndex,
+            cudf::make_count_aggregation<cudf::groupby_aggregation>(
+                cudf::null_policy::EXCLUDE))};
+  }
+
+  auto& request = requests_.emplace_back();
+  request.values = tableView_.column(inputIndex);
+  request.aggregations.push_back(
+      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  GroupbyAggregationResultRef sumRef{
+      static_cast<uint32_t>(requests_.size() - 1),
+      0,
+      std::make_shared<bool>(false)};
+  request.aggregations.push_back(
+      cudf::make_count_aggregation<cudf::groupby_aggregation>(
+          cudf::null_policy::EXCLUDE));
+  GroupbyAggregationResultRef countRef{
+      static_cast<uint32_t>(requests_.size() - 1),
+      1,
+      std::make_shared<bool>(false)};
+  reusablePartialSums_.emplace(reusableInputKey, sumRef);
+  return {sumRef, countRef};
+}
+
+cudf::groupby::aggregation_request&
+GroupbyAggregationRequestBuilder::aggregationRequest(
+    const GroupbyAggregationResultRef& ref) {
+  VELOX_CHECK_LT(ref.requestIndex, requests_.size());
+  return requests_[ref.requestIndex];
+}
+
 std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode const& aggregationNode,
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
-    std::vector<std::optional<uint32_t>> const& maskChannels) {
+    std::vector<std::optional<uint32_t>> const& maskChannels,
+    const std::vector<column_index_t>* aggregationInputChannels) {
   auto params = resolveAggregateInfos(
       aggregationNode, step, outputType, constants, maskChannels);
 
   std::vector<std::unique_ptr<GroupbyAggregator>> aggregators;
   aggregators.reserve(params.size());
   for (const auto& p : params) {
-    aggregators.push_back(createGroupbyAggregator(p));
+    auto aggregator = createGroupbyAggregator(p);
+    if (aggregationInputChannels != nullptr) {
+      VELOX_CHECK_LT(p.inputIndex, aggregationInputChannels->size());
+      aggregator->reusableInputKey = (*aggregationInputChannels)[p.inputIndex];
+    }
+    aggregators.push_back(std::move(aggregator));
   }
   return aggregators;
 }
@@ -1711,7 +1868,10 @@ void CudfGroupby::initialize() {
       aggregationNode_->step(),
       outputType_,
       aggregationInput.constants,
-      aggregationInput.maskChannels);
+      aggregationInput.maskChannels,
+      &aggregationInputChannels_);
+  partialAggregationFlushThresholdBytes_ =
+      partialAggregationFlushThresholdBytes();
   incrementalAggregationEnabled_ =
       !hasCompanionAggregates(aggregationNode_->aggregates());
 
@@ -1742,7 +1902,8 @@ void CudfGroupby::initialize() {
           core::AggregationNode::Step::kPartial,
           bufferedResultType_,
           aggregationInput.constants,
-          aggregationInput.maskChannels);
+          aggregationInput.maskChannels,
+          &aggregationInputChannels_);
       finalAggregators_ = toGroupbyAggregators(
           *aggregationNode_,
           core::AggregationNode::Step::kFinal,
@@ -1820,60 +1981,123 @@ void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
   }
 }
 
-void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
-  auto inputTableStream = tbl->stream();
-  auto permutedInputView = tbl->getTableView().select(
-      aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+CudfVectorPtr CudfGroupby::compactGroupbyStates(
+    std::vector<CudfVectorPtr>&& states,
+    bool projectAggregationInputs,
+    CudfVectorPtr existingState) {
+  if (!existingState && states.empty()) {
+    return nullptr;
+  }
 
-  if (!bufferedResult_) {
-    auto groupbyOnInput = doGroupByAggregation(
-        permutedInputView,
+  if (!projectAggregationInputs && !existingState && states.size() == 1) {
+    return std::move(states.front());
+  }
+
+  if (existingState && states.empty()) {
+    return existingState;
+  }
+
+  if (projectAggregationInputs && !existingState && states.size() == 1) {
+    auto input = std::move(states.front());
+    auto stream = input->stream();
+    auto projectedInput = input->getTableView().select(
+        aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+    return doGroupByAggregation(
+        projectedInput,
         groupingKeyOutputChannels_,
         intermediateAggregators_,
         bufferedResultType_,
-        inputTableStream,
+        stream,
         get_output_mr());
-    if (!groupbyOnInput) {
-      return;
-    }
-    bufferedResult_ = groupbyOnInput;
-    return;
   }
 
-  common::testutil::TestValue::adjust(
-      "CudfGroupby::computeFinalGroupbyIncrementally::beforeConcatenate",
-      &bufferedResult_);
-  std::vector<cudf::table_view> tablesToConcat;
-  tablesToConcat.push_back(bufferedResult_->getTableView());
-  tablesToConcat.push_back(permutedInputView);
+  const bool hasExistingState = existingState != nullptr;
+  std::vector<CudfVectorPtr> allVectors;
+  allVectors.reserve(states.size() + (hasExistingState ? 1 : 0));
+  if (existingState) {
+    allVectors.push_back(std::move(existingState));
+  }
+  for (auto& state : states) {
+    allVectors.push_back(std::move(state));
+  }
 
-  auto finalStream = bufferedResult_->stream();
-  cudf::detail::join_streams(
-      std::vector<cuda::stream_ref>{inputTableStream}, finalStream);
+  std::vector<cudf::table_view> tableViews;
+  std::vector<cuda::stream_ref> inputStreams;
+  tableViews.reserve(allVectors.size());
+  inputStreams.reserve(allVectors.size());
 
+  for (size_t i = 0; i < allVectors.size(); ++i) {
+    VELOX_CHECK_NOT_NULL(allVectors[i]);
+    if (i == 0 && hasExistingState) {
+      tableViews.push_back(allVectors[i]->getTableView());
+    } else if (projectAggregationInputs) {
+      tableViews.push_back(allVectors[i]->getTableView().select(
+          aggregationInputChannels_.begin(), aggregationInputChannels_.end()));
+    } else {
+      tableViews.push_back(allVectors[i]->getTableView());
+    }
+    inputStreams.push_back(allVectors[i]->stream());
+  }
+
+  auto stream = inputStreams.front();
+  cudf::detail::join_streams(inputStreams, stream);
+  if (hasExistingState) {
+    common::testutil::TestValue::adjust(
+        "CudfGroupby::computeFinalGroupbyIncrementally::beforeConcatenate",
+        &allVectors.front());
+  }
   auto concatenatedTable =
-      cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
-  // Release before the re-aggregation so the copied-from state is not part of
-  // the peak. The free is stream-ordered on `finalStream`, the stream the
-  // concatenate ran on, so it cannot race the copy.
-  bufferedResult_.reset();
-  cudf::detail::join_streams(
-      std::vector<cuda::stream_ref>{finalStream}, inputTableStream);
-  // The concatenation owns a replacement for the retained result. Release
-  // the old table before aggregation allocates its working/output buffers.
-  // Its deallocation is ordered after concatenation on finalStream.
-  bufferedResult_.reset();
-  common::testutil::TestValue::adjust(
-      "CudfGroupby::computeFinalGroupbyIncrementally::beforeAggregate",
-      &bufferedResult_);
-  auto compactedOutput = doGroupByAggregation(
+      cudf::concatenate(tableViews, stream, get_temp_mr());
+  orderCudfVectorDeallocationsAfterStream(
+      std::span<const CudfVectorPtr>(allVectors.data(), allVectors.size()),
+      std::span<const cuda::stream_ref>(
+          inputStreams.data(), inputStreams.size()),
+      stream);
+  allVectors.clear();
+  if (hasExistingState) {
+    common::testutil::TestValue::adjust(
+        "CudfGroupby::computeFinalGroupbyIncrementally::beforeAggregate",
+        &bufferedResult_);
+  }
+
+  return doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
       intermediateAggregators_,
       bufferedResultType_,
-      finalStream,
+      stream,
       get_output_mr());
-  bufferedResult_ = compactedOutput;
+}
+
+void CudfGroupby::compactPendingGroupbyStates(
+    bool projectAggregationInputs) {
+  auto states = std::move(pendingGroupbyStates_);
+  pendingGroupbyStates_.clear();
+  pendingGroupbyStateBytes_ = 0;
+
+  bufferedResult_ = compactGroupbyStates(
+      std::move(states), projectAggregationInputs, std::move(bufferedResult_));
+  if (bufferedResult_) {
+    pendingGroupbyStateBytes_ = bufferedResult_->estimateFlatSize();
+  }
+}
+
+void CudfGroupby::addPendingGroupbyState(
+    CudfVectorPtr state,
+    bool projectAggregationInputs) {
+  if (!state) {
+    return;
+  }
+
+  pendingGroupbyStateBytes_ += state->estimateFlatSize();
+  pendingGroupbyStates_.push_back(std::move(state));
+  if (pendingGroupbyStateBytes_ >= maxPartialAggregationMemoryUsage_) {
+    compactPendingGroupbyStates(projectAggregationInputs);
+  }
+}
+
+void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
+  addPendingGroupbyState(std::move(tbl), true);
 }
 
 void CudfGroupby::computeSingleGroupbyIncrementally(CudfVectorPtr tbl) {
@@ -1888,30 +2112,29 @@ void CudfGroupby::computeSingleGroupbyIncrementally(CudfVectorPtr tbl) {
       inputTableStream,
       get_output_mr());
 
-  if (bufferedResult_) {
-    auto partialOutputStream = bufferedResult_->stream();
-    std::vector<CudfVectorPtr> tablesToConcat;
-    tablesToConcat.push_back(bufferedResult_);
-    tablesToConcat.push_back(std::move(groupbyOnInput));
-    auto concatenatedTable = getConcatenatedTable(
-        std::move(tablesToConcat),
-        bufferedResultType_,
-        partialOutputStream,
-        get_temp_mr());
-    // Same as the partial path.
-    bufferedResult_.reset();
+  addPendingGroupbyState(std::move(groupbyOnInput), false);
+}
 
-    auto compactedOutput = doGroupByAggregation(
-        concatenatedTable->view(),
-        groupingKeyOutputChannels_,
-        intermediateAggregators_,
-        bufferedResultType_,
-        partialOutputStream,
-        get_output_mr());
-    bufferedResult_ = compactedOutput;
-  } else {
-    bufferedResult_ = groupbyOnInput;
+int64_t CudfGroupby::partialAggregationFlushThresholdBytes() const {
+  // Velox's default partial aggregation threshold is tuned for CPU hash tables.
+  // cuDF grouped state already lives on the GPU and can be much larger; using
+  // the CPU default causes high-cardinality partial aggregations to emit many
+  // mostly-duplicate states that the final aggregation must merge again.
+  constexpr int64_t kTinyExplicitThresholdBytes = 1 << 20;
+  constexpr int64_t kFallbackGpuThresholdBytes = 4LL << 30;
+  constexpr int64_t kMaxGpuThresholdBytes = 8LL << 30;
+
+  if (maxPartialAggregationMemoryUsage_ < kTinyExplicitThresholdBytes) {
+    return maxPartialAggregationMemoryUsage_;
   }
+
+  int64_t gpuThreshold = kFallbackGpuThresholdBytes;
+  if (auto info = currentDeviceMemoryInfo(); info.has_value()) {
+    gpuThreshold = std::min<int64_t>(
+        kMaxGpuThresholdBytes, static_cast<int64_t>(info->totalBytes / 16));
+  }
+
+  return std::max(maxPartialAggregationMemoryUsage_, gpuThreshold);
 }
 
 void CudfGroupby::doAddInput(RowVectorPtr input) {
@@ -1969,8 +2192,9 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
   };
   auto releaseInputsGuard = folly::makeGuard(releaseInputs);
   std::vector<cudf::groupby::aggregation_request> requests;
+  GroupbyAggregationRequestBuilder builder(tableView, requests);
   for (auto& aggregator : aggregators) {
-    aggregator->addGroupbyRequest(tableView, requests, stream, get_temp_mr());
+    aggregator->addGroupbyRequest(builder, stream, get_temp_mr());
   }
 
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream, mr);
@@ -2056,7 +2280,7 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   if (isPartialOutput_ && incrementalAggregationEnabled_) {
     if (bufferedResult_ &&
         bufferedResult_->estimateFlatSize() >
-            maxPartialAggregationMemoryUsage_) {
+            partialAggregationFlushThresholdBytes_) {
       return releaseAndResetBufferedResult();
     }
     if (not noMoreInput_) {
@@ -2091,6 +2315,9 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   // is true (guarded by the check above).
   if (incrementalAggregationEnabled_) {
     finished_ = true;
+    if (!pendingGroupbyStates_.empty()) {
+      compactPendingGroupbyStates(!isSingleStep_);
+    }
     if (!bufferedResult_) {
       return nullptr;
     }
@@ -2147,6 +2374,8 @@ void CudfGroupby::doClose() {
   streamingGroupbyCapacity_ = 0;
   streamingGroupbyAggregators_.clear();
   inputs_.clear();
+  pendingGroupbyStates_.clear();
+  pendingGroupbyStateBytes_ = 0;
   bufferedResult_.reset();
   aggregators_.clear();
   intermediateAggregators_.clear();

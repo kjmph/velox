@@ -73,15 +73,20 @@ class CudfBatchConcatTest : public OperatorTestBase {
     config.batchSizeMinThreshold = 100'000;
     config.batchSizeMinBytes.reset();
     config.batchSizeMaxThreshold.reset();
+    config.finalAggregationBatchSizeMinThreshold.reset();
     cudf_velox::unregisterCudf();
     OperatorTestBase::TearDown();
   }
 
-  void updateCudfConfig(int32_t min, std::optional<int32_t> max) {
+  void updateCudfConfig(
+      int32_t min,
+      std::optional<int32_t> max,
+      std::optional<int32_t> finalAggregationMin = std::nullopt) {
     auto& config = CudfConfig::getInstance();
     config.batchSizeMinBytes.reset();
     config.batchSizeMinThreshold = min;
     config.batchSizeMaxThreshold = max;
+    config.finalAggregationBatchSizeMinThreshold = finalAggregationMin;
   }
 
   void updateCudfByteConfig(uint64_t minBytes, std::optional<int32_t> maxRows) {
@@ -529,6 +534,65 @@ TEST_F(CudfBatchConcatTest, concatWithGroupedAggregation) {
   EXPECT_LT(concatIt->second->outputVectors, 6);
 }
 
+TEST_F(CudfBatchConcatTest, finalAggregationUsesDedicatedConcatThreshold) {
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < 6; ++i) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(10, [](auto row) { return row % 3; }),
+         makeFlatSequence<int64_t>(i * 10, 10)}));
+  }
+  createDuckDbTable(vectors);
+
+  auto runWithFinalAggregationThreshold =
+      [&](std::optional<int32_t> finalAggregationMin) {
+        updateCudfConfig(/*min=*/5, /*max=*/std::nullopt, finalAggregationMin);
+        CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+        auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+        std::vector<core::PlanNodePtr> partialSources;
+        partialSources.reserve(vectors.size());
+        for (const auto& vector : vectors) {
+          partialSources.push_back(
+              PlanBuilder(generator)
+                  .values({vector})
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .planNode());
+        }
+
+        core::PlanNodeId finalAggNodeId;
+        auto plan = PlanBuilder(generator)
+                        .localPartition({"c0"}, partialSources)
+                        .finalAggregation()
+                        .capturePlanNodeId(finalAggNodeId)
+                        .planNode();
+
+        auto task =
+            AssertQueryBuilder(duckDbQueryRunner_)
+                .plan(plan)
+                .maxDrivers(1)
+                .config(
+                    core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
+                .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+        const auto* concatStats = getConcatStats(task, finalAggNodeId);
+        VELOX_CHECK_NOT_NULL(concatStats);
+        return std::pair{
+            concatStats->inputVectors, concatStats->outputVectors};
+      };
+
+  const auto genericThresholdStats =
+      runWithFinalAggregationThreshold(std::nullopt);
+  const auto finalThresholdStats =
+      runWithFinalAggregationThreshold(/*finalAggregationMin=*/100000);
+
+  EXPECT_GT(genericThresholdStats.first, 1);
+  EXPECT_GT(genericThresholdStats.second, finalThresholdStats.second);
+  EXPECT_EQ(finalThresholdStats.first, genericThresholdStats.first);
+  EXPECT_EQ(finalThresholdStats.second, 1)
+      << "A high final aggregation threshold should merge compact partial "
+         "aggregation inputs into a single final aggregation batch.";
+}
+
 TEST_F(CudfBatchConcatTest, concatPreservesZeroColumnRowCountForCountStar) {
   updateCudfConfig(/*min=*/30, /*max=*/std::nullopt);
   CudfConfig::getInstance().concatOptimizationEnabled = true;
@@ -561,7 +625,6 @@ TEST_F(CudfBatchConcatTest, concatPreservesZeroColumnRowCountForCountStar) {
   EXPECT_EQ(concatIt->second->inputVectors, 1);
   EXPECT_EQ(concatIt->second->outputVectors, 1);
 }
-
 // Verifies that CudfBatchConcat is inserted before the hash join probe and
 // correctly handles the 2-source HashJoinNode plan node.
 TEST_F(CudfBatchConcatTest, concatBeforeHashJoinProbe) {

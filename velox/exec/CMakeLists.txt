@@ -48,6 +48,7 @@ velox_add_library(
   FixedPointOperators.cpp
   FixedPointSplit.cpp
   FixedPointVerdicts.cpp
+  GroupedScalarFilter.cpp
   GroupId.cpp
   GroupingSet.cpp
   HashAggregation.cpp
@@ -161,6 +162,7 @@ velox_add_library(
   FixedPointSplit.h
   FixedPointOptions.h
   FixedPointVerdicts.h
+  GroupedScalarFilter.h
   GroupId.h
   GroupingSet.h
   HashAggregation.h

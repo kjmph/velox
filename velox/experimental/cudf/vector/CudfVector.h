@@ -68,6 +68,18 @@ class CudfVector : public RowVector {
       cuda::stream_ref stream,
       ReleaseCallback releaseCallback = nullptr);
 
+  /// Constructs a CudfVector from a table view backed by a shared owner table.
+  /// The view may be a slice of owner->view(); the owner is retained until this
+  /// vector is destroyed or materialized via release().
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      cudf::table_view tableView,
+      std::shared_ptr<cudf::table> owner,
+      cuda::stream_ref stream,
+      uint64_t flatSize);
+
   ~CudfVector() override;
 
   cuda::stream_ref stream() const {
@@ -100,11 +112,12 @@ class CudfVector : public RowVector {
 
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
 
-  // Storage for either an owned table or packed table.
+  // Storage for an owned table, packed table, or shared owner table.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
-      std::unique_ptr<cudf::packed_table>>;
+      std::unique_ptr<cudf::packed_table>,
+      std::shared_ptr<cudf::table>>;
   TableStorage tableStorage_;
 
   // Table view - always valid, points to either table_->view() or

@@ -828,6 +828,46 @@ TEST_F(UcxPartitionedOutputTest, replicatesNullPartitionKeysToAllDestinations) {
       kNumPartitions * (numNullRows + 1) + (kNumRows - numNullRows - 1));
 }
 
+// Trusted null-only replication must not inherit the arbitrary-row behavior
+// of the adaptive replicate-nulls-and-any path it shares.
+TEST_F(UcxPartitionedOutputTest, replicatesOnlyNullKeysWithoutArbitraryRow) {
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  auto task = createPartitionedOutputTask(
+      taskId_,
+      pool_,
+      UcxTestData::kTestRowType,
+      kNumPartitions,
+      {"c0"},
+      FOUR_GBYTES,
+      {},
+      /*replicateNullsAndAny=*/false,
+      /*partitionFunctionSpecOverride=*/nullptr,
+      /*outputTypeOverride=*/nullptr,
+      /*replicateNulls=*/true);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      /*numDrivers=*/1);
+  runPartitionedOutput(
+      task,
+      makeKeyColumn(
+          {10, 20, kNullSentinel, 30, kNullSentinel, 40}, {2, 4}, stream),
+      stream);
+
+  std::vector<int32_t> allKeys;
+  for (int destination = 0; destination < kNumPartitions; ++destination) {
+    const auto keys = drainKeyColumn(destination);
+    EXPECT_EQ(countSentinels(keys), 2);
+    allKeys.insert(allKeys.end(), keys.begin(), keys.end());
+  }
+  EXPECT_EQ(allKeys.size(), 2 * kNumPartitions + 4);
+  // In particular, the first non-null row is routed exactly once.
+  for (const auto routedKey : {10, 20, 30, 40}) {
+    EXPECT_EQ(countValue(allKeys, routedKey), 1);
+  }
+}
+
 // A stalled destination must not block the others or make their replicated
 // rows appear again when the stalled destination resumes. The held reservation
 // exercises admission pressure without allocating a huge device buffer.

@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/buffer/Buffer.h"
@@ -161,6 +162,29 @@ CudfVector::CudfVector(
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view tableView,
+    std::shared_ptr<cudf::table> owner,
+    cuda::stream_ref stream,
+    uint64_t flatSize)
+    : RowVector(
+          pool,
+          std::move(type),
+          BufferPtr(nullptr),
+          size,
+          std::vector<VectorPtr>(),
+          std::nullopt),
+      tableStorage_{std::move(owner)},
+      tabView_{tableView},
+      stream_{stream},
+      flatSize_{flatSize} {
+  VELOX_CHECK_NOT_NULL(std::get<std::shared_ptr<cudf::table>>(tableStorage_));
+  VELOX_CHECK_EQ(tabView_.num_rows(), size);
+}
+
 CudfVector::~CudfVector() {
   // Release the GPU allocation first. device_buffer deallocation is ordered on
   // its associated stream; runReleaseCallback() synchronizes that stream before
@@ -211,33 +235,39 @@ void CudfVector::runReleaseCallback(
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {
-  flatSize_ = 0;
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
-    // Constructed from owned table - just move it out
     return std::move(*tablePtr);
   }
-  // Constructed from packed_table - materialize a table from the view.
-  // This copies the data since the view references the packed buffer.
-  auto& packedPtr =
-      std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
-  // Using same memory resource as packed_table
-  auto mr = packedPtr->data.gpu_data->memory_resource();
-  packedPtr->data.gpu_data->set_stream(stream_);
-  auto materializedTable = std::make_unique<cudf::table>(tabView_, stream_, mr);
-  // Clear the packed table once its materialization is ordered on stream_. The
-  // following synchronization waits for both the copy and the stream-ordered
-  // deallocation before returning its receive credit.
-  packedPtr.reset();
-  try {
-    stream_.sync();
-  } catch (...) {
-    auto error = std::current_exception();
-    runReleaseCallback(/*synchronizeStream=*/false, error);
-    std::rethrow_exception(error);
+  if (auto* packedPtr =
+          std::get_if<std::unique_ptr<cudf::packed_table>>(&tableStorage_)) {
+    // Materialize on the same stream that releases the packed allocation.
+    auto mr = (*packedPtr)->data.gpu_data->memory_resource();
+    (*packedPtr)->data.gpu_data->set_stream(stream_);
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, mr);
+    // Wait for both the copy and stream-ordered free before returning credit.
+    packedPtr->reset();
+    try {
+      stream_.sync();
+    } catch (...) {
+      auto error = std::current_exception();
+      runReleaseCallback(/*synchronizeStream=*/false, error);
+      std::rethrow_exception(error);
+    }
+    runReleaseCallback(/*synchronizeStream=*/false);
+    return materializedTable;
   }
-  runReleaseCallback(/*synchronizeStream=*/false);
-  return materializedTable;
+  if (auto* ownerPtr =
+          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+    auto materializedTable =
+        std::make_unique<cudf::table>(tabView_, stream_, get_output_mr());
+    stream_.sync();
+    ownerPtr->reset();
+    runReleaseCallback();
+    return materializedTable;
+  }
+  VELOX_UNREACHABLE();
 }
 
 bool CudfVector::rebindStream(cuda::stream_ref stream) {
@@ -271,6 +301,11 @@ bool CudfVector::rebindStream(cuda::stream_ref stream) {
     (*packedPtr)->data.gpu_data->set_stream(stream);
     stream_ = stream;
     return true;
+  }
+
+  if (auto* ownerPtr =
+          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+    return *ownerPtr != nullptr && stream_.get() == stream.get();
   }
 
   return false;

@@ -1776,6 +1776,24 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
   if (nullAsValue_) {
     stream << ", null as value";
   }
+  if (leftKeysUnique_) {
+    stream << ", left keys unique";
+  }
+  if (rightKeysUnique_) {
+    stream << ", right keys unique";
+  }
+  if (leftKeysNonNull_) {
+    stream << ", left keys non-null";
+  }
+  if (rightKeysNonNull_) {
+    stream << ", right keys non-null";
+  }
+  if (leftKeysCoveredByRightKeys_) {
+    stream << ", left keys covered by right keys";
+  }
+  if (rightKeysCoveredByLeftKeys_) {
+    stream << ", right keys covered by left keys";
+  }
 }
 
 folly::dynamic HashJoinNode::serialize() const {
@@ -1786,6 +1804,12 @@ folly::dynamic HashJoinNode::serialize() const {
   if (cacheKey_.has_value()) {
     obj["cacheKey"] = cacheKey_.value();
   }
+  obj["leftKeysUnique"] = leftKeysUnique_;
+  obj["rightKeysUnique"] = rightKeysUnique_;
+  obj["leftKeysNonNull"] = leftKeysNonNull_;
+  obj["rightKeysNonNull"] = rightKeysNonNull_;
+  obj["leftKeysCoveredByRightKeys"] = leftKeysCoveredByRightKeys_;
+  obj["rightKeysCoveredByLeftKeys"] = rightKeysCoveredByLeftKeys_;
   return obj;
 }
 
@@ -1807,6 +1831,14 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
   if (obj.count("cacheKey")) {
     cacheKey = obj["cacheKey"].asString();
   }
+  auto leftKeysUnique = obj.getDefault("leftKeysUnique", false).asBool();
+  auto rightKeysUnique = obj.getDefault("rightKeysUnique", false).asBool();
+  auto leftKeysNonNull = obj.getDefault("leftKeysNonNull", false).asBool();
+  auto rightKeysNonNull = obj.getDefault("rightKeysNonNull", false).asBool();
+  auto leftKeysCoveredByRightKeys =
+      obj.getDefault("leftKeysCoveredByRightKeys", false).asBool();
+  auto rightKeysCoveredByLeftKeys =
+      obj.getDefault("rightKeysCoveredByLeftKeys", false).asBool();
   auto leftKeys = deserializeFields(obj["leftKeys"], context);
   auto rightKeys = deserializeFields(obj["rightKeys"], context);
 
@@ -1829,7 +1861,13 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       outputType,
       useHashTableCache,
       nullAsValue,
-      std::move(cacheKey));
+      std::move(cacheKey),
+      leftKeysUnique,
+      rightKeysUnique,
+      leftKeysNonNull,
+      rightKeysNonNull,
+      leftKeysCoveredByRightKeys,
+      rightKeysCoveredByLeftKeys);
 }
 
 MergeJoinNode::MergeJoinNode(
@@ -3509,6 +3547,9 @@ void LocalPartitionNode::addDetails(std::stringstream& stream) const {
   if (scaleWriter_) {
     stream << " scaleWriter";
   }
+  if (replicateNulls_) {
+    stream << " replicate nulls";
+  }
 }
 
 folly::dynamic LocalPartitionNode::serialize() const {
@@ -3516,6 +3557,7 @@ folly::dynamic LocalPartitionNode::serialize() const {
   obj["type"] = toName(type_);
   obj["scaleWriter"] = scaleWriter_;
   obj["partitionFunctionSpec"] = partitionFunctionSpec_->serialize();
+  obj["replicateNulls"] = replicateNulls_;
   return obj;
 }
 
@@ -3535,7 +3577,8 @@ PlanNodePtr LocalPartitionNode::create(
       obj["scaleWriter"].asBool(),
       ISerializable::deserialize<PartitionFunctionSpec>(
           obj["partitionFunctionSpec"], context),
-      deserializeSources(obj, context));
+      deserializeSources(obj, context),
+      obj.getDefault("replicateNulls", false).asBool());
 }
 
 namespace {
@@ -3560,6 +3603,7 @@ PartitionedOutputNode::PartitionedOutputNode(
     const std::vector<TypedExprPtr>& keys,
     int numPartitions,
     bool replicateNullsAndAny,
+    bool replicateNulls,
     PartitionFunctionSpecPtr partitionFunctionSpec,
     RowTypePtr outputType,
     std::string serdeKind,
@@ -3572,6 +3616,7 @@ PartitionedOutputNode::PartitionedOutputNode(
       keys_(keys),
       numPartitions_(numPartitions),
       replicateNullsAndAny_(replicateNullsAndAny),
+      replicateNulls_(replicateNulls),
       partitionFunctionSpec_(std::move(partitionFunctionSpec)),
       serdeKind_(std::move(serdeKind)),
       transportKind_(std::move(transportKind)),
@@ -3610,6 +3655,7 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::broadcast(
       noKeys,
       numPartitions,
       false,
+      false,
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
@@ -3631,6 +3677,7 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::arbitrary(
       noKeys,
       1,
       false,
+      false,
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
       serdeKind,
@@ -3651,6 +3698,7 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
       Kind::kPartitioned,
       noKeys,
       1,
+      false,
       false,
       std::make_shared<GatherPartitionFunctionSpec>(),
       std::move(outputType),
@@ -3714,6 +3762,9 @@ void PartitionedOutputNode::addDetails(std::stringstream& stream) const {
   if (replicateNullsAndAny_) {
     stream << " replicate nulls and any";
   }
+  if (replicateNulls_) {
+    stream << " replicate nulls";
+  }
 
   stream << " ";
   addVectorSerdeKind(serdeKind_, stream);
@@ -3726,6 +3777,7 @@ folly::dynamic PartitionedOutputNode::serialize() const {
   obj["numPartitions"] = numPartitions_;
   obj["keys"] = ISerializable::serialize(keys_);
   obj["replicateNullsAndAny"] = replicateNullsAndAny_;
+  obj["replicateNulls"] = replicateNulls_;
   obj["partitionFunctionSpec"] = partitionFunctionSpec_->serialize();
   obj["serdeKind"] = serdeKind_;
   obj["transportKind"] = transportKind_;
@@ -3750,6 +3802,7 @@ PlanNodePtr PartitionedOutputNode::create(
       ISerializable::deserialize<std::vector<ITypedExpr>>(obj["keys"], context),
       obj["numPartitions"].asInt(),
       obj["replicateNullsAndAny"].asBool(),
+      obj.getDefault("replicateNulls", false).asBool(),
       ISerializable::deserialize<PartitionFunctionSpec>(
           obj["partitionFunctionSpec"], context),
       deserializeRowType(obj["outputType"]),
@@ -4214,6 +4267,7 @@ void PlanNode::registerSerDe() {
   registry.Register("ExchangeNode", ExchangeNode::create);
   registry.Register("ExpandNode", ExpandNode::create);
   registry.Register("FilterNode", FilterNode::create);
+  registry.Register("GroupedScalarFilterNode", GroupedScalarFilterNode::create);
   registry.Register("GroupIdNode", GroupIdNode::create);
   registry.Register("HashJoinNode", HashJoinNode::create);
   registry.Register("MergeExchangeNode", MergeExchangeNode::create);
@@ -4311,6 +4365,43 @@ void FilterNode::accept(
   visitor.visit(*this, context);
 }
 
+void GroupedScalarFilterNode::addSummaryDetails(
+    const std::string& indentation,
+    const PlanSummaryOptions& options,
+    std::stringstream& stream) const {
+  SummarizeExprVisitor::Context exprCtx;
+  SummarizeExprVisitor visitor;
+  filter_->accept(visitor, exprCtx);
+
+  appendExprSummary(indentation, options, exprCtx, stream);
+
+  stream << indentation << "groupId: " << groupIdName_
+         << ", groupedGroupId: " << groupedGroupId_
+         << ", scalarGroupId: " << scalarGroupId_
+         << ", scalarValue: " << scalarValueName_
+         << ", scalarVariable: " << scalarVariableName_ << std::endl;
+  stream << indentation
+         << "filter: " << truncate(filter_->toString(), options.maxLength)
+         << std::endl;
+}
+
+folly::dynamic GroupedScalarFilterNode::serialize() const {
+  auto obj = PlanNode::serialize();
+  obj["groupIdName"] = groupIdName_;
+  obj["groupedGroupId"] = groupedGroupId_;
+  obj["scalarGroupId"] = scalarGroupId_;
+  obj["scalarValueName"] = scalarValueName_;
+  obj["scalarVariableName"] = scalarVariableName_;
+  obj["filter"] = filter_->serialize();
+  return obj;
+}
+
+void GroupedScalarFilterNode::accept(
+    const PlanNodeVisitor& visitor,
+    PlanNodeVisitorContext& context) const {
+  visitor.visit(*this, context);
+}
+
 void AggregationNode::addSummaryDetails(
     const std::string& indentation,
     const PlanSummaryOptions& options,
@@ -4341,6 +4432,23 @@ PlanNodePtr FilterNode::create(const folly::dynamic& obj, void* context) {
   auto filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
   return std::make_shared<FilterNode>(
       deserializePlanNodeId(obj), filter, std::move(source));
+}
+
+// static
+PlanNodePtr GroupedScalarFilterNode::create(
+    const folly::dynamic& obj,
+    void* context) {
+  auto source = deserializeSingleSource(obj, context);
+  auto filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
+  return std::make_shared<GroupedScalarFilterNode>(
+      deserializePlanNodeId(obj),
+      std::move(source),
+      obj["groupIdName"].asString(),
+      obj["groupedGroupId"].asInt(),
+      obj["scalarGroupId"].asInt(),
+      obj["scalarValueName"].asString(),
+      obj["scalarVariableName"].asString(),
+      std::move(filter));
 }
 
 folly::dynamic IndexLookupCondition::serialize() const {

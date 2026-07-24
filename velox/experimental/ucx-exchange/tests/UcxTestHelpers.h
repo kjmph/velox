@@ -104,7 +104,8 @@ std::shared_ptr<facebook::velox::exec::Task> createPartitionedOutputTask(
     bool replicateNullsAndAny = false,
     facebook::velox::core::PartitionFunctionSpecPtr
         partitionFunctionSpecOverride = nullptr,
-    facebook::velox::RowTypePtr outputTypeOverride = nullptr);
+    facebook::velox::RowTypePtr outputTypeOverride = nullptr,
+    bool replicateNulls = false);
 
 /// @brief Helper function to create a CudfVector for testing.
 /// Uses makeTable when tableGenerator is null, or tableGenerator->makeTable()

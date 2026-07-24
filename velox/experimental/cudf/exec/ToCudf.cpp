@@ -494,6 +494,10 @@ void CudfConfig::initialize(
     batchSizeMaxThreshold =
         folly::to<int32_t>(config[kCudfBatchSizeMaxThreshold]);
   }
+  if (config.find(kCudfFinalAggregationBatchSizeMinThreshold) != config.end()) {
+    finalAggregationBatchSizeMinThreshold =
+        folly::to<int32_t>(config[kCudfFinalAggregationBatchSizeMinThreshold]);
+  }
   if (config.find(kCudfConcatOptimizationEnabled) != config.end()) {
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
@@ -505,6 +509,14 @@ void CudfConfig::initialize(
   if (config.find(kCudfStreamingGroupbyCapacityMultiplier) != config.end()) {
     streamingGroupbyCapacityMultiplier =
         folly::to<double>(config[kCudfStreamingGroupbyCapacityMultiplier]);
+  }
+  if (config.find(kCudfDistinctHashJoinEnabled) != config.end()) {
+    distinctHashJoinEnabled =
+        folly::to<bool>(config[kCudfDistinctHashJoinEnabled]);
+  }
+  if (config.find(kCudfProbeUniqueInnerJoinEnabled) != config.end()) {
+    probeUniqueInnerJoinEnabled =
+        folly::to<bool>(config[kCudfProbeUniqueInnerJoinEnabled]);
   }
   if (config.find(kCudfExchange) != config.end()) {
     exchange = folly::to<bool>(config[kCudfExchange]);

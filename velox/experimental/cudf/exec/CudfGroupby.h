@@ -20,7 +20,9 @@
 
 #include <cudf/groupby.hpp>
 
+#include <memory>
 #include <optional>
+#include <unordered_map>
 #include <string_view>
 #include <utility>
 
@@ -76,9 +78,66 @@ struct StreamingGroupbyAggregator {
       std::optional<column_index_t> childIndex = std::nullopt) const;
 };
 
+struct GroupbyAggregationResultRef {
+  uint32_t requestIndex;
+  uint32_t resultIndex;
+  std::shared_ptr<bool> shared;
+};
+
+struct GroupbyPartialMeanResultRefs {
+  GroupbyAggregationResultRef sum;
+  GroupbyAggregationResultRef count;
+};
+
+class GroupbyAggregationRequestBuilder {
+ public:
+  GroupbyAggregationRequestBuilder(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests);
+
+  GroupbyAggregationResultRef addAggregationForColumn(
+      uint32_t inputIndex,
+      std::unique_ptr<cudf::groupby_aggregation> aggregation);
+
+  GroupbyAggregationResultRef addAggregationForValues(
+      cudf::column_view values,
+      std::unique_ptr<cudf::groupby_aggregation> aggregation);
+
+  GroupbyAggregationResultRef addSum(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey,
+      core::AggregationNode::Step step);
+
+  GroupbyPartialMeanResultRefs addPartialMean(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey);
+
+  cudf::table_view const& tableView() const {
+    return tableView_;
+  }
+
+  std::vector<cudf::groupby::aggregation_request>& requests() {
+    return requests_;
+  }
+
+  cudf::groupby::aggregation_request& aggregationRequest(
+      const GroupbyAggregationResultRef& ref);
+
+ private:
+  GroupbyAggregationResultRef addReusablePartialSum(
+      uint32_t inputIndex,
+      uint32_t reusableInputKey);
+
+  cudf::table_view tableView_;
+  std::vector<cudf::groupby::aggregation_request>& requests_;
+  std::unordered_map<uint32_t, GroupbyAggregationResultRef>
+      reusablePartialSums_;
+};
+
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
   uint32_t inputIndex;
+  uint32_t reusableInputKey;
   VectorPtr constant;
   TypePtr resultType;
   std::optional<uint32_t> maskIndex;
@@ -88,6 +147,15 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_request>& requests,
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
+
+  // Most aggregates keep their type-specific request construction. Unmasked
+  // partial SUM and AVG override this to reuse the same input sum.
+  virtual void addGroupbyRequest(
+      GroupbyAggregationRequestBuilder& builder,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) {
+    addGroupbyRequest(builder.tableView(), builder.requests(), stream, mr);
+  }
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
@@ -117,6 +185,7 @@ struct GroupbyAggregator {
       std::optional<uint32_t> maskIndex)
       : step(step),
         inputIndex(inputIndex),
+        reusableInputKey(inputIndex),
         constant(constant),
         resultType(resultType),
         maskIndex(maskIndex) {}
@@ -146,7 +215,8 @@ std::vector<std::unique_ptr<GroupbyAggregator>> toGroupbyAggregators(
     core::AggregationNode::Step step,
     TypePtr const& outputType,
     std::vector<VectorPtr> const& constants,
-    std::vector<std::optional<uint32_t>> const& maskChannels);
+    std::vector<std::optional<uint32_t>> const& maskChannels,
+    const std::vector<column_index_t>* aggregationInputChannels = nullptr);
 
 std::optional<std::vector<std::unique_ptr<StreamingGroupbyAggregator>>>
 toStreamingGroupbyAggregators(
@@ -232,6 +302,13 @@ class CudfGroupby : public CudfOperatorBase {
   void computePartialGroupbyIncrementally(CudfVectorPtr tbl);
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
+  void addPendingGroupbyState(CudfVectorPtr state, bool projectAggregationInputs);
+  void compactPendingGroupbyStates(bool projectAggregationInputs);
+  CudfVectorPtr compactGroupbyStates(
+      std::vector<CudfVectorPtr>&& states,
+      bool projectAggregationInputs,
+      CudfVectorPtr existingState = nullptr);
+  int64_t partialAggregationFlushThresholdBytes() const;
 
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
@@ -251,6 +328,7 @@ class CudfGroupby : public CudfOperatorBase {
   bool incrementalAggregationEnabled_{true};
   bool streamingGroupbyEnabled_{false};
   const int64_t maxPartialAggregationMemoryUsage_;
+  int64_t partialAggregationFlushThresholdBytes_{0};
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;
@@ -261,6 +339,8 @@ class CudfGroupby : public CudfOperatorBase {
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;
+  std::vector<CudfVectorPtr> pendingGroupbyStates_;
+  int64_t pendingGroupbyStateBytes_{0};
 
   std::vector<std::unique_ptr<StreamingGroupbyAggregator>>
       streamingGroupbyAggregators_;

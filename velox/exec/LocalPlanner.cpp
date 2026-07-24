@@ -28,6 +28,7 @@
 #include "velox/exec/Expand.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/FixedPointOperators.h"
+#include "velox/exec/GroupedScalarFilter.h"
 #include "velox/exec/GroupId.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
@@ -548,6 +549,12 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
       }
       operators.push_back(
           std::make_unique<FilterProject>(id, ctx.get(), filterNode, nullptr));
+    } else if (
+        auto groupedScalarFilterNode =
+            std::dynamic_pointer_cast<const core::GroupedScalarFilterNode>(
+                planNode)) {
+      operators.push_back(std::make_unique<GroupedScalarFilter>(
+          id, ctx.get(), groupedScalarFilterNode));
     } else if (
         auto projectNode =
             std::dynamic_pointer_cast<const core::ProjectNode>(planNode)) {

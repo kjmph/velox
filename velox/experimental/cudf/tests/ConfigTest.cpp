@@ -29,7 +29,22 @@ TEST(ConfigTest, batchConcatThresholdDefaults) {
   EXPECT_FALSE(config.batchSizeMinBytes);
 }
 
-TEST(ConfigTest, cudfConfig) {
+TEST(ConfigTest, Defaults) {
+  CudfConfig config;
+  ASSERT_EQ(config.distinctHashJoinEnabled, true);
+  ASSERT_EQ(config.probeUniqueInnerJoinEnabled, false);
+}
+
+TEST(ConfigTest, DistinctHashJoinCanBeDisabled) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "false"}};
+
+  CudfConfig config;
+  config.initialize(std::move(options));
+  ASSERT_EQ(config.distinctHashJoinEnabled, false);
+}
+
+TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
       {CudfConfig::kCudfDebugEnabled, "true"},
@@ -41,6 +56,9 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
       {CudfConfig::kCudfBatchSizeMinBytes, "2147483648"},
+      {CudfConfig::kCudfFinalAggregationBatchSizeMinThreshold, "150000000"},
+      {CudfConfig::kCudfDistinctHashJoinEnabled, "true"},
+      {CudfConfig::kCudfProbeUniqueInnerJoinEnabled, "true"},
       {CudfConfig::kCudfExchange, "true"},
       {CudfConfig::kCudfExchangeServerPort, "12345"},
       {CudfConfig::kCudfIntraNodeExchange, "false"},
@@ -63,6 +81,10 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 123'456);
   ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
+  ASSERT_TRUE(config.finalAggregationBatchSizeMinThreshold.has_value());
+  ASSERT_EQ(config.finalAggregationBatchSizeMinThreshold.value(), 150000000);
+  ASSERT_EQ(config.distinctHashJoinEnabled, true);
+  ASSERT_EQ(config.probeUniqueInnerJoinEnabled, true);
   ASSERT_EQ(config.exchange, true);
   ASSERT_EQ(config.exchangeServerPort, 12345);
   ASSERT_EQ(config.intraNodeExchange, false);

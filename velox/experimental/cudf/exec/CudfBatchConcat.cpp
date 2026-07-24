@@ -63,12 +63,20 @@ size_t getTargetRows() {
   return targetRows;
 }
 
+size_t resolveTargetRows(size_t targetRows) {
+  if (targetRows != 0) {
+    return targetRows;
+  }
+  return getTargetRows();
+}
+
 } // namespace
 
 CudfBatchConcat::CudfBatchConcat(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    std::shared_ptr<const core::PlanNode> planNode)
+    std::shared_ptr<const core::PlanNode> planNode,
+    size_t targetRows)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -79,8 +87,8 @@ CudfBatchConcat::CudfBatchConcat(
           NvtxMethodFlag::kAll,
           std::nullopt,
           planNode),
-      targetBytes_(getTargetBytes(outputType_)),
-      targetRows_(getTargetRows()) {}
+      targetBytes_(targetRows == 0 ? getTargetBytes(outputType_) : std::nullopt),
+      targetRows_(resolveTargetRows(targetRows)) {}
 
 bool CudfBatchConcat::meetsTarget(size_t numRows, uint64_t numBytes) const {
   if (targetBytes_.has_value()) {
@@ -94,6 +102,10 @@ uint64_t CudfBatchConcat::estimateBytes(const CudfVector& vector) const {
 }
 
 void CudfBatchConcat::doAddInput(RowVectorPtr input) {
+  if (input->size() == 0) {
+    return;
+  }
+
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
 

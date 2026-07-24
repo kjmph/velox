@@ -208,6 +208,7 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       isPartitionedKind_(
           planNode->kind() == core::PartitionedOutputNode::Kind::kPartitioned),
       replicateNullsAndAny_(planNode->isReplicateNullsAndAny()),
+      replicateNulls_(planNode->isReplicateNulls()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       flushThresholdRows_(ctx->queryConfig().get<int64_t>(
@@ -228,6 +229,15 @@ UcxPartitionedOutput::UcxPartitionedOutput(
         "projecting away all output columns");
   }
   this->initPartitionKeys(planNode);
+  VELOX_CHECK(
+      !replicateNullsAndAny_ || !partitionKeyIndices_.empty(),
+      "Null-key replication requires at least one partition key");
+  if (replicateNulls_) {
+    VELOX_USER_CHECK_EQ(
+        partitionKeyIndices_.size(),
+        1,
+        "UcxPartitionedOutput replicateNulls requires exactly one partition key");
+  }
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
   inNames.reserve(planNode->inputType()->size());
@@ -399,7 +409,7 @@ bool UcxPartitionedOutput::downsizePendingInputBatch() {
 
 bool UcxPartitionedOutput::prepareReplicateNullsAndAny(
     PendingInputBatch& input) {
-  if (!replicateNullsAndAny_ || numPartitions_ <= 1) {
+  if ((!replicateNullsAndAny_ && !replicateNulls_) || numPartitions_ <= 1) {
     return false;
   }
 
@@ -431,7 +441,7 @@ bool UcxPartitionedOutput::prepareReplicateNullsAndAny(
     }
   }
   const bool anyKeyHasNulls = !nullKeyIndices.empty();
-  const bool needsArbitraryRow = !replicatedAnyRow_;
+  const bool needsArbitraryRow = replicateNullsAndAny_ && !replicatedAnyRow_;
   if (!anyKeyHasNulls && !needsArbitraryRow) {
     return false;
   }
@@ -919,7 +929,7 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
       };
 
       VELOX_CHECK(
-          !replicateNullsAndAny_ || numPartitions_ == 1,
+          (!replicateNullsAndAny_ && !replicateNulls_) || numPartitions_ == 1,
           "A partitioned output with an empty layout has no partition key to "
           "replicate nulls for");
       if (numPartitions_ == 1) {

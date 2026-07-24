@@ -91,6 +91,10 @@ class HashPartitionFunctionSpec : public core::PartitionFunctionSpec {
 
   folly::dynamic serialize() const override;
 
+  const std::vector<column_index_t>& keyChannels() const {
+    return keyChannels_;
+  }
+
   static core::PartitionFunctionSpecPtr deserialize(
       const folly::dynamic& obj,
       void* context);

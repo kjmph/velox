@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfDistinct.h"
 #include "velox/experimental/cudf/exec/CudfEnforceSingleRow.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/exec/CudfGroupId.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
@@ -52,6 +53,7 @@
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/FilterProject.h"
+#include "velox/exec/GroupedScalarFilter.h"
 #include "velox/exec/GroupId.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
@@ -294,6 +296,64 @@ class FilterProjectAdapter : public OperatorAdapter {
   }
 };
 
+/// GroupedScalarFilterAdapter - Replaces with CudfGroupedScalarFilter.
+class GroupedScalarFilterAdapter : public OperatorAdapter {
+ public:
+  GroupedScalarFilterAdapter() : OperatorAdapter("GroupedScalarFilter") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::GroupedScalarFilter*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx) const override {
+    auto groupedScalarFilterNode =
+        std::dynamic_pointer_cast<const core::GroupedScalarFilterNode>(
+            planNode);
+    if (!groupedScalarFilterNode) {
+      LOG_FALLBACK(
+          "GroupedScalarFilterAdapter plan node is not GroupedScalarFilter, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    if (!canBeEvaluatedByCudf(
+            {groupedScalarFilterNode->filter()},
+            ctx->task->queryCtx().get())) {
+      LOG_FALLBACK(
+          "GroupedScalarFilter predicate cannot be evaluated by cuDF, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto groupedScalarFilterNode =
+        std::dynamic_pointer_cast<const core::GroupedScalarFilterNode>(
+            planNode);
+    VELOX_CHECK_NOT_NULL(groupedScalarFilterNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfGroupedScalarFilter>(
+        operatorId, ctx, groupedScalarFilterNode));
+    return result;
+  }
+};
+
 /// AggregationAdapter - Replaces with CudfGroupby, CudfDistinct, or CudfReduce
 class AggregationAdapter : public OperatorAdapter {
  public:
@@ -354,10 +414,20 @@ class AggregationAdapter : public OperatorAdapter {
     bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    if (CudfConfig::getInstance().concatOptimizationEnabled) {
-      result.push_back(
-          std::make_unique<CudfBatchConcat>(
-              operatorId, ctx, aggregationPlanNode));
+    const auto& cudfConfig = CudfConfig::getInstance();
+    if (cudfConfig.concatOptimizationEnabled) {
+      VELOX_CHECK_GT(cudfConfig.batchSizeMinThreshold, 0);
+      auto targetRows = static_cast<size_t>(cudfConfig.batchSizeMinThreshold);
+      if (!isGlobal && !isDistinct &&
+          aggregationPlanNode->step() == core::AggregationNode::Step::kFinal &&
+          cudfConfig.finalAggregationBatchSizeMinThreshold.has_value()) {
+        VELOX_CHECK_GT(
+            cudfConfig.finalAggregationBatchSizeMinThreshold.value(), 0);
+        targetRows = static_cast<size_t>(
+            cudfConfig.finalAggregationBatchSizeMinThreshold.value());
+      }
+      result.push_back(std::make_unique<CudfBatchConcat>(
+          operatorId, ctx, aggregationPlanNode, targetRows));
     }
     if (isGlobal) {
       result.push_back(
@@ -1441,6 +1511,7 @@ void registerAllOperatorAdapters() {
   // Register all adapters
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
+  registry.registerAdapter(std::make_unique<GroupedScalarFilterAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinProbeAdapter>());

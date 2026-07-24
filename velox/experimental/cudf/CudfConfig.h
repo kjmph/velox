@@ -50,12 +50,19 @@ struct CudfConfig {
       "cudf.batch_size_min_bytes"};
   static constexpr const char* kCudfBatchSizeMaxThreshold{
       "cudf.batch_size_max_threshold"};
+  static constexpr const char* kCudfFinalAggregationBatchSizeMinThreshold{
+      "cudf.final_aggregation_batch_size_min_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
       "cudf.streaming_groupby_capacity_multiplier"};
+  // TODO: Remove this switch during the production config/default pass.
+  static constexpr const char* kCudfDistinctHashJoinEnabled{
+      "cudf.distinct_hash_join_enabled"};
+  static constexpr const char* kCudfProbeUniqueInnerJoinEnabled{
+      "cudf.probe_unique_inner_join_enabled"};
   static constexpr const char* kCudfExchange{"cudf.exchange"};
   static constexpr const char* kCudfExchangeServerPort{
       "cudf.exchange.server.port"};
@@ -204,6 +211,17 @@ struct CudfConfig {
   /// LIBCUDF_LARGE_STRINGS_ENABLED is set; cuDF rejects strings columns whose
   /// character data overflows 32-bit offsets.
   std::optional<uint64_t> batchSizeMinBytes;
+  /// Whether joins with trusted unique build keys should use
+  /// cudf::distinct_hash_join instead of cudf::hash_join.
+  bool distinctHashJoinEnabled{true};
+
+  /// Experimental: for inner joins with trusted unique, non-null probe keys,
+  /// build a temporary distinct hash table on the probe batch and probe it with
+  /// the build side.
+  bool probeUniqueInnerJoinEnabled{false};
+
+  /// Optional CudfBatchConcat target used only before final aggregations.
+  std::optional<int32_t> finalAggregationBatchSizeMinThreshold;
 
   /// Maximum rows allowed in a concatenated batch (user configurable).
   /// When not set, cuDF's own `size_type::max()` is used.

@@ -30,6 +30,7 @@
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -37,6 +38,8 @@
 
 #include <memory>
 #include <vector>
+#include <optional>
+#include <utility>
 
 namespace facebook::velox::cudf_velox {
 
@@ -58,13 +61,17 @@ class CudfExpression;
  */
 class CudfHashJoinBridge : public exec::JoinBridge {
  public:
+  struct HashJoinState {
+    std::vector<std::shared_ptr<cudf::table>> buildTables;
+    std::vector<std::shared_ptr<cudf::hash_join>> hashJoins;
+    std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctHashJoins;
+  };
+
   // The bridge transfers all build side batches and the hash join objects
   // constructed from them to the probe operator
   /** @brief Hash tables paired with their corresponding join objects for
    * batched processing */
-  using hash_type = std::pair<
-      std::vector<std::shared_ptr<cudf::table>>,
-      std::vector<std::shared_ptr<cudf::hash_join>>>;
+  using hash_type = HashJoinState;
 
   void setHashTable(std::optional<hash_type> hashObject);
 
@@ -108,10 +115,14 @@ class CudfHashJoinBuild : public CudfJoinBuild {
 
  protected:
   void recordInputStats(const CudfVector& input) override;
+  CudfVectorPtr prepareInput(CudfVectorPtr input) override;
   void buildAndPublish(std::vector<CudfVectorPtr> inputs) override;
 
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
+  std::vector<cudf::size_type> buildKeyIndices_;
+  std::optional<std::pair<cudf::size_type, cudf::size_type>> simpleNotEqual_;
+  RowTypePtr minMaxSummaryType_;
 };
 
 /**
@@ -212,6 +223,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   RowTypePtr buildType_;
   /** @brief Cached evaluator for post-join filter column */
   std::shared_ptr<CudfExpression> filterEvaluator_;
+  std::optional<cudf::size_type> simpleNotEqualLeftIndex_;
+  std::optional<cudf::size_type> simpleNotEqualRightIndex_;
 
   bool rightPrecomputed_{false};
 
@@ -294,6 +307,25 @@ class CudfHashJoinProbe : public CudfOperatorBase {
     vector_size_t numRows;
   };
 
+  using JoinIndices = std::pair<
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>>>;
+
+  JoinIndices computeInnerJoinIndices(
+      size_t buildTableIndex,
+      cudf::table_view leftKeyView,
+      cuda::stream_ref stream);
+
+  JoinIndices computeLeftJoinIndices(
+      size_t buildTableIndex,
+      cudf::table_view leftKeyView,
+      cuda::stream_ref stream);
+
+  JoinIndices computeProbeUniqueInnerJoinIndices(
+      cudf::table_view leftKeyView,
+      cudf::table_view rightKeyView,
+      cuda::stream_ref stream);
+
   /**
    * @brief Performs inner join between probe table and all build tables.
    * @param leftTable Probe-side table to join
@@ -351,6 +383,10 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<JoinOutput> leftSemiProjectJoin(
       cudf::table_view leftTableView,
       cuda::stream_ref stream);
+
+  std::vector<JoinOutput> leftSemiProjectMinMaxJoin(
+      cudf::table_view leftTableView,
+      cuda::stream_ref stream);
   /**
    * @brief Performs right semi filter join between probe table and all build
    * tables.
@@ -382,6 +418,20 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   JoinOutput unfilteredOutput(
       cudf::table_view leftTableView,
       cudf::column_view leftIndicesCol,
+      cudf::table_view rightTableView,
+      cudf::column_view rightIndicesCol,
+      cuda::stream_ref stream);
+  /**
+   * @brief Constructs left-join output when probe rows are already in output
+   * order.
+   *
+   * For a LEFT join against a build side with unique keys, cuDF returns one
+   * right-side index per probe row. The left side is therefore the identity
+   * projection of the probe table and does not need a materialized
+   * [0, row_count) index vector or a gather.
+   */
+  JoinOutput unfilteredOutputWithIdentityLeft(
+      cudf::table_view leftTableView,
       cudf::table_view rightTableView,
       cudf::column_view rightIndicesCol,
       cuda::stream_ref stream);

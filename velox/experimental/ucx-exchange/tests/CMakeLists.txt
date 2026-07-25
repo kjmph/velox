@@ -66,9 +66,6 @@ if(VELOX_ENABLE_CUDF)
 
   target_link_libraries(
     ucx_exchange_test
-    UcxExchangeQueueTest.cpp
-    UcxExchangeProtocolTest.cpp
-    IntraNodeTransferRegistryTest.cpp
     velox_ucx_exchange
     velox_cudf_exec
     velox_exec

@@ -57,7 +57,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
           core::PartitionedOutputNode::Kind::kPartitioned,
       uint64_t maxOutputBufferSize = FOUR_GBYTES) {
     if (cleanup) {
-      queueManager_->removeTask(taskId);
+      queueManager_->removeTask(std::string{taskId});
     }
 
     auto task = createSourceTask(
@@ -385,6 +385,22 @@ TEST_F(UcxOutputQueueManagerTest, registersUcxOutputTransport) {
       exec::OutputTransportRegistry::tryGet(
           std::string{core::TransportKind::kInMemory}),
       nullptr);
+}
+
+TEST_F(UcxOutputQueueManagerTest, diagnostics) {
+  const std::string taskId = "diagnostics";
+  initializeTask(taskId, 2 /* numDestinations */, 1 /* numDrivers */);
+
+  const auto diagnostics = queueManager_->toString(taskId);
+  EXPECT_NE(
+      diagnostics.find("UcxOutputQueue task=" + taskId), std::string::npos);
+  EXPECT_NE(diagnostics.find("queues="), std::string::npos);
+  EXPECT_NE(diagnostics.find("numFinished=0/1"), std::string::npos);
+
+  queueManager_->removeTask(taskId);
+  EXPECT_EQ(
+      queueManager_->toString(taskId),
+      "UcxOutputQueue[" + taskId + " not found]");
 }
 
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {

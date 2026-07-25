@@ -12,44 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+find_package(Threads REQUIRED)
+
 add_executable(
-  ucx_exchange_test
-  UcxExchangeQueueTest.cpp
-  UcxExchangeProtocolTest.cpp
-  IntraNodeTransferRegistryTest.cpp
-  UcxOutputQueueManagerTest.cpp
-  UcxPartitionedOutputTest.cpp
-  UcxExchangeTest.cpp
-  UcxExchangeTaskTest.cpp
-  UcxExchangeTestBase.cpp
-  Main.cpp
-  UcxTestHelpers.cpp
-  UcxTestData.cpp
-  UcxPartitionedOutputMock.cpp
-  SinkDriverMock.cpp
-  SourceDriverMock.cpp
+  ucx_cpu_row_completion_tracker_test
+  CpuRowFrameCompletionTrackerTest.cpp
+  CpuRowPayloadCopyTest.cpp
+  ../CpuRowFrameCompletionTracker.cpp
+  ../CpuRowPayloadCopy.cpp
 )
 
 add_test(
-  NAME ucx_exchange_test
-  COMMAND ucx_exchange_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  NAME ucx_cpu_row_completion_tracker_test
+  COMMAND ucx_cpu_row_completion_tracker_test
 )
-
-set_tests_properties(ucx_exchange_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 
 target_link_libraries(
-  ucx_exchange_test
-  velox_ucx_exchange
-  velox_cudf_exec
-  velox_exec
-  velox_exec_test_lib
-  velox_test_util
-  velox_vector_fuzzer
-  gtest
-  gtest_main
-  gmock
-  Folly::folly
-  fmt::fmt
-  ucxx::ucxx
+  ucx_cpu_row_completion_tracker_test
+  PRIVATE
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main
+    Threads::Threads
+    ucx::ucs
 )
+
+if(VELOX_ENABLE_CUDF)
+  add_executable(
+    ucx_exchange_test
+    UcxExchangeQueueTest.cpp
+    UcxExchangeProtocolTest.cpp
+    IntraNodeTransferRegistryTest.cpp
+    UcxOutputQueueManagerTest.cpp
+    UcxExchangeTest.cpp
+    UcxPartitionedOutputTest.cpp
+    UcxExchangeTaskTest.cpp
+    UcxExchangeTestBase.cpp
+    Main.cpp
+    UcxTestHelpers.cpp
+    UcxTestData.cpp
+    UcxPartitionedOutputMock.cpp
+    SinkDriverMock.cpp
+    SourceDriverMock.cpp
+  )
+
+  add_test(
+    NAME ucx_exchange_test
+    COMMAND ucx_exchange_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  set_tests_properties(ucx_exchange_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+
+  target_link_libraries(
+    ucx_exchange_test
+    UcxExchangeQueueTest.cpp
+    UcxExchangeProtocolTest.cpp
+    IntraNodeTransferRegistryTest.cpp
+    velox_ucx_exchange
+    velox_cudf_exec
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    velox_vector_fuzzer
+    gtest
+    gtest_main
+    gmock
+    Folly::folly
+    fmt::fmt
+    ucxx::ucxx
+  )
+endif()

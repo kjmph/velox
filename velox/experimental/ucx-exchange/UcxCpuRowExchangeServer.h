@@ -135,9 +135,8 @@ class UcxCpuRowExchangeServer
 
   std::shared_ptr<UcxCpuRowPayload> pendingData_;
 
-  // The Request owns its callback closure; completed UCXX requests are
-  // kept for the server lifetime because UCP wireup-replay can invoke
-  // callbacks after ucxx marks a request complete.
+  // Requests own their callback closures and are kept for the server lifetime.
+  // Completion callbacks release their large payload contexts promptly.
   std::vector<std::shared_ptr<ucxx::Request>> metaRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
   std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};

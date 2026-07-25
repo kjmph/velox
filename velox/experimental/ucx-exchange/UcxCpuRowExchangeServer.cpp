@@ -19,6 +19,8 @@
 #include <cstring>
 #include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/CpuRowFrameCompletionTracker.h"
+#include "velox/experimental/ucx-exchange/CpuRowPayloadCopy.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowMetadataMsg.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
@@ -58,14 +60,13 @@ VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     ServerState,
     serverStateNames)
 
-// Decouples ucxx::Request lifetime from buffer lifetime. The Request must
-// survive UCP wireup-replay; the buffer should be released as soon as DMA
-// completes. The Request's callbackData is a shared_ptr<context>; the
-// context holds the buffer; the completion callback moves the buffer out
-// of the context, freeing it while the (now-empty) context shell stays
-// pinned to the Request.
+// Decouples ucxx::Request lifetime from buffer lifetime. The Request's
+// callbackData is a shared_ptr<context>; the context holds the buffer and the
+// completion callback moves it out as soon as DMA completes. The now-empty
+// context shell can remain pinned to the longer-lived Request cheaply.
 struct CpuRowMetaSendContext {
   std::shared_ptr<uint8_t> metadata;
+  CpuRowCallbackOnce callbackOnce;
 };
 
 // One on-the-wire frame. Large chunks ship standalone when already
@@ -79,14 +80,12 @@ struct CpuRowSendFrame {
 };
 
 // Shared state across the N per-frame tagSend callbacks of one bundle.
-// `pendingFrames` counts down as each frame completes; the callback
-// that brings it to zero invokes the unified sendComplete. `frames`
-// keeps every byte UCX is reading from alive across the whole bundle's
-// DMA.
+// The indexed tracker counts each frame exactly once and the last unique
+// completion invokes sendComplete. `frames` keeps every byte UCX is reading
+// from alive across the whole bundle's DMA.
 struct CpuRowMultiSendState {
   std::vector<CpuRowSendFrame> frames;
-  std::atomic<int32_t> pendingFrames{0};
-  std::atomic<ucs_status_t> finalStatus{UCS_OK};
+  std::unique_ptr<CpuRowFrameCompletionTracker> completion;
 };
 
 // Target packed-frame size on the wire. Small chunks are accumulated into a
@@ -240,6 +239,7 @@ void UcxCpuRowExchangeServer::postDataEndpointAckReceive() {
   uint64_t ackTag = getHandshakeAckTag(partitionKeyHash_);
 
   std::weak_ptr<UcxCpuRowExchangeServer> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
   dataEndpointAckRequest_ = endpointRef_->endpoint_->tagRecvBuilder(
       ack.get(),
       sizeof(*ack),
@@ -247,7 +247,10 @@ void UcxCpuRowExchangeServer::postDataEndpointAckReceive() {
       ucxx::TagMaskFull)
       .pythonFuture(false)
       .callbackFunction(
-          [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+          [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+            if (!callbackOnce->tryClaim()) {
+              return;
+            }
             if (auto self = weak.lock()) {
               self->enqueueStateEvent(
                   self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
@@ -399,18 +402,26 @@ void UcxCpuRowExchangeServer::sendData(
       if (pendingChunks.empty()) {
         return;
       }
+      VELOX_CHECK_GT(
+          pendingBytes, 0, "Packed CPU row frame size must be positive");
+      const auto packedSize = static_cast<size_t>(pendingBytes);
+      VELOX_CHECK_EQ(
+          static_cast<int64_t>(packedSize),
+          pendingBytes,
+          "Packed CPU row frame size exceeds size_t");
       std::shared_ptr<uint8_t> buf(
-          new uint8_t[pendingBytes], [](uint8_t* p) { delete[] p; });
-      size_t off = 0;
-      for (auto& c : pendingChunks) {
-        for (auto range : *c->data) {
-          std::memcpy(buf.get() + off, range.data(), range.size());
-          off += range.size();
-        }
+          new uint8_t[packedSize], [](uint8_t* p) { delete[] p; });
+      std::vector<const folly::IOBuf*> payloads;
+      payloads.reserve(pendingChunks.size());
+      for (const auto& chunk : pendingChunks) {
+        VELOX_CHECK_NOT_NULL(chunk);
+        VELOX_CHECK_NOT_NULL(chunk->data);
+        payloads.push_back(chunk->data.get());
       }
+      copyCpuRowPayloads(payloads, std::span<uint8_t>(buf.get(), packedSize));
       CpuRowSendFrame f;
       f.ptr = buf.get();
-      f.len = static_cast<size_t>(pendingBytes);
+      f.len = packedSize;
       f.packedBuf = std::move(buf);
       multiState->frames.push_back(std::move(f));
       pendingChunks.clear();
@@ -473,6 +484,11 @@ void UcxCpuRowExchangeServer::sendData(
           [tid = partitionKey_.toString(), weakMeta](
               ucs_status_t status, std::shared_ptr<void> arg) {
             auto ctx = std::static_pointer_cast<CpuRowMetaSendContext>(arg);
+            if (!ctx->callbackOnce.tryClaim()) {
+              LOG(WARNING) << "Ignoring duplicate CPU metadata send completion for "
+                           << tid;
+              return;
+            }
             auto metaHolder = std::move(ctx->metadata);
 
             auto self = weakMeta.lock();
@@ -498,8 +514,8 @@ void UcxCpuRowExchangeServer::sendData(
   setState(ServerState::WaitingForSendComplete);
   uint64_t dataTagBase = getDataTag(partitionKeyHash_, sequenceNumber);
 
-  multiState->pendingFrames.store(
-      static_cast<int32_t>(numFrames), std::memory_order_release);
+  multiState->completion =
+      std::make_unique<CpuRowFrameCompletionTracker>(numFrames);
   ++inFlightSends_;
 
   std::weak_ptr<UcxCpuRowExchangeServer> weakData = weak_from_this();
@@ -514,26 +530,26 @@ void UcxCpuRowExchangeServer::sendData(
         ucxx::Tag{dataTagBase})
         .pythonFuture(false)
         .callbackFunction(
-            [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
+            [weakData, frameIdx, sequenceNumber, task = partitionKey_.toString()](
+                ucs_status_t status, std::shared_ptr<void> arg) {
               auto state = std::static_pointer_cast<CpuRowMultiSendState>(arg);
-              if (status != UCS_OK) {
-                ucs_status_t expected = UCS_OK;
-                state->finalStatus.compare_exchange_strong(
-                    expected, status, std::memory_order_acq_rel);
-              }
-              const int32_t before =
-                  state->pendingFrames.fetch_sub(1, std::memory_order_acq_rel);
-              if (before != 1) {
+              const auto result = state->completion->complete(frameIdx, status);
+              if (result.state == CpuRowFrameCompletionTracker::State::kDuplicate) {
+                LOG(WARNING) << "Ignoring duplicate CPU data send completion for "
+                             << task << " sequence=" << sequenceNumber
+                             << " frame=" << frameIdx
+                             << " status=" << ucs_status_string(status);
                 return;
               }
-              const ucs_status_t finalStatus =
-                  state->finalStatus.load(std::memory_order_acquire);
+              if (result.state == CpuRowFrameCompletionTracker::State::kPending) {
+                return;
+              }
               state->frames.clear();
               if (auto self = weakData.lock()) {
                 self->enqueueStateEvent(
                     self,
                     [raw = self.get(),
-                     finalStatus,
+                     finalStatus = result.finalStatus,
                      arg = std::move(arg)]() mutable {
                       raw->sendComplete(finalStatus, std::move(arg));
                     });
@@ -574,6 +590,9 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
       .callbackFunction(
           [weakMeta](ucs_status_t status, std::shared_ptr<void> arg) {
             auto ctx = std::static_pointer_cast<CpuRowMetaSendContext>(arg);
+            if (!ctx->callbackOnce.tryClaim()) {
+              return;
+            }
             auto metaHolder = std::move(ctx->metadata);
             if (auto self = weakMeta.lock()) {
               self->enqueueStateEvent(self, [raw = self.get(), status]() {
@@ -626,9 +645,8 @@ void UcxCpuRowExchangeServer::sendComplete(
   --inFlightSends_;
 
   if (status == UCS_OK) {
-    // Completed UCXX requests are retained for the server lifetime to protect
-    // callback closures from UCP wireup replay, but their captured send state
-    // must not keep payload buffers alive.
+    // Completed UCXX requests are retained for the server lifetime, but their
+    // captured send state must not keep payload buffers alive.
     state->frames.clear();
 
     if (!finalMetadataSent_) {

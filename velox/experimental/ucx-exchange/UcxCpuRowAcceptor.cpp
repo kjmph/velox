@@ -19,6 +19,7 @@
 #include <vector>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/CpuRowFrameCompletionTracker.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -192,14 +193,21 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
   // AM. If same-host data is selected, this response carries the server worker
   // address so the source can create the reciprocal data endpoint before
   // posting metadata receives.
+  auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
   bootstrapEpRef->endpoint_->tagSendBuilder(
       response->data(),
       response->size(),
       ucxx::Tag{responseTag})
       .pythonFuture(false)
       .callbackFunction(
-          [response, keyStr = key.toString()](
+          [response, callbackOnce, keyStr = key.toString()](
               ucs_status_t status, std::shared_ptr<void> /*arg*/) {
+            if (!callbackOnce->tryClaim()) {
+              LOG(WARNING)
+                  << "Ignoring duplicate CPU HandshakeResponse send completion for "
+                  << keyStr;
+              return;
+            }
             if (status != UCS_OK) {
               LOG(WARNING) << "Failed to send CPU HandshakeResponse to " << keyStr
                            << ": " << ucs_status_string(status);

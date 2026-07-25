@@ -14,6 +14,8 @@
 set(
   UCX_EXCHANGE_CORE_SOURCES
   Acceptor.cpp
+  CpuRowFrameCompletionTracker.cpp
+  CpuRowPayloadCopy.cpp
   CommElement.cpp
   Communicator.cpp
   EndpointRef.cpp
@@ -100,6 +102,6 @@ else()
   )
 endif()
 
-if(VELOX_BUILD_TESTING AND VELOX_ENABLE_CUDF)
+if(VELOX_BUILD_TESTING)
   add_subdirectory(tests)
 endif()

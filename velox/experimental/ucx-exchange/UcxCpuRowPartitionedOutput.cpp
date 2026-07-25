@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
 #include "velox/common/memory/ByteStream.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
 
@@ -459,10 +460,11 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
                    : BlockingReason::kNotBlocked;
   };
 
-  IOBufOutputStream stream(
-      *current_->pool(),
-      /*listener=*/nullptr,
-      initialSize);
+  // Honor the same serialized-page checksum configuration as the standard
+  // PartitionedOutput path even though CPU UCX uses a different queue manager.
+  auto listener =
+      exec::DefaultOutputBufferManager::getInstanceRef()->newListener();
+  IOBufOutputStream stream(*current_->pool(), listener.get(), initialSize);
   current_->flush(&stream);
   clearVectorStreamGroup();
 

@@ -22,6 +22,7 @@
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/CpuRowFrameCompletionTracker.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeQueue.h"
@@ -107,14 +108,13 @@ class UcxCpuRowExchangeSource
   // Bundles a metadata record with N receiver buffers (one per frame).
   // Each frame is one chunk on the wire; we allocate per-frame so we
   // can stitch them into an IOBuf chain without a coalesce on receive.
-  // pendingFrames counts down across the per-frame tagRecv callbacks;
-  // when it hits zero we build the chain and enqueue.
+  // The completion tracker accepts each frame index once; when all unique
+  // frames complete we build the chain and enqueue.
   struct DataAndMetadata {
     uint32_t sequenceNumber{0};
     UcxCpuRowMetadataMsg metadata;
     std::vector<std::shared_ptr<uint8_t>> frameBufs;
-    std::atomic<int32_t> pendingFrames{0};
-    std::atomic<ucs_status_t> finalStatus{UCS_OK};
+    std::unique_ptr<CpuRowFrameCompletionTracker> completion;
   };
 
   explicit UcxCpuRowExchangeSource(

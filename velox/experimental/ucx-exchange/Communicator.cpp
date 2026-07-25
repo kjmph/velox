@@ -35,6 +35,7 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include "UcxExchangeModules.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -359,7 +360,14 @@ void Communicator::run() {
         UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_WAKEUP).build();
   }
 
-  worker_ = context_->workerBuilder().delayedSubmission(false).pythonFuture(false).build();
+  // UCXX progress runs on a dedicated thread below, while exchange state
+  // machines submit requests from this communicator thread. Delay request
+  // submission onto the progress thread so RequestTag::request(),
+  // publishRequest(), and process() cannot race a completion callback.
+  worker_ = context_->workerBuilder()
+                .delayedSubmission(true)
+                .pythonFuture(false)
+                .build();
 
   listener_ = worker_->listenerBuilder(
       port_, Communicator::cStyleListenerCallback, this).build();

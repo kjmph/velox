@@ -412,6 +412,42 @@ void Communicator::run() {
       },
       &cudaDevice);
 #endif
+
+  // A worker address is immutable for the lifetime of its UCX worker. Read it
+  // synchronously before the progress thread introduces concurrent worker
+  // access. Fetching it from each CPU exchange source instead schedules work
+  // on the single UCXX progress thread and can time out under a burst of
+  // all-to-all handshakes.
+  try {
+    auto address = worker_->addressBuilder().build();
+    if (address != nullptr) {
+      const auto addressView = address->getStringView();
+      if (!addressView.empty() &&
+          addressView.size() <= kMaxCpuRowWorkerAddressBytes) {
+        std::lock_guard<std::mutex> lock(workerAddressMutex_);
+        workerAddress_.assign(addressView.data(), addressView.size());
+      } else {
+        LOG(WARNING) << "UCX worker address has unsupported size "
+                     << addressView.size() << "; same-host CPU exchanges will "
+                     << "use the listener endpoint";
+      }
+    } else {
+      LOG(WARNING)
+          << "UCX returned a null worker address; same-host CPU exchanges will "
+             "use the listener endpoint";
+    }
+  } catch (const std::exception& error) {
+    // The worker-address field is an optional same-host optimization in the
+    // CPU handshake. An empty address keeps the listener endpoint as the data
+    // path instead of aborting the worker during startup.
+    LOG(WARNING) << "Could not cache UCX worker address: " << error.what()
+                 << "; same-host CPU exchanges will use the listener endpoint";
+  } catch (...) {
+    LOG(WARNING)
+        << "Could not cache UCX worker address: unknown error; same-host CPU "
+           "exchanges will use the listener endpoint";
+  }
+
   worker_->startProgressThread(!blockingMode, blockingMode ? 0 : 1);
 
   promise_.setValue();
@@ -741,13 +777,8 @@ void Communicator::logUnexpectedSameHostEndpointTransport(
 }
 
 std::string Communicator::getWorkerAddress() const {
-  VELOX_CHECK_NOT_NULL(worker_, "Communicator worker is not initialized");
-  std::shared_ptr<ucxx::Address> address;
-  const bool success = worker_->registerGenericPre(
-      [&]() { address = worker_->addressBuilder().build(); }, 3000000000);
-  VELOX_CHECK(success, "Timed out reading UCX worker address");
-  VELOX_CHECK_NOT_NULL(address, "Communicator worker address is null");
-  return std::string(address->getStringView());
+  std::lock_guard<std::mutex> lock(workerAddressMutex_);
+  return workerAddress_;
 }
 
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {

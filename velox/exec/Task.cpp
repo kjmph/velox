@@ -1403,6 +1403,7 @@ struct PendingExchangeSplits {
 } // namespace
 
 bool Task::initializePartitionOutput() {
+  std::unique_lock<std::mutex> outputBufferUpdateLock(outputBufferUpdateMutex_);
   TestValue::adjust(
       "facebook::velox::exec::Task::initializePartitionOutput", this);
   core::PartitionedOutputNodePtr partitionedOutputNode;
@@ -1489,13 +1490,35 @@ bool Task::initializePartitionOutput() {
           partitionedOutputNode->numPartitions(),
           numOutputDrivers,
           partitionedOutputNode->transportOptions());
+      // Initialization owns output-buffer removal until it marks completion.
+      // A cancellation during initializeTask is handled by that existing
+      // lifecycle; only replay destinations while the task is still running.
+      if (isRunning()) {
+        if (pendingOutputBufferUpdate_.has_value()) {
+          const auto& update = *pendingOutputBufferUpdate_;
+          VELOX_CHECK(
+              manager->updateOutputBuffers(
+                  taskId_, update.numBuffers, update.noMoreBuffers),
+              "Output buffer manager lost task {} during initialization",
+              taskId_);
+        }
+        outputBufferManagerState_ = OutputBufferManagerState::kReady;
+      } else {
+        outputBufferManagerState_ = OutputBufferManagerState::kUnavailable;
+      }
     } catch (...) {
+      outputBufferManagerState_ = OutputBufferManagerState::kUnavailable;
       initializeError = std::current_exception();
     }
+    pendingOutputBufferUpdate_.reset();
+    outputBufferUpdateLock.unlock();
     finishOutputBufferInitialization();
     if (initializeError != nullptr) {
       std::rethrow_exception(initializeError);
     }
+  } else {
+    outputBufferManagerState_ = OutputBufferManagerState::kUnavailable;
+    pendingOutputBufferUpdate_.reset();
   }
   return true;
 }
@@ -2572,8 +2595,14 @@ bool Task::isFinishedLocked() const {
 }
 
 bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
+  std::lock_guard<std::mutex> outputBufferUpdateLock(outputBufferUpdateMutex_);
+
+  std::shared_ptr<OutputBufferManager> manager;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
+    if (!isRunningLocked()) {
+      return false;
+    }
     // Ignore messages received after no-more-buffers message.
     if (noMoreOutputBuffers_) {
       return false;
@@ -2581,11 +2610,28 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     if (noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
+
+    switch (outputBufferManagerState_) {
+      case OutputBufferManagerState::kUninitialized:
+        if (pendingOutputBufferUpdate_.has_value()) {
+          pendingOutputBufferUpdate_->numBuffers =
+              std::max(pendingOutputBufferUpdate_->numBuffers, numBuffers);
+          pendingOutputBufferUpdate_->noMoreBuffers |= noMoreBuffers;
+        } else {
+          pendingOutputBufferUpdate_ =
+              PendingOutputBufferUpdate{numBuffers, noMoreBuffers};
+        }
+        return true;
+      case OutputBufferManagerState::kReady:
+        manager = bufferManager_.lock();
+        break;
+      case OutputBufferManagerState::kUnavailable:
+        return false;
+    }
   }
-  if (auto manager = outputBufferManager().lock()) {
-    return manager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
-  }
-  return false;
+
+  return manager != nullptr &&
+      manager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
 }
 
 int Task::getOutputPipelineId() const {

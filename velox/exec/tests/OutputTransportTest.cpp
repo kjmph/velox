@@ -19,6 +19,9 @@
 #include <gmock/gmock.h>
 
 #include "folly/Synchronized.h"
+#include <atomic>
+#include <stdexcept>
+
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/DefaultOutputBufferManager.h"
@@ -36,12 +39,60 @@ namespace {
 
 // A CPU test transport double: the default output buffer manager registered
 // under a distinct transport id (kTransport), so operator selection can be
-// verified without a real second transport (e.g. UCX).
+// verified without a real second transport (e.g. UCX). Failure injection occurs
+// after the default manager creates or updates real buffer state.
 class TestTransportBufferManager : public DefaultOutputBufferManager {
  public:
   static constexpr std::string_view kTransport{"test-transport"};
 
-  TestTransportBufferManager() : DefaultOutputBufferManager(Options{}) {}
+  enum class FailurePoint {
+    kNone,
+    kInitialize,
+    kUpdate,
+  };
+
+  explicit TestTransportBufferManager(
+      FailurePoint failurePoint = FailurePoint::kNone)
+      : DefaultOutputBufferManager(Options{}), failurePoint_(failurePoint) {}
+
+  void initializeTask(
+      std::shared_ptr<Task> task,
+      core::PartitionedOutputNode::Kind kind,
+      int numDestinations,
+      int numDrivers,
+      const std::string& transportOptions = {}) override {
+    ++initializeCount;
+    DefaultOutputBufferManager::initializeTask(
+        std::move(task), kind, numDestinations, numDrivers, transportOptions);
+    if (failurePoint_ == FailurePoint::kInitialize) {
+      throw std::runtime_error("injected output buffer initialization failure");
+    }
+  }
+
+  bool updateOutputBuffers(
+      const std::string& taskId,
+      int numDestinations,
+      bool noMoreBuffers) override {
+    ++updateCount;
+    const auto updated = DefaultOutputBufferManager::updateOutputBuffers(
+        taskId, numDestinations, noMoreBuffers);
+    if (failurePoint_ == FailurePoint::kUpdate) {
+      throw std::runtime_error("injected output buffer replay failure");
+    }
+    return updated;
+  }
+
+  void removeTask(const std::string& taskId) override {
+    ++removeCount;
+    DefaultOutputBufferManager::removeTask(taskId);
+  }
+
+  std::atomic<int> initializeCount{0};
+  std::atomic<int> updateCount{0};
+  std::atomic<int> removeCount{0};
+
+ private:
+  const FailurePoint failurePoint_;
 };
 
 // Records task initialization and removal. Hooks run immediately before and
@@ -128,6 +179,44 @@ class OutputTransportTest : public HiveConnectorTestBase {
         Task::ExecutionMode::kParallel,
         exec::Consumer{});
   }
+  std::shared_ptr<Task> makeBroadcastTask(
+      const std::string& taskId,
+      const std::string& transportType) {
+    auto plan = PlanBuilder()
+                    .tableScan(ROW({"c0"}, {BIGINT()}))
+                    .partitionedOutputBroadcast({}, "Presto", transportType)
+                    .planFragment();
+    return Task::create(
+        taskId,
+        std::move(plan),
+        0,
+        core::QueryCtx::create(driverExecutor_.get()),
+        Task::ExecutionMode::kParallel,
+        exec::Consumer{});
+  }
+
+  void registerTestTransport(
+      const std::string& transportType,
+      const std::shared_ptr<TestTransportBufferManager>& manager,
+      std::shared_ptr<std::atomic<int>> builderInvocations = nullptr) {
+    OutputTransportRegistry::global().insert(
+        transportType,
+        OutputTransportEntry::make<TestTransportBufferManager>(
+            manager,
+            [builderInvocations](
+                int32_t operatorId,
+                DriverCtx* ctx,
+                const std::shared_ptr<const core::PartitionedOutputNode>& node,
+                bool eagerFlush,
+                const std::shared_ptr<TestTransportBufferManager>& manager)
+                -> std::unique_ptr<Operator> {
+              if (builderInvocations != nullptr) {
+                ++*builderInvocations;
+              }
+              return std::make_unique<PartitionedOutput>(
+                  operatorId, ctx, node, eagerFlush, manager);
+            }));
+  }
 };
 
 TEST_F(OutputTransportTest, usesDefaultAfterRegistryClear) {
@@ -192,21 +281,7 @@ TEST_F(OutputTransportTest, selectsOperatorByTransportKind) {
   // the operator from the resolved manager's entry, without needing UCX.
   auto builderInvocations = std::make_shared<std::atomic<int>>(0);
   auto manager = std::make_shared<TestTransportBufferManager>();
-  OutputTransportRegistry::global().insert(
-      transportType,
-      OutputTransportEntry::make<TestTransportBufferManager>(
-          manager,
-          [builderInvocations](
-              int32_t operatorId,
-              DriverCtx* ctx,
-              const std::shared_ptr<const core::PartitionedOutputNode>& node,
-              bool eagerFlush,
-              const std::shared_ptr<TestTransportBufferManager>& manager)
-              -> std::unique_ptr<Operator> {
-            ++*builderInvocations;
-            return std::make_unique<PartitionedOutput>(
-                operatorId, ctx, node, eagerFlush, manager);
-          }));
+  registerTestTransport(transportType, manager, builderInvocations);
 
   auto plan = PlanBuilder()
                   .tableScan(ROW({"c0"}, {BIGINT()}))
@@ -326,6 +401,86 @@ DEBUG_ONLY_TEST_F(
   EXPECT_EQ(task->state(), TaskState::kAborted);
   EXPECT_THAT(
       manager->calls(), ::testing::ElementsAre("initializeTask", "removeTask"));
+}
+
+TEST_F(OutputTransportTest, replaysTerminalBufferUpdateReceivedBeforeStart) {
+  OutputTransportRegistry::unregisterAll();
+  SCOPE_EXIT {
+    OutputTransportRegistry::unregisterAll();
+  };
+
+  const std::string transportType{TestTransportBufferManager::kTransport};
+  auto manager = std::make_shared<TestTransportBufferManager>();
+  registerTestTransport(transportType, manager);
+  auto task =
+      makeBroadcastTask("task-buffer-update-before-start", transportType);
+
+  constexpr int32_t kNumDestinations = 10;
+  EXPECT_TRUE(task->updateOutputBuffers(
+      kNumDestinations / 2, false /* noMoreBuffers */));
+  EXPECT_TRUE(
+      task->updateOutputBuffers(kNumDestinations, true /* noMoreBuffers */));
+  EXPECT_FALSE(task->updateOutputBuffers(
+      kNumDestinations + 1, false /* noMoreBuffers */));
+  task->start(1, 1);
+
+  auto stats = manager->stats(task->taskId());
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_TRUE(stats->noMoreBuffers);
+  EXPECT_EQ(stats->buffersStats.size(), kNumDestinations);
+
+  task->requestCancel();
+  waitForTaskCompletion(task.get());
+}
+
+TEST_F(
+    OutputTransportTest,
+    initializationFailureTerminatesTaskAndCleansBuffer) {
+  OutputTransportRegistry::unregisterAll();
+  SCOPE_EXIT {
+    OutputTransportRegistry::unregisterAll();
+  };
+
+  const std::string transportType{"failing-output-initialize"};
+  auto manager = std::make_shared<TestTransportBufferManager>(
+      TestTransportBufferManager::FailurePoint::kInitialize);
+  registerTestTransport(transportType, manager);
+  auto task =
+      makeBroadcastTask("task-output-initialize-failure", transportType);
+
+  VELOX_ASSERT_THROW(
+      task->start(1, 1), "injected output buffer initialization failure");
+
+  EXPECT_EQ(task->state(), TaskState::kFailed);
+  EXPECT_EQ(manager->initializeCount.load(), 1);
+  EXPECT_EQ(manager->updateCount.load(), 0);
+  EXPECT_EQ(manager->removeCount.load(), 1);
+  EXPECT_FALSE(manager->stats(task->taskId()).has_value());
+  EXPECT_FALSE(task->updateOutputBuffers(1, true));
+}
+
+TEST_F(OutputTransportTest, replayFailureTerminatesTaskAndCleansBuffer) {
+  OutputTransportRegistry::unregisterAll();
+  SCOPE_EXIT {
+    OutputTransportRegistry::unregisterAll();
+  };
+
+  const std::string transportType{"failing-output-replay"};
+  auto manager = std::make_shared<TestTransportBufferManager>(
+      TestTransportBufferManager::FailurePoint::kUpdate);
+  registerTestTransport(transportType, manager);
+  auto task = makeBroadcastTask("task-output-replay-failure", transportType);
+  EXPECT_TRUE(task->updateOutputBuffers(10, true));
+
+  VELOX_ASSERT_THROW(
+      task->start(1, 1), "injected output buffer replay failure");
+
+  EXPECT_EQ(task->state(), TaskState::kFailed);
+  EXPECT_EQ(manager->initializeCount.load(), 1);
+  EXPECT_EQ(manager->updateCount.load(), 1);
+  EXPECT_EQ(manager->removeCount.load(), 1);
+  EXPECT_FALSE(manager->stats(task->taskId()).has_value());
+  EXPECT_FALSE(task->updateOutputBuffers(10, true));
 }
 
 } // namespace

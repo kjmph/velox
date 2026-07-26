@@ -18,6 +18,9 @@
 #include <folly/container/IntrusiveList.h>
 #include <folly/stop_watch.h>
 
+#include <mutex>
+#include <optional>
+
 #include "velox/common/base/SkewedPartitionBalancer.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
@@ -1648,11 +1651,35 @@ class Task : public std::enable_shared_from_this<Task> {
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
 
+  struct PendingOutputBufferUpdate {
+    int numBuffers;
+    bool noMoreBuffers;
+  };
+
+  enum class OutputBufferManagerState {
+    kUninitialized,
+    kReady,
+    kUnavailable,
+  };
+
+  // Serializes output buffer manager initialization and destination updates.
+  // This lock must be acquired before mutex_. Initialization and destination
+  // update calls are made without mutex_ because an implementation may call
+  // back into Task.
+  std::mutex outputBufferUpdateMutex_;
+
+  // Guarded by outputBufferUpdateMutex_. Updates received before the manager is
+  // initialized are coalesced and replayed before the manager is published.
+  OutputBufferManagerState outputBufferManagerState_{
+      OutputBufferManagerState::kUninitialized};
+  std::optional<PendingOutputBufferUpdate> pendingOutputBufferUpdate_;
+
   // Output buffer manager for this task's partitioned output -- the manager for
   // the transport named on the PartitionedOutputNode. A weak_ptr to break the
   // reference cycle through OutputBuffer::task_ (which holds a
-  // shared_ptr<Task>). Assigned once under mutex_ when the task starts; read
-  // directly by code already holding mutex_, or via outputBufferManager().
+  // shared_ptr<Task>). Assigned under mutex_ before initialization so that the
+  // existing initialization/removal lifecycle can clean up partial failures.
+  // Read directly under mutex_ or via outputBufferManager().
   std::weak_ptr<OutputBufferManager> bufferManager_;
 
   // Factory that builds the output operator for the resolved transport, paired

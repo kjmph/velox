@@ -229,17 +229,50 @@ bool UcxCpuRowOutputQueue::initialize(
   task_ = task;
   maxSize_ = task_->queryCtx()->queryConfig().maxOutputBufferSize();
   continueSize_ = (maxSize_ * kContinuePct) / 100;
-  for (int i = queues_.size(); i < numDestinations; ++i) {
-    queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
-    if (atEnd_) {
-      queues_.back()->enqueueBack(nullptr);
-    }
+  if (numDestinations > queues_.size()) {
+    addOutputBuffersLocked(numDestinations);
   }
-  finishedBufferStats_.resize(queues_.size());
   // Release-store: paired with isInitialized()'s acquire-load so
   // lock-free readers see a fully-populated queue.
   initialized_.store(true, std::memory_order_release);
   return true;
+}
+
+void UcxCpuRowOutputQueue::addOutputBuffersLocked(int numBuffers) {
+  using Kind = core::PartitionedOutputNode::Kind;
+
+  VELOX_CHECK_GE(numBuffers, 0);
+  VELOX_CHECK_LT(queues_.size(), numBuffers);
+  VELOX_CHECK(!noMoreQueues_, "Cannot add destinations after noMoreBuffers");
+  // An uninitialized placeholder has the default partitioned kind, but must
+  // still grow to hold early getData() callbacks. Once task metadata is
+  // published, partitioned output has a fixed destination count.
+  VELOX_CHECK(
+      !isInitialized() || kind_ != Kind::kPartitioned,
+      "Cannot add destinations to initialized partitioned output");
+
+  queues_.reserve(numBuffers);
+  if (kind_ == Kind::kBroadcast && !dataToBroadcast_.empty()) {
+    updateTotalQueuedBytesMsLocked();
+  }
+  for (int32_t i = queues_.size(); i < numBuffers; ++i) {
+    auto buffer = std::make_unique<UcxCpuRowDestinationQueue>();
+    if (kind_ == Kind::kBroadcast) {
+      for (const auto& data : dataToBroadcast_) {
+        buffer->enqueueBack(data);
+        // Each backfilled payload will be decremented independently when this
+        // destination drains.
+        queuedBytes_ += data->numBytes;
+        queuedPayloads_++;
+      }
+    }
+    // Preserve FIFO ordering: retained broadcast payloads precede EOS.
+    if (atEnd_) {
+      buffer->enqueueBack(nullptr);
+    }
+    queues_.emplace_back(std::move(buffer));
+  }
+  finishedBufferStats_.resize(queues_.size());
 }
 
 void UcxCpuRowOutputQueue::updateNumDrivers(uint32_t newNumDrivers) {
@@ -339,19 +372,17 @@ bool UcxCpuRowOutputQueue::checkBlocked(ContinueFuture* future) {
 void UcxCpuRowOutputQueue::getData(
     int destination,
     UcxCpuRowDataAvailableCallback notify) {
+  VELOX_CHECK_GE(destination, 0);
   UcxCpuRowDestinationQueue::Data data;
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
-    // Late-arriving getData (queue not yet initialized): create
-    // placeholder destination queues to hold the notify callback.
-    for (int i = queues_.size(); i <= destination; ++i) {
-      queues_.emplace_back(std::make_unique<UcxCpuRowDestinationQueue>());
-      if (atEnd_) {
-        queues_.back()->enqueueBack(nullptr);
-      }
+    if (destination >= queues_.size()) {
+      VELOX_CHECK_LT(destination, std::numeric_limits<int>::max());
+      // Before initialization this creates placeholders for early callbacks.
+      // After initialization it also backfills a late broadcast destination.
+      addOutputBuffersLocked(destination + 1);
     }
-    finishedBufferStats_.resize(queues_.size());
     auto* queue = queues_[destination].get();
     // queue can be nullptr if the destination's results have already
     // been deleted (post-cancellation). Return empty in that case.
@@ -607,41 +638,21 @@ void UcxCpuRowOutputQueue::updateOutputBuffers(
     int numBuffers,
     bool noMoreBuffers) {
   using Kind = core::PartitionedOutputNode::Kind;
-  if (kind_ == Kind::kPartitioned) {
-    std::lock_guard<std::mutex> l(mutex_);
-    VELOX_CHECK_EQ(queues_.size(), numBuffers);
-    VELOX_CHECK(noMoreBuffers);
-    noMoreQueues_ = true;
-    return;
-  }
-
-  VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
-  bool isFinished;
+  bool isFinished{false};
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK_GE(numBuffers, 0);
+    if (kind_ == Kind::kPartitioned) {
+      VELOX_CHECK_EQ(queues_.size(), numBuffers);
+      VELOX_CHECK(noMoreBuffers);
+      noMoreQueues_ = true;
+      return;
+    }
+
+    VELOX_CHECK(kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary);
 
     if (numBuffers > queues_.size()) {
-      int32_t numNewBuffers = numBuffers - queues_.size();
-      queues_.reserve(numBuffers);
-      for (int32_t i = 0; i < numNewBuffers; ++i) {
-        auto buffer = std::make_unique<UcxCpuRowDestinationQueue>();
-        if (kind_ == Kind::kBroadcast) {
-          for (const auto& data : dataToBroadcast_) {
-            buffer->enqueueBack(data);
-            // Account for backfilled data so dequeue decrements don't
-            // drive queuedBytes_ negative.
-            queuedBytes_ += data->numBytes;
-            queuedPayloads_++;
-          }
-        }
-        // No backfill for arbitrary. New consumers only get future data, or an
-        // end marker if production already completed.
-        if (atEnd_) {
-          buffer->enqueueBack(nullptr);
-        }
-        queues_.emplace_back(std::move(buffer));
-      }
-      finishedBufferStats_.resize(queues_.size());
+      addOutputBuffersLocked(numBuffers);
     }
 
     if (!noMoreBuffers) {

@@ -839,6 +839,96 @@ TEST_F(UcxOutputQueueManagerTest, broadcastLateDestination) {
   queueManager_->removeTask(taskId);
 }
 
+// Broadcast: a destination can register before the coordinator publishes its
+// buffer ID. Retained data must be available immediately, and the later
+// buffer-count update must not duplicate it.
+TEST_F(
+    UcxOutputQueueManagerTest,
+    broadcastDestinationRegistersBeforeBufferUpdate) {
+  const vector_size_t size = 50;
+  const std::string taskId = "broadcast-register-first";
+
+  auto task = initializeTask(
+      taskId,
+      1 /* numDestinations */,
+      1 /* numDrivers */,
+      true /* cleanup */,
+      core::PartitionedOutputNode::Kind::kBroadcast);
+
+  enqueue(taskId, 0, size);
+  enqueue(taskId, 0, size);
+
+  int receivedData = 0;
+  for (int i = 0; i < 2; ++i) {
+    queueManager_->getDataWithQueue(
+        taskId,
+        1,
+        [&receivedData](
+            std::shared_ptr<UcxOutputQueue> queue,
+            std::shared_ptr<cudf::packed_columns> data,
+            vector_size_t numRows,
+            std::vector<int64_t> /*remainingBytes*/) {
+          ASSERT_NE(data, nullptr);
+          EXPECT_EQ(numRows, 50);
+          queue->releaseInFlightBytes(
+              1, static_cast<int64_t>(data->gpu_data->size()), 1);
+          ++receivedData;
+        });
+    EXPECT_EQ(receivedData, i + 1);
+  }
+
+  queueManager_->updateOutputBuffers(taskId, 2, false);
+
+  bool receivedEndMarker = false;
+  queueManager_->getData(taskId, 1, receiveEndMarker(1, receivedEndMarker));
+  EXPECT_FALSE(receivedEndMarker);
+
+  // Publishing the already-created destination is idempotent and must not
+  // manufacture another retained payload.
+  queueManager_->updateOutputBuffers(taskId, 2, false);
+  EXPECT_FALSE(receivedEndMarker);
+
+  queueManager_->updateOutputBuffers(taskId, 2, true);
+  EXPECT_ANY_THROW(queueManager_->getData(taskId, 2, [](auto, auto, auto) {}));
+
+  noMoreData(taskId);
+  EXPECT_TRUE(receivedEndMarker);
+  deleteResults(taskId, 1);
+
+  fetch(taskId, 0);
+  fetch(taskId, 0);
+  fetchEndMarker(taskId, 0);
+
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+// Broadcast: a destination registered after production finishes receives all
+// retained data before exactly one end marker.
+TEST_F(UcxOutputQueueManagerTest, broadcastLateRegistrationAfterEnd) {
+  const std::string taskId = "broadcast-register-after-end";
+
+  auto task = initializeTask(
+      taskId,
+      1 /* numDestinations */,
+      1 /* numDrivers */,
+      true /* cleanup */,
+      core::PartitionedOutputNode::Kind::kBroadcast);
+
+  enqueue(taskId, 0, 10);
+  noMoreData(taskId);
+
+  fetch(taskId, 1);
+  fetchEndMarker(taskId, 1);
+
+  queueManager_->updateOutputBuffers(taskId, 2, true);
+  fetch(taskId, 0);
+  fetchEndMarker(taskId, 0);
+
+  EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
 // Broadcast: isFinished requires noMoreQueues.
 TEST_F(UcxOutputQueueManagerTest, broadcastNotFinishedWithoutNoMoreQueues) {
   const std::string taskId = "broadcast2";

@@ -14,6 +14,26 @@
 
 find_package(Threads REQUIRED)
 
+add_executable(ucx_communicator_test CommunicatorTest.cpp)
+
+add_test(NAME ucx_communicator_test COMMAND ucx_communicator_test)
+
+set_tests_properties(ucx_communicator_test PROPERTIES TIMEOUT 60)
+
+if(VELOX_ENABLE_CUDF)
+  set_tests_properties(ucx_communicator_test PROPERTIES LABELS cuda_driver)
+endif()
+
+target_link_libraries(
+  ucx_communicator_test
+  PRIVATE
+    velox_ucx_exchange
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main
+    Threads::Threads
+)
+
 add_executable(
   ucx_cpu_row_completion_tracker_test
   CpuRowFrameCompletionTrackerTest.cpp

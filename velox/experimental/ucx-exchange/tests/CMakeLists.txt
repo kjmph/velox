@@ -37,6 +37,28 @@ target_link_libraries(
     ucx::ucs
 )
 
+add_executable(
+  ucx_cpu_row_output_queue_test
+  UcxCpuRowOutputQueueTest.cpp
+  ../UcxCpuRowQueues.cpp
+)
+
+add_test(
+  NAME ucx_cpu_row_output_queue_test
+  COMMAND ucx_cpu_row_output_queue_test
+)
+
+target_link_libraries(
+  ucx_cpu_row_output_queue_test
+  PRIVATE
+    Folly::folly
+    fmt::fmt
+    GTest::gtest
+    GTest::gtest_main
+    Threads::Threads
+    velox_exec
+)
+
 if(VELOX_ENABLE_CUDF)
   add_executable(
     ucx_exchange_test

@@ -634,6 +634,18 @@ bool UcxCpuRowOutputQueue::isFinishedLocked() {
   return true;
 }
 
+std::optional<exec::TaskState> UcxCpuRowOutputQueue::taskState() {
+  std::shared_ptr<exec::Task> task;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    task = task_;
+  }
+  if (task == nullptr) {
+    return std::nullopt;
+  }
+  return task->state();
+}
+
 void UcxCpuRowOutputQueue::updateOutputBuffers(
     int numBuffers,
     bool noMoreBuffers) {

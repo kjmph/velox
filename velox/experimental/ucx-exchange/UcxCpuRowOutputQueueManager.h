@@ -16,11 +16,13 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string_view>
-#include <unordered_set>
+#include <unordered_map>
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/Task.h"
+#include "velox/experimental/ucx-exchange/PartitionKey.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowQueues.h"
 
 /// Singleton mapping (taskId -> UcxCpuRowOutputQueue). Mirrors
@@ -28,8 +30,36 @@
 
 namespace facebook::velox::ucx_exchange {
 
+/// Minimal lifecycle interface used by the output queue manager to stop
+/// producer-side UCX sends when their task terminates abnormally. Keeping this
+/// separate from the concrete server makes the registry independently
+/// testable without constructing UCX endpoints.
+class UcxCpuRowExchangeServerLifecycle {
+ public:
+  virtual ~UcxCpuRowExchangeServerLifecycle() = default;
+
+  virtual const PartitionKey& getPartitionKey() const = 0;
+
+  /// Requests asynchronous, idempotent shutdown on the communicator thread.
+  virtual void requestAbort() = 0;
+
+  /// Atomically enables communicator processing after registry admission.
+  /// Returns false if shutdown won the race.
+  virtual bool activate() = 0;
+
+  /// Lock-free lifecycle check used to close registration-vs-shutdown races.
+  virtual bool isClosed() const = 0;
+};
+
 class UcxCpuRowOutputQueueManager : public exec::OutputBufferManager {
  public:
+  enum class ExchangeServerAdmission {
+    kAccepted,
+    kTaskRemoved,
+    kDuplicateServer,
+    kServerUnavailable,
+  };
+
   static std::shared_ptr<UcxCpuRowOutputQueueManager> getInstanceRef();
 
   UcxCpuRowOutputQueueManager() = default;
@@ -105,8 +135,23 @@ class UcxCpuRowOutputQueueManager : public exec::OutputBufferManager {
       int destination,
       std::shared_ptr<UcxCpuRowPayload> data);
 
+  /// Registers a producer-side exchange server for task-lifecycle cleanup.
+  /// Registration and task removal are linearized by the same mutex. A server
+  /// arriving after task removal, or while another server owns the same exact
+  /// partition key, is rejected and asynchronously aborted. Accepted servers
+  /// are activated after releasing the lifecycle lock.
+  ExchangeServerAdmission registerExchangeServer(
+      const std::shared_ptr<UcxCpuRowExchangeServerLifecycle>& server);
+
+  /// Removes a server from lifecycle tracking. Safe to call repeatedly.
+  void unregisterExchangeServer(
+      const std::shared_ptr<UcxCpuRowExchangeServerLifecycle>& server);
+
   /// Removes the queue for the given task. Calls `terminate` on the
-  /// queue to wake up any waiting producers/consumers.
+  /// queue to wake up any waiting producers/consumers. Servers for a normally
+  /// finished task remain alive long enough to complete their final metadata
+  /// send. Servers for canceled, aborted, failed, or uninitialized tasks are
+  /// asynchronously aborted.
   void removeTask(const std::string& taskId) override;
 
   /// Returns the queue stats, or nullopt if no queue exists.
@@ -126,17 +171,27 @@ class UcxCpuRowOutputQueueManager : public exec::OutputBufferManager {
   // Throws if no queue exists for the taskId.
   std::shared_ptr<UcxCpuRowOutputQueue> getQueue(std::string_view taskId);
 
-  folly::Synchronized<
-      std::unordered_map<std::string, std::shared_ptr<UcxCpuRowOutputQueue>>,
-      std::mutex>
-      queues_;
+  enum class TaskRemovalKind {
+    kFinished,
+    kAborted,
+  };
 
-  // Tracks tasks that have been removed via removeTask(). Prevents
-  // getData() from re-creating placeholder queues for dead tasks,
-  // which would cause crashes when deleteResults() runs on undersized
-  // placeholders. Mirrors UcxOutputQueueManager's removedTasks_.
-  folly::Synchronized<std::unordered_set<std::string>, std::mutex>
-      removedTasks_;
+  using ServerWeakPtr = std::weak_ptr<UcxCpuRowExchangeServerLifecycle>;
+
+  struct State {
+    std::unordered_map<std::string, std::shared_ptr<UcxCpuRowOutputQueue>>
+        queues;
+    // Tombstones prevent late handshakes from recreating placeholder queues.
+    // They persist because UCX tags have no generation and task IDs are unique.
+    std::unordered_map<std::string, TaskRemovalKind> removedTasks;
+    // An entry claims the exact key for the task lifetime. Its weak pointer is
+    // cleared when a server closes before task removal, but the claim remains:
+    // a replacement would restart sequence zero on a partially consumed
+    // stream. Task removal replaces these claims with a task tombstone.
+    std::map<PartitionKey, ServerWeakPtr> activeServers;
+  };
+
+  folly::Synchronized<State, std::mutex> state_;
 };
 
 } // namespace facebook::velox::ucx_exchange

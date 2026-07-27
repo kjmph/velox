@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 /// Definitions needed for the Ucx exchange protocol.
@@ -100,6 +101,19 @@ constexpr uint32_t kMaxCpuRowWorkerAddressBytes = 4096;
 enum class CpuRowDataEndpointMode : uint8_t {
   kBootstrap = 0,
   kSameHostWorkerAddress = 1,
+  // Rejected responses use a mode that old version-1 sources already reject
+  // as unsupported, preventing them from waiting forever for metadata.
+  kRejected = 0xff,
+};
+
+/// Admission result returned by the producer in the CPU-row handshake.
+/// This occupies one byte that was reserved in version 1 of the response, so
+/// accepted handshakes remain wire-compatible with existing workers.
+enum class CpuRowHandshakeResponseStatus : uint8_t {
+  kAccepted = 0,
+  kTaskRemoved = 1,
+  kDuplicateServer = 2,
+  kServerUnavailable = 3,
 };
 
 /// CPU-row handshake envelope. The legacy HandshakeMsg remains unchanged for
@@ -130,10 +144,19 @@ struct CpuRowHandshakeResponseHeader {
   uint16_t version{kCpuRowHandshakeResponseVersion};
   uint16_t headerSize{sizeof(CpuRowHandshakeResponseHeader)};
   CpuRowDataEndpointMode dataEndpointMode{CpuRowDataEndpointMode::kBootstrap};
-  uint8_t reserved[3]{};
+  CpuRowHandshakeResponseStatus status{
+      CpuRowHandshakeResponseStatus::kAccepted};
+  uint8_t reserved[2]{};
   uint32_t serverWorkerAddressBytes{0};
   uint32_t serverHostIdHash{0};
 };
+
+static_assert(std::is_standard_layout_v<CpuRowHandshakeResponseHeader>);
+static_assert(sizeof(CpuRowHandshakeResponseHeader) == 20);
+static_assert(offsetof(CpuRowHandshakeResponseHeader, dataEndpointMode) == 8);
+static_assert(offsetof(CpuRowHandshakeResponseHeader, status) == 9);
+static_assert(
+    offsetof(CpuRowHandshakeResponseHeader, serverWorkerAddressBytes) == 12);
 
 /// CPU-row data-endpoint ACK. The source sends this on the selected data
 /// endpoint after it has created the endpoint and posted its first metadata

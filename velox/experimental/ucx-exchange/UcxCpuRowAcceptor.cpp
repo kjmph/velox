@@ -91,6 +91,7 @@ ParsedCpuHandshake parseCpuHandshake(ucxx::Buffer& buffer) {
 }
 
 std::shared_ptr<std::vector<uint8_t>> makeCpuHandshakeResponse(
+    CpuRowHandshakeResponseStatus status,
     CpuRowDataEndpointMode dataEndpointMode,
     std::string_view serverWorkerAddress,
     uint32_t serverHostIdHash) {
@@ -104,6 +105,7 @@ std::shared_ptr<std::vector<uint8_t>> makeCpuHandshakeResponse(
   auto response = std::make_shared<std::vector<uint8_t>>(
       sizeof(CpuRowHandshakeResponseHeader) + serverWorkerAddress.size());
   CpuRowHandshakeResponseHeader header;
+  header.status = status;
   header.dataEndpointMode = dataEndpointMode;
   header.serverWorkerAddressBytes =
       static_cast<uint32_t>(serverWorkerAddress.size());
@@ -116,6 +118,22 @@ std::shared_ptr<std::vector<uint8_t>> makeCpuHandshakeResponse(
         serverWorkerAddress.size());
   }
   return response;
+}
+
+CpuRowHandshakeResponseStatus toHandshakeResponseStatus(
+    UcxCpuRowOutputQueueManager::ExchangeServerAdmission admission) {
+  switch (admission) {
+    case UcxCpuRowOutputQueueManager::ExchangeServerAdmission::kAccepted:
+      return CpuRowHandshakeResponseStatus::kAccepted;
+    case UcxCpuRowOutputQueueManager::ExchangeServerAdmission::kTaskRemoved:
+      return CpuRowHandshakeResponseStatus::kTaskRemoved;
+    case UcxCpuRowOutputQueueManager::ExchangeServerAdmission::kDuplicateServer:
+      return CpuRowHandshakeResponseStatus::kDuplicateServer;
+    case UcxCpuRowOutputQueueManager::ExchangeServerAdmission::
+        kServerUnavailable:
+      return CpuRowHandshakeResponseStatus::kServerUnavailable;
+  }
+  VELOX_UNREACHABLE();
 }
 
 } // namespace
@@ -184,9 +202,26 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
 
   dataEpRef->addCommElem(exchangeServer);
   communicator->registerCommElement(exchangeServer);
+  const auto admission =
+      UcxCpuRowOutputQueueManager::getInstanceRef()->registerExchangeServer(
+          exchangeServer);
+  const auto responseStatus = toHandshakeResponseStatus(admission);
+  if (admission !=
+      UcxCpuRowOutputQueueManager::ExchangeServerAdmission::kAccepted) {
+    // A rejected source must receive an explicit terminal response. The
+    // bootstrap endpoint is shared, so closing it would disrupt unrelated
+    // exchanges. The inactive server is aborted independently.
+    dataEndpointMode = CpuRowDataEndpointMode::kRejected;
+    serverWorkerAddress.clear();
+  }
 
   auto response = makeCpuHandshakeResponse(
-      dataEndpointMode, serverWorkerAddress, communicator->getHostIdHash());
+      responseStatus,
+      dataEndpointMode,
+      serverWorkerAddress,
+      responseStatus == CpuRowHandshakeResponseStatus::kAccepted
+          ? communicator->getHostIdHash()
+          : 0);
 
   uint64_t responseTag = getHandshakeResponseTag(fnv1a_32(key.toString()));
   // Keep the control-plane response on the listener endpoint that received the

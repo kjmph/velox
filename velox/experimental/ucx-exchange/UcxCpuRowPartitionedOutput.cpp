@@ -383,6 +383,7 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::advance(
     uint64_t maxBytes,
     const std::vector<vector_size_t>& sizes,
     const RowVectorPtr& output,
+    const std::function<void()>& bufferReleaseFn,
     bool* atEnd,
     ContinueFuture* future,
     Scratch& scratch) {
@@ -394,7 +395,7 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::advance(
   const auto firstRow = rowIdx_;
   const uint32_t adjustedMaxBytes = (maxBytes * targetSizePct_) / 100;
   if (bytesInCurrent_ >= adjustedMaxBytes) {
-    return flush(future);
+    return flush(bufferReleaseFn, future);
   }
 
   bool shouldFlush = false;
@@ -420,12 +421,13 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::advance(
     *atEnd = true;
   }
   if (shouldFlush || (eagerFlush_ && rowsInCurrent_ > 0)) {
-    return flush(future);
+    return flush(bufferReleaseFn, future);
   }
   return BlockingReason::kNotBlocked;
 }
 
 BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
+    const std::function<void()>& bufferReleaseFn,
     ContinueFuture* future) {
   if (!current_ || rowsInCurrent_ == 0) {
     return BlockingReason::kNotBlocked;
@@ -471,7 +473,7 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
   const int64_t flushedBytes = stream.tellp();
 
   auto payload = std::make_unique<UcxCpuRowPayload>();
-  payload->data = stream.getIOBuf();
+  payload->data = stream.getIOBuf(bufferReleaseFn);
   return enqueuePayload(std::move(payload), flushedBytes);
 }
 
@@ -500,6 +502,11 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
           planNode->outputType(),
           planNode->outputType())),
       queueMgr_(std::move(queueManager)),
+      // Serialized pages can outlive the output operator while UCX is sending
+      // them. Keep the task, which owns the operator's child memory pools,
+      // alive until the last IOBuf range is released. This mirrors
+      // exec::PartitionedOutput's external-buffer lifetime contract.
+      bufferReleaseFn_([task = operatorCtx_->task()]() {}),
       maxBufferedBytes_(ctx->task->queryCtx()
                             ->queryConfig()
                             .maxPartitionedOutputBufferSize()),
@@ -696,7 +703,7 @@ void UcxCpuRowPartitionedOutput::finishOutput() {
     if (destination->isFinished()) {
       continue;
     }
-    destination->flush(/*future=*/nullptr);
+    destination->flush(bufferReleaseFn_, /*future=*/nullptr);
     destination->setFinished();
   }
   sharedQueueManager()->noMoreData(operatorCtx_->task()->taskId());
@@ -729,7 +736,13 @@ RowVectorPtr UcxCpuRowPartitionedOutput::getOutput() {
     for (auto& destination : destinations_) {
       bool atEnd = false;
       blockingReason_ = destination->advance(
-          maxPageSize, rowSize_, output_, &atEnd, &future_, scratch_);
+          maxPageSize,
+          rowSize_,
+          output_,
+          bufferReleaseFn_,
+          &atEnd,
+          &future_,
+          scratch_);
       if (blockingReason_ != BlockingReason::kNotBlocked) {
         blockedDestination = destination.get();
         workLeft = false;
@@ -751,7 +764,7 @@ RowVectorPtr UcxCpuRowPartitionedOutput::getOutput() {
           destination->serializedBytes() < kMinDestinationSize) {
         continue;
       }
-      destination->flush(/*future=*/nullptr);
+      destination->flush(bufferReleaseFn_, /*future=*/nullptr);
     }
     return nullptr;
   }

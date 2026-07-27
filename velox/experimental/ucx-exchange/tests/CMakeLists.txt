@@ -60,6 +60,8 @@ target_link_libraries(
 add_executable(
   ucx_cpu_row_output_queue_test
   UcxCpuRowOutputQueueTest.cpp
+  ../UcxCpuRowOutputQueueManager.cpp
+  ../UcxCpuRowPartitionedOutput.cpp
   ../UcxCpuRowQueues.cpp
 )
 
@@ -77,6 +79,7 @@ target_link_libraries(
     GTest::gtest_main
     Threads::Threads
     velox_exec
+    velox_presto_serializer
 )
 
 if(VELOX_ENABLE_CUDF)

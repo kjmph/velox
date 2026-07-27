@@ -40,6 +40,7 @@
 namespace facebook::velox::ucx_exchange {
 
 class UcxVectorStreamGroup;
+class UcxCpuRowOutputQueueTest;
 
 class UcxCpuRowPartitionedOutput : public exec::Operator {
  public:
@@ -73,6 +74,8 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   void close() override;
 
  private:
+  friend class UcxCpuRowOutputQueueTest;
+
   /// Per-destination buffer: accumulates row indices, runs the
   /// PrestoSerializer-backed VectorStreamGroup, and flushes an IOBuf
   /// chain into UcxCpuRowOutputQueueManager when full or finishing.
@@ -112,6 +115,7 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
         uint64_t maxBytes,
         const std::vector<vector_size_t>& sizes,
         const RowVectorPtr& output,
+        const std::function<void()>& bufferReleaseFn,
         bool* atEnd,
         ContinueFuture* future,
         Scratch& scratch);
@@ -119,7 +123,9 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
     /// Materializes the buffered VectorStreamGroup as an IOBuf chain,
     /// hands it to the queue manager, and returns whether the producer
     /// must block.
-    exec::BlockingReason flush(ContinueFuture* future);
+    exec::BlockingReason flush(
+        const std::function<void()>& bufferReleaseFn,
+        ContinueFuture* future);
 
     bool isFinished() const {
       return finished_;
@@ -180,6 +186,7 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
   const std::vector<column_index_t> outputChannels_;
   const std::weak_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
+  const std::function<void()> bufferReleaseFn_;
   const int64_t maxBufferedBytes_;
   const bool eagerFlush_;
   const uint64_t maxPageBytes_;

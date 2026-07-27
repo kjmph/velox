@@ -22,14 +22,21 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
+#include "velox/serializers/PrestoSerializer.h"
 
 namespace facebook::velox::ucx_exchange {
-namespace {
 
 class UcxCpuRowOutputQueueTest : public testing::Test {
  protected:
+  using Destination = UcxCpuRowPartitionedOutput::Destination;
+
   static void SetUpTestSuite() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+    if (!isRegisteredNamedVectorSerde("Presto")) {
+      serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
+    }
   }
 
   void SetUp() override {
@@ -68,6 +75,79 @@ class UcxCpuRowOutputQueueTest : public testing::Test {
 
   std::shared_ptr<memory::MemoryPool> pool_;
 };
+
+TEST_F(UcxCpuRowOutputQueueTest, exportedPageRetainsReleaseOwner) {
+  const std::string taskId = "exported-page-retains-release-owner";
+  auto task = makeTask(taskId);
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  auto child =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, pool_.get());
+  child->set(0, 42);
+  auto output = std::make_shared<RowVector>(
+      pool_.get(),
+      ROW({"c0"}, {BIGINT()}),
+      nullptr,
+      1,
+      std::vector<VectorPtr>{child});
+
+  Destination destination(
+      taskId,
+      /*destination=*/0,
+      getNamedVectorSerde("Presto"),
+      /*serdeOptions=*/nullptr,
+      pool_.get(),
+      /*eagerFlush=*/false,
+      UcxCpuRowPartitionedOutput::kTargetNumRows,
+      queueManager,
+      [](uint64_t /*bytes*/, uint64_t /*rows*/) {});
+  destination.beginBatch();
+  destination.addRow(0);
+
+  std::vector<vector_size_t> sizes{sizeof(int64_t)};
+  bool atEnd = false;
+  Scratch scratch;
+  auto releaseOwner = std::make_shared<int>(42);
+  std::weak_ptr<int> weakReleaseOwner = releaseOwner;
+  std::function<void()> releaseFn = [releaseOwner]() {};
+
+  EXPECT_EQ(
+      destination.advance(
+          1 << 20,
+          sizes,
+          output,
+          releaseFn,
+          &atEnd,
+          /*future=*/nullptr,
+          scratch),
+      exec::BlockingReason::kNotBlocked);
+  EXPECT_TRUE(atEnd);
+  EXPECT_EQ(
+      destination.flush(releaseFn, /*future=*/nullptr),
+      exec::BlockingReason::kNotBlocked);
+
+  auto payload = queueManager->tryGetData(taskId, /*destination=*/0);
+  ASSERT_NE(payload, nullptr);
+  ASSERT_NE(payload->data, nullptr);
+
+  releaseOwner.reset();
+  releaseFn = nullptr;
+  EXPECT_FALSE(weakReleaseOwner.expired());
+
+  // The release callback is part of the exported IOBuf ownership. It must
+  // remain alive after the serializer and caller drop their references, then
+  // release only after the transport drops the page.
+  payload.reset();
+  EXPECT_TRUE(weakReleaseOwner.expired());
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+}
 
 TEST_F(
     UcxCpuRowOutputQueueTest,
@@ -254,5 +334,4 @@ TEST_F(
   queue->terminate();
 }
 
-} // namespace
 } // namespace facebook::velox::ucx_exchange

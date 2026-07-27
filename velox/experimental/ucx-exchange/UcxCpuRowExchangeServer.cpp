@@ -132,7 +132,18 @@ std::shared_ptr<UcxCpuRowExchangeServer> UcxCpuRowExchangeServer::create(
 
 void UcxCpuRowExchangeServer::process() {
   while (true) {
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      close();
+      return;
+    }
+    if (!activated_.load(std::memory_order_acquire)) {
+      return;
+    }
     drainStateEvents();
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      close();
+      return;
+    }
     if (closed_.load(std::memory_order_acquire)) {
       return;
     }
@@ -164,13 +175,32 @@ void UcxCpuRowExchangeServer::process() {
         return;
       case ServerState::Done:
         close();
-        if (endpointRef_) {
-          endpointRef_->removeCommElem(getSelfPtr());
-          endpointRef_ = nullptr;
-        }
         return;
     };
   }
+}
+
+bool UcxCpuRowExchangeServer::activate() {
+  if (closed_.load(std::memory_order_acquire) ||
+      abortRequested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  bool expected = false;
+  if (activated_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+  return !closed_.load(std::memory_order_acquire) &&
+      !abortRequested_.load(std::memory_order_acquire);
+}
+
+void UcxCpuRowExchangeServer::requestAbort() {
+  bool expected = false;
+  if (!abortRequested_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
 }
 
 void UcxCpuRowExchangeServer::close() {
@@ -214,7 +244,15 @@ void UcxCpuRowExchangeServer::close() {
     }
   }
 
-  communicator_->unregister(getSelfPtr());
+  auto self = getSelfPtr();
+  queueMgr_->unregisterExchangeServer(self);
+  if (endpointRef_) {
+    auto endpointRef = std::move(endpointRef_);
+    endpointRef->removeCommElem(self);
+  }
+  if (communicator_) {
+    communicator_->unregister(std::move(self));
+  }
 }
 
 std::string UcxCpuRowExchangeServer::toString() {
@@ -292,11 +330,15 @@ void UcxCpuRowExchangeServer::onDataEndpointAck(
 }
 
 void UcxCpuRowExchangeServer::fillSendWindow() {
-  if (closed_.load(std::memory_order_acquire) || finalMetadataSent_) {
+  if (closed_.load(std::memory_order_acquire) ||
+      abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
     return;
   }
 
   while (inFlightSends_ < kMaxInFlightBundles) {
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      return;
+    }
     if (hasPendingData_) {
       auto data = std::move(pendingData_);
       hasPendingData_ = false;
@@ -363,6 +405,9 @@ void UcxCpuRowExchangeServer::onDataAvailable(
 
 void UcxCpuRowExchangeServer::sendData(
     std::shared_ptr<UcxCpuRowPayload> firstChunk) {
+  if (abortRequested_.load(std::memory_order_acquire)) {
+    return;
+  }
   // Drain the queue up to kBundleTargetBytes. The collected chunks are
   // then packed into ~kFrameTargetBytes frames before the metadata is
   // built; the receiver allocates one buffer per frame and we must
@@ -562,7 +607,7 @@ void UcxCpuRowExchangeServer::sendData(
 }
 
 void UcxCpuRowExchangeServer::sendFinalMetadata() {
-  if (finalMetadataSent_) {
+  if (abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
     return;
   }
 

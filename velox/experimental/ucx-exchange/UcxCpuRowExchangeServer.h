@@ -35,6 +35,7 @@ namespace facebook::velox::ucx_exchange {
 
 class UcxCpuRowExchangeServer
     : public CommElement,
+      public UcxCpuRowExchangeServerLifecycle,
       public std::enable_shared_from_this<UcxCpuRowExchangeServer> {
  public:
   // Public for logging and the VELOX_DEFINE_EMBEDDED_ENUM_NAME names map.
@@ -65,9 +66,17 @@ class UcxCpuRowExchangeServer
 
   void close() override;
 
+  void requestAbort() override;
+
+  bool activate() override;
+
+  bool isClosed() const override {
+    return closed_.load(std::memory_order_acquire);
+  }
+
   std::string toString();
 
-  const PartitionKey& getPartitionKey() const {
+  const PartitionKey& getPartitionKey() const override {
     return partitionKey_;
   }
 
@@ -123,6 +132,8 @@ class UcxCpuRowExchangeServer
 
   std::atomic<ServerState> state_;
   std::atomic<bool> closed_{false};
+  std::atomic<bool> abortRequested_{false};
+  std::atomic<bool> activated_{false};
 
   uint32_t sequenceNumber_{0};
   uint32_t inFlightSends_{0};

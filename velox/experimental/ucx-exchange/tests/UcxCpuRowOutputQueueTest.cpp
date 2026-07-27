@@ -16,6 +16,8 @@
 
 #include "velox/experimental/ucx-exchange/UcxCpuRowQueues.h"
 
+#include <atomic>
+
 #include <folly/io/IOBuf.h>
 #include <gtest/gtest.h>
 
@@ -24,6 +26,7 @@
 #include "velox/core/QueryCtx.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/serializers/PrestoSerializer.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -75,6 +78,77 @@ class UcxCpuRowOutputQueueTest : public testing::Test {
 
   std::shared_ptr<memory::MemoryPool> pool_;
 };
+
+class TestCpuRowExchangeServerLifecycle
+    : public UcxCpuRowExchangeServerLifecycle {
+ public:
+  TestCpuRowExchangeServerLifecycle(std::string taskId, uint32_t destination)
+      : key_{std::move(taskId), destination} {}
+
+  const PartitionKey& getPartitionKey() const override {
+    return key_;
+  }
+
+  void requestAbort() override {
+    bool expected = false;
+    if (abortRequested_.compare_exchange_strong(expected, true)) {
+      ++abortRequests_;
+    }
+  }
+
+  bool activate() override {
+    if (closed_.load() || abortRequested_.load()) {
+      return false;
+    }
+    activated_.store(true);
+    return true;
+  }
+
+  bool isClosed() const override {
+    return closed_.load();
+  }
+
+  int abortRequests() const {
+    return abortRequests_.load();
+  }
+
+  bool isActivated() const {
+    return activated_.load();
+  }
+
+  void completeClose() {
+    closed_.store(true);
+  }
+
+ private:
+  const PartitionKey key_;
+  std::atomic<int> abortRequests_{0};
+  std::atomic<bool> abortRequested_{false};
+  std::atomic<bool> closed_{false};
+  std::atomic<bool> activated_{false};
+};
+
+using ExchangeServerAdmission =
+    UcxCpuRowOutputQueueManager::ExchangeServerAdmission;
+
+TEST(CpuRowHandshakeResponseTest, rejectionIsCompatibleWithVersionOneReaders) {
+  CpuRowHandshakeResponseHeader accepted;
+  EXPECT_EQ(accepted.status, CpuRowHandshakeResponseStatus::kAccepted);
+  EXPECT_EQ(accepted.dataEndpointMode, CpuRowDataEndpointMode::kBootstrap);
+
+  CpuRowHandshakeResponseHeader rejected;
+  rejected.status = CpuRowHandshakeResponseStatus::kTaskRemoved;
+  rejected.dataEndpointMode = CpuRowDataEndpointMode::kRejected;
+  rejected.serverWorkerAddressBytes = 0;
+  rejected.serverHostIdHash = 0;
+
+  EXPECT_NE(rejected.dataEndpointMode, CpuRowDataEndpointMode::kBootstrap);
+  EXPECT_NE(
+      rejected.dataEndpointMode,
+      CpuRowDataEndpointMode::kSameHostWorkerAddress);
+  EXPECT_EQ(sizeof(rejected), sizeof(accepted));
+  EXPECT_EQ(rejected.version, kCpuRowHandshakeResponseVersion);
+}
 
 TEST_F(UcxCpuRowOutputQueueTest, exportedPageRetainsReleaseOwner) {
   const std::string taskId = "exported-page-retains-release-owner";
@@ -147,6 +221,301 @@ TEST_F(UcxCpuRowOutputQueueTest, exportedPageRetainsReleaseOwner) {
 
   task->requestAbort().wait();
   queueManager->removeTask(taskId);
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    abnormalTaskRemovalAbortsAllAndOnlyMatchingServers) {
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto taskA = makeTask("aborted-task-a");
+  auto taskB = makeTask("unrelated-task-b");
+  queueManager->initializeTask(
+      taskA,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/2,
+      /*numDrivers=*/1);
+  queueManager->initializeTask(
+      taskB,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  auto a0 =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskA->taskId(), 0);
+  auto a0Duplicate =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskA->taskId(), 0);
+  auto a1 =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskA->taskId(), 1);
+  auto b0 =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskB->taskId(), 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(a0),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(a0Duplicate),
+      ExchangeServerAdmission::kDuplicateServer);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(a1),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(b0),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_TRUE(a0->isActivated());
+  EXPECT_FALSE(a0Duplicate->isActivated());
+  EXPECT_TRUE(a1->isActivated());
+  EXPECT_TRUE(b0->isActivated());
+  EXPECT_EQ(a0Duplicate->abortRequests(), 1);
+
+  taskA->requestAbort().wait();
+  queueManager->removeTask(taskA->taskId());
+
+  EXPECT_EQ(a0->abortRequests(), 1);
+  EXPECT_EQ(a0Duplicate->abortRequests(), 1);
+  EXPECT_EQ(a1->abortRequests(), 1);
+  EXPECT_EQ(b0->abortRequests(), 0);
+
+  // Repeated removal must preserve the tombstone. requestAbort() is
+  // idempotent while the servers remain registered until close completes.
+  queueManager->removeTask(taskA->taskId());
+  EXPECT_EQ(a0->abortRequests(), 1);
+  EXPECT_EQ(a0Duplicate->abortRequests(), 1);
+  EXPECT_EQ(a1->abortRequests(), 1);
+
+  auto lateA =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskA->taskId(), 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(lateA),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_EQ(lateA->abortRequests(), 1);
+
+  // Unregistering the unrelated server prevents later task cleanup from
+  // touching a server that has already completed normally.
+  queueManager->unregisterExchangeServer(b0);
+  queueManager->unregisterExchangeServer(b0);
+  taskB->requestAbort().wait();
+  queueManager->removeTask(taskB->taskId());
+  EXPECT_EQ(b0->abortRequests(), 0);
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, removedTaskTombstoneRejectsReinitialization) {
+  const std::string taskId = "removed-before-initialization";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  queueManager->removeTask(taskId);
+  queueManager->removeTask(taskId);
+
+  auto rejected =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(rejected),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_EQ(rejected->abortRequests(), 1);
+
+  auto task = makeTask(taskId);
+  EXPECT_ANY_THROW(queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1));
+  task->requestAbort().wait();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    finishedTaskServersDrainInsteadOfBeingAborted) {
+  const std::string taskId = "normally-finished-task";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto task = makeTask(taskId);
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  auto active = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(active),
+      ExchangeServerAdmission::kAccepted);
+
+  task->testingFinish();
+  queueManager->removeTask(taskId);
+  EXPECT_EQ(active->abortRequests(), 0);
+
+  auto reusedTask = makeTask(taskId);
+  EXPECT_ANY_THROW(queueManager->initializeTask(
+      reusedTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1));
+
+  queueManager->unregisterExchangeServer(active);
+
+  // A server admitted before normal removal drains its final marker. A server
+  // arriving after the finished tombstone is stale and must never start an
+  // empty stream.
+  auto late = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(late),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_FALSE(late->isActivated());
+  EXPECT_EQ(late->abortRequests(), 1);
+
+  // UCX tags contain no generation. Cleanup makes the old server reclaimable
+  // but cannot prove that no unexpected old message remains in the worker.
+  EXPECT_ANY_THROW(queueManager->initializeTask(
+      reusedTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1));
+  reusedTask->requestAbort().wait();
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, taskIdTombstoneOutlivesAbortedServerCleanup) {
+  const std::string taskId = "tombstone-after-asynchronous-abort";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto task = makeTask(taskId);
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  auto draining =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(draining),
+      ExchangeServerAdmission::kAccepted);
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+  EXPECT_EQ(draining->abortRequests(), 1);
+  EXPECT_FALSE(draining->isClosed());
+
+  auto reusedTask = makeTask(taskId);
+  EXPECT_ANY_THROW(queueManager->initializeTask(
+      reusedTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1));
+
+  draining->completeClose();
+  queueManager->unregisterExchangeServer(draining);
+  EXPECT_ANY_THROW(queueManager->initializeTask(
+      reusedTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1));
+  reusedTask->requestAbort().wait();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    activationFailureRetainsRegistrationUntilClose) {
+  const std::string taskId = "abort-before-activation";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  auto aborting =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  aborting->requestAbort();
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(aborting),
+      ExchangeServerAdmission::kServerUnavailable);
+  EXPECT_EQ(aborting->abortRequests(), 1);
+
+  auto duplicate =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(duplicate),
+      ExchangeServerAdmission::kDuplicateServer);
+  EXPECT_EQ(duplicate->abortRequests(), 1);
+
+  aborting->completeClose();
+  queueManager->unregisterExchangeServer(aborting);
+
+  auto replacement =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(replacement),
+      ExchangeServerAdmission::kDuplicateServer);
+  EXPECT_EQ(replacement->abortRequests(), 1);
+
+  queueManager->removeTask(taskId);
+  auto afterRemoval =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(afterRemoval),
+      ExchangeServerAdmission::kTaskRemoved);
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, closedServerKeepsKeyClaimUntilTaskRemoval) {
+  const std::string taskId = "closed-active-task-server";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  auto server = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(server),
+      ExchangeServerAdmission::kAccepted);
+  server->completeClose();
+  queueManager->unregisterExchangeServer(server);
+
+  auto retry = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(retry),
+      ExchangeServerAdmission::kDuplicateServer);
+
+  queueManager->removeTask(taskId);
+  auto afterRemoval =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(afterRemoval),
+      ExchangeServerAdmission::kTaskRemoved);
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    closedBeforeRegistrationClaimsKeyUntilTaskRemoval) {
+  const std::string taskId = "closed-before-registration";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  auto closed = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  closed->requestAbort();
+  closed->completeClose();
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(closed),
+      ExchangeServerAdmission::kServerUnavailable);
+
+  auto retry = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(retry),
+      ExchangeServerAdmission::kDuplicateServer);
+
+  queueManager->removeTask(taskId);
+  auto afterRemoval =
+      std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(afterRemoval),
+      ExchangeServerAdmission::kTaskRemoved);
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, serverMayArriveBeforeFirstTaskInitialization) {
+  const std::string taskId = "server-before-task-initialization";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto early = std::make_shared<TestCpuRowExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager->registerExchangeServer(early),
+      ExchangeServerAdmission::kAccepted);
+
+  auto task = makeTask(taskId);
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+  EXPECT_EQ(early->abortRequests(), 0);
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+  EXPECT_EQ(early->abortRequests(), 1);
 }
 
 TEST_F(

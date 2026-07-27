@@ -87,9 +87,26 @@ int32_t readIntEnv(
 
 struct ParsedCpuHandshakeResponse {
   CpuRowDataEndpointMode dataEndpointMode{CpuRowDataEndpointMode::kBootstrap};
+  CpuRowHandshakeResponseStatus status{
+      CpuRowHandshakeResponseStatus::kAccepted};
   std::string_view serverWorkerAddress;
   uint32_t serverHostIdHash{0};
 };
+
+std::string_view handshakeResponseStatusName(
+    CpuRowHandshakeResponseStatus status) {
+  switch (status) {
+    case CpuRowHandshakeResponseStatus::kAccepted:
+      return "accepted";
+    case CpuRowHandshakeResponseStatus::kTaskRemoved:
+      return "task removed";
+    case CpuRowHandshakeResponseStatus::kDuplicateServer:
+      return "duplicate exchange server";
+    case CpuRowHandshakeResponseStatus::kServerUnavailable:
+      return "exchange server unavailable";
+  }
+  return "unknown rejection";
+}
 
 struct CpuRowMetadataReceiveContext {
   explicit CpuRowMetadataReceiveContext(size_t size) : buffer(size) {}
@@ -147,6 +164,7 @@ ParsedCpuHandshakeResponse parseCpuHandshakeResponse(
       reinterpret_cast<const char*>(response.data()) + header.headerSize;
   return {
       header.dataEndpointMode,
+      header.status,
       std::string_view(address, header.serverWorkerAddressBytes),
       header.serverHostIdHash};
 }
@@ -634,6 +652,27 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
 
   auto responseBuffer = std::static_pointer_cast<std::vector<uint8_t>>(arg);
   const auto response = parseCpuHandshakeResponse(*responseBuffer);
+
+  if (response.status != CpuRowHandshakeResponseStatus::kAccepted ||
+      response.dataEndpointMode == CpuRowDataEndpointMode::kRejected) {
+    const auto rejectionReason =
+        response.status == CpuRowHandshakeResponseStatus::kAccepted
+        ? std::string_view{"rejected"}
+        : handshakeResponseStatusName(response.status);
+    std::string errorMsg = fmt::format(
+        "CPU exchange producer rejected the handshake from host {}:{}, task "
+        "{}: {} (status={})",
+        host_,
+        port_,
+        partitionKey_.toString(),
+        rejectionReason,
+        static_cast<int>(response.status));
+    LOG(ERROR) << errorMsg;
+    queue_->setError(errorMsg);
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    return;
+  }
 
   if (response.dataEndpointMode ==
       CpuRowDataEndpointMode::kSameHostWorkerAddress) {

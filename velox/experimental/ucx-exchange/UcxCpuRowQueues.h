@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 #include "velox/core/PlanNode.h"
@@ -224,6 +225,11 @@ class UcxCpuRowOutputQueue
 
   bool isFinished();
   bool isFinishedLocked();
+
+  /// Returns the current state of the producing task, or nullopt for a
+  /// pre-initialization placeholder. The queue mutex is released before
+  /// acquiring the Task mutex.
+  std::optional<exec::TaskState> taskState();
 
   /// Drops all queued payloads for `destination` and makes subsequent
   /// getData() calls return immediately with empty data.

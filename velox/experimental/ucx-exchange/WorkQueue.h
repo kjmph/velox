@@ -29,10 +29,21 @@ class WorkQueue {
   WorkQueue(const WorkQueue&) = delete;
   WorkQueue& operator=(const WorkQueue&) = delete;
 
-  // push always succeeds; never blocks
-  void push(std::shared_ptr<T> item) {
+  // push never blocks. Returns false after stopAccepting() has closed intake.
+  bool push(std::shared_ptr<T> item) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!accepting_) {
+      return false;
+    }
     queue_.emplace_back(std::move(item));
+    return true;
+  }
+
+  // Serializes queue shutdown with in-flight producers. Once this returns, a
+  // producer that has not already enqueued an item can no longer do so.
+  void stopAccepting() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accepting_ = false;
   }
 
   // pop never blocks; returns nullptr if empty
@@ -76,4 +87,5 @@ class WorkQueue {
  private:
   mutable std::mutex mutex_;
   std::list<std::shared_ptr<T>> queue_;
+  bool accepting_{true};
 };

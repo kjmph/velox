@@ -154,6 +154,23 @@ TEST(CpuRowHandshakeResponseTest, rejectionIsCompatibleWithVersionOneReaders) {
   EXPECT_EQ(rejected.version, kCpuRowHandshakeResponseVersion);
 }
 
+TEST(CpuRowAbortProtocolTest, usesPartitionScopedControlTag) {
+  constexpr uint32_t kTaskHash = 0xa1b2c3d4;
+  const auto abortTag = getCpuRowAbortTag(kTaskHash);
+
+  EXPECT_EQ(abortTag >> 32, kTaskHash);
+  EXPECT_EQ(abortTag & 0xff000000ULL, CPU_ROW_ABORT_TAG);
+  EXPECT_EQ(abortTag & 0x00ffffffULL, 0);
+  EXPECT_NE(abortTag, getHandshakeAckTag(kTaskHash));
+  EXPECT_NE(abortTag, getMetadataTag(kTaskHash, 0));
+  EXPECT_NE(abortTag, getDataTag(kTaskHash, 0));
+
+  CpuRowAbortHeader abort;
+  EXPECT_EQ(abort.magic, kCpuRowAbortMagic);
+  EXPECT_EQ(abort.version, kCpuRowAbortVersion);
+  EXPECT_EQ(abort.headerSize, sizeof(CpuRowAbortHeader));
+}
+
 TEST_F(UcxCpuRowOutputQueueTest, exportedPageRetainsReleaseOwner) {
   const std::string taskId = "exported-page-retains-release-owner";
   auto task = makeTask(taskId);
@@ -554,6 +571,47 @@ TEST_F(
   ASSERT_NE(received, nullptr);
   EXPECT_EQ(received->numBytes, 10);
   EXPECT_EQ(producerQueue->stats().bufferedBytes, 0);
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    deletedPlaceholderDestinationStaysDeletedAfterInitialization) {
+  const std::string taskId = "deleted-placeholder-destination";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  int endNotifications = 0;
+  auto earlyQueue = queueManager->getData(
+      taskId,
+      /*destination=*/1,
+      [&](std::shared_ptr<UcxCpuRowPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        EXPECT_EQ(data, nullptr);
+        ++endNotifications;
+      });
+  ASSERT_NE(earlyQueue, nullptr);
+  EXPECT_FALSE(earlyQueue->isInitialized());
+
+  earlyQueue->deleteResults(/*destination=*/1);
+  EXPECT_EQ(endNotifications, 1);
+
+  auto task = makeTask(taskId);
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/2,
+      /*numDrivers=*/1);
+  auto producerQueue = queueManager->getTaskQueue(taskId);
+  EXPECT_EQ(producerQueue.get(), earlyQueue.get());
+
+  producerQueue->enqueue(
+      /*destination=*/1, makePayload("must-be-dropped"), /*numRows=*/1);
+  const auto stats = producerQueue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+  EXPECT_EQ(endNotifications, 1);
 
   task->requestAbort().wait();
   queueManager->removeTask(taskId);

@@ -46,6 +46,7 @@ constexpr uint64_t METADATA_TAG = 0x02000000;
 constexpr uint64_t DATA_TAG = 0x03000000;
 constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 constexpr uint64_t HANDSHAKE_ACK_TAG = 0x05000000;
+constexpr uint64_t CPU_ROW_ABORT_TAG = 0x06000000;
 
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(std::string_view s);
@@ -74,6 +75,13 @@ inline uint64_t getHandshakeAckTag(uint64_t taskHash) {
   return (taskHash << 32) | HANDSHAKE_ACK_TAG;
 }
 
+// Gets the tag used by a CPU-row source to stop one producing partition.
+// The producer responds in-band: after draining its current send, it publishes
+// the normal final metadata record at the next sequence number.
+inline uint64_t getCpuRowAbortTag(uint64_t taskHash) {
+  return (taskHash << 32) | CPU_ROW_ABORT_TAG;
+}
+
 /// @brief Request that is sent from the client (UcxExchangeSource) to the
 /// server (UcxExchangeServer) after connection.
 ///
@@ -96,6 +104,8 @@ constexpr uint32_t kCpuRowHandshakeResponseMagic = 0x43505258; // "CPRX"
 constexpr uint16_t kCpuRowHandshakeResponseVersion = 1;
 constexpr uint32_t kCpuRowHandshakeAckMagic = 0x4350414b; // "CPAK"
 constexpr uint16_t kCpuRowHandshakeAckVersion = 1;
+constexpr uint32_t kCpuRowAbortMagic = 0x43504142; // "CPAB"
+constexpr uint16_t kCpuRowAbortVersion = 1;
 constexpr uint32_t kMaxCpuRowWorkerAddressBytes = 4096;
 
 enum class CpuRowDataEndpointMode : uint8_t {
@@ -168,6 +178,20 @@ struct CpuRowHandshakeAckHeader {
   uint16_t version{kCpuRowHandshakeAckVersion};
   uint16_t headerSize{sizeof(CpuRowHandshakeAckHeader)};
 };
+
+/// Per-partition CPU-row abort request. The source sends this only after its
+/// handshake was accepted. The server stops pulling new output, lets its
+/// single in-flight bundle finish, then sends the ordinary final metadata
+/// marker. Reusing the sequenced final marker prevents an abort ACK from
+/// overtaking data that the source still needs to drain.
+struct CpuRowAbortHeader {
+  uint32_t magic{kCpuRowAbortMagic};
+  uint16_t version{kCpuRowAbortVersion};
+  uint16_t headerSize{sizeof(CpuRowAbortHeader)};
+};
+
+static_assert(std::is_standard_layout_v<CpuRowAbortHeader>);
+static_assert(sizeof(CpuRowAbortHeader) == 8);
 
 /// @brief Response sent from server to source after handshake.
 /// The GPU exchange path uses this to report same-process intra-node transfer

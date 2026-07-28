@@ -28,9 +28,13 @@ bool CommElement::enqueueStateEventImpl(
     stateEvents_.push_back(std::move(event));
     try {
       // Keep the event queue locked through work-queue insertion. If insertion
-      // cannot allocate, removing the event is safe because drainStateEvents()
+      // is closed or cannot allocate, removing the event is safe because
+      // drainStateEvents()
       // cannot race and consume it in between.
-      communicator_->addToWorkQueue(std::move(self));
+      if (!communicator_->addToWorkQueue(std::move(self))) {
+        stateEvents_.pop_back();
+        return false;
+      }
     } catch (...) {
       stateEvents_.pop_back();
       return false;

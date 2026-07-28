@@ -53,6 +53,8 @@ const folly::
            "WaitingForReceiveCredit"},
           {UcxCpuRowExchangeSource::ReceiverState::WaitingForData,
            "WaitingForData"},
+          {UcxCpuRowExchangeSource::ReceiverState::DrainingAfterAbort,
+           "DrainingAfterAbort"},
           {UcxCpuRowExchangeSource::ReceiverState::Done, "Done"},
       };
   return kNames;
@@ -260,9 +262,19 @@ void UcxCpuRowExchangeSource::start() {
 void UcxCpuRowExchangeSource::process() {
   while (true) {
     drainStateEvents();
-    if (closed_) {
-      cleanUp();
+    if (closed_.load(std::memory_order_acquire)) {
       return;
+    }
+
+    if (closeRequested_.load(std::memory_order_acquire)) {
+      if (getState() == ReceiverState::Created) {
+        setState(ReceiverState::Done);
+      } else if (
+          handshakeAccepted_ &&
+          getState() != ReceiverState::DrainingAfterAbort &&
+          getState() != ReceiverState::Done) {
+        startAbortDrain();
+      }
     }
 
     switch (state_) {
@@ -334,6 +346,12 @@ void UcxCpuRowExchangeSource::process() {
       case ReceiverState::WaitingForData:
         // Legacy state from the single-flight receiver.
         return;
+      case ReceiverState::DrainingAfterAbort:
+        processAbortDrain();
+        if (getState() == ReceiverState::Done) {
+          continue;
+        }
+        return;
       case ReceiverState::Done:
         cleanUp();
         return;
@@ -342,48 +360,46 @@ void UcxCpuRowExchangeSource::process() {
 }
 
 void UcxCpuRowExchangeSource::cleanUp() {
-  if (handshakeRequest_ && !handshakeRequest_->isCompleted()) {
-    handshakeRequest_->cancel();
+  if (cleanupStarted_) {
+    return;
   }
-  if (handshakeResponseRequest_ && !handshakeResponseRequest_->isCompleted()) {
-    handshakeResponseRequest_->cancel();
-  }
-  if (dataEndpointAckRequest_ && !dataEndpointAckRequest_->isCompleted()) {
-    dataEndpointAckRequest_->cancel();
-  }
-  for (auto& req : metadataRequests_) {
-    if (req && !req->isCompleted()) {
-      req->cancel();
-    }
-  }
-  for (auto& req : dataRequests_) {
-    if (req && !req->isCompleted()) {
-      req->cancel();
-    }
-  }
+  cleanupStarted_ = true;
+  closed_.store(true, std::memory_order_release);
 
   if (communicator_) {
+    // UCP cancellation is supported for tag receives, not tag sends. Retain
+    // source control sends until completion, and exact-cancel only receives
+    // that provably have no matching producer send after the terminal cutoff.
     if (handshakeRequest_) {
       communicator_->deferRequestCleanup(std::move(handshakeRequest_));
-    }
-    if (handshakeResponseRequest_) {
-      communicator_->deferRequestCleanup(std::move(handshakeResponseRequest_));
     }
     if (dataEndpointAckRequest_) {
       communicator_->deferRequestCleanup(std::move(dataEndpointAckRequest_));
     }
+    if (abortRequest_) {
+      communicator_->deferRequestCleanup(std::move(abortRequest_));
+    }
+
+    std::vector<std::shared_ptr<ucxx::Request>> receiveRequests;
+    receiveRequests.reserve(
+        metadataRequests_.size() + dataRequests_.size() +
+        (handshakeResponseRequest_ ? 1 : 0));
+    if (handshakeResponseRequest_) {
+      receiveRequests.push_back(std::move(handshakeResponseRequest_));
+    }
     for (auto& req : metadataRequests_) {
       if (req) {
-        communicator_->deferRequestCleanup(std::move(req));
+        receiveRequests.push_back(std::move(req));
       }
     }
     metadataRequests_.clear();
     for (auto& req : dataRequests_) {
       if (req) {
-        communicator_->deferRequestCleanup(std::move(req));
+        receiveRequests.push_back(std::move(req));
       }
     }
     dataRequests_.clear();
+    communicator_->deferTagReceiveCancellation(std::move(receiveRequests));
   }
 
   if (endpointRef_) {
@@ -396,18 +412,21 @@ void UcxCpuRowExchangeSource::cleanUp() {
 }
 
 void UcxCpuRowExchangeSource::close() {
-  if (closeRequested_.exchange(true, std::memory_order_acq_rel)) {
-    return;
-  }
   std::lock_guard<std::recursive_mutex> processLock(processMutex_);
   bool expected = false;
-  if (!closed_.compare_exchange_strong(
+  if (!closeRequested_.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
     return;
   }
   deliverEndMarker();
-  setState(ReceiverState::Done);
   communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxCpuRowExchangeSource::forceCloseForShutdown() {
+  closeRequested_.store(true, std::memory_order_release);
+  deliverEndMarker();
+  setState(ReceiverState::Done);
+  cleanUp();
 }
 
 void UcxCpuRowExchangeSource::resumeFromBackpressure() {
@@ -724,7 +743,6 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
       endpointRef_->removeCommElem(self);
     }
     endpointRef_ = std::move(dataEpRef);
-    dataEndpointAckNeeded_ = true;
     dataEndpointPeerHostIdHash_ = response.serverHostIdHash;
   } else if (response.dataEndpointMode != CpuRowDataEndpointMode::kBootstrap) {
     std::string errorMsg = fmt::format(
@@ -739,9 +757,18 @@ void UcxCpuRowExchangeSource::onHandshakeResponse(
     return;
   }
 
-  setStateIf(
-      ReceiverState::WaitingForHandshakeResponse,
-      ReceiverState::ReadyToReceive);
+  handshakeAccepted_ = true;
+  // Both the bootstrap and same-host data paths are READY-gated. Post the
+  // first metadata receive before sending this ACK so the producer can never
+  // run ahead into UCX's unexpected-message queue.
+  dataEndpointAckNeeded_ = true;
+  if (closeRequested_.load(std::memory_order_acquire)) {
+    startAbortDrain();
+  } else {
+    setStateIf(
+        ReceiverState::WaitingForHandshakeResponse,
+        ReceiverState::ReadyToReceive);
+  }
 }
 
 void UcxCpuRowExchangeSource::sendDataEndpointAck() {
@@ -794,8 +821,106 @@ void UcxCpuRowExchangeSource::onDataEndpointAck(
   }
 }
 
+void UcxCpuRowExchangeSource::sendAbort() {
+  if (abortSent_ || !handshakeAccepted_) {
+    return;
+  }
+  abortSent_ = true;
+
+  auto abort = std::make_shared<CpuRowAbortHeader>();
+  const uint64_t abortTag = getCpuRowAbortTag(partitionKeyHash_);
+  std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
+  abortRequest_ = endpointRef_->endpoint_->tagSend(
+      abort.get(),
+      sizeof(*abort),
+      ucxx::Tag{abortTag},
+      false,
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onAbortSent(status, std::move(arg));
+              });
+        }
+      },
+      abort);
+}
+
+void UcxCpuRowExchangeSource::onAbortSent(
+    ucs_status_t status,
+    std::shared_ptr<void> /*arg*/) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_OK) {
+    return;
+  }
+
+  const auto errorMsg = fmt::format(
+      "Failed to send CPU abort control to host {}:{}, task {}: {}",
+      host_,
+      port_,
+      partitionKey_.toString(),
+      ucs_status_string(status));
+  LOG(ERROR) << errorMsg;
+  queue_->setError(errorMsg);
+  setState(ReceiverState::Done);
+}
+
+void UcxCpuRowExchangeSource::startAbortDrain() {
+  if (!handshakeAccepted_ || getState() == ReceiverState::Done) {
+    return;
+  }
+  if (atEnd_) {
+    setState(ReceiverState::Done);
+    return;
+  }
+
+  setState(ReceiverState::DrainingAfterAbort);
+  backpressureActive_.store(false, std::memory_order_release);
+  completedData_.clear();
+
+  // Metadata may already be parked waiting for consumer credit. The producer
+  // has committed the advertised frames, so receive and discard them even when
+  // the consumer queue is above its high-water mark.
+  if (pendingDataReceive_) {
+    auto pending = std::move(pendingDataReceive_);
+    startDataReceive(std::move(pending));
+  }
+
+  // The producer is READY-gated, so this receive is always posted before the
+  // abort can make it publish its terminal metadata record.
+  if (inFlightSequences_.empty()) {
+    const auto sequenceNumber = nextMetadataSequence_++;
+    inFlightSequences_.insert(sequenceNumber);
+    getMetadata(sequenceNumber);
+  }
+  sendAbort();
+}
+
+void UcxCpuRowExchangeSource::processAbortDrain() {
+  if (atEnd_) {
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    return;
+  }
+  if (pendingDataReceive_) {
+    auto pending = std::move(pendingDataReceive_);
+    startDataReceive(std::move(pending));
+    return;
+  }
+  if (inFlightSequences_.empty()) {
+    const auto sequenceNumber = nextMetadataSequence_++;
+    inFlightSequences_.insert(sequenceNumber);
+    getMetadata(sequenceNumber);
+  }
+  sendAbort();
+}
+
 void UcxCpuRowExchangeSource::postReceiveWindow() {
-  while (!atEnd_ && !closed_.load(std::memory_order_acquire) &&
+  while (!atEnd_ && !closeRequested_.load(std::memory_order_acquire) &&
+         !closed_.load(std::memory_order_acquire) &&
          inFlightSequences_.size() < kMaxInFlightBundles) {
     if (!inFlightSequences_.empty() && pauseForBackpressureIfNeeded()) {
       break;
@@ -925,7 +1050,17 @@ void UcxCpuRowExchangeSource::onMetadata(
     atEnd_ = true;
     endSequence_ = sequenceNumber;
     inFlightSequences_.erase(sequenceNumber);
-    drainCompletedData();
+    if (getState() == ReceiverState::DrainingAfterAbort) {
+      deliverEndMarker();
+      setState(ReceiverState::Done);
+    } else {
+      drainCompletedData();
+    }
+    return;
+  }
+
+  if (getState() == ReceiverState::DrainingAfterAbort) {
+    startDataReceive(std::move(ptr));
     return;
   }
 
@@ -1049,6 +1184,15 @@ void UcxCpuRowExchangeSource::onData(
   } else {
     auto ptr = std::static_pointer_cast<DataAndMetadata>(arg);
     VELOX_CHECK_EQ(ptr->sequenceNumber, sequenceNumber);
+
+    if (getState() == ReceiverState::DrainingAfterAbort) {
+      // UCX has finished writing every advertised frame. Drop the payload,
+      // advance to the producer's next sequenced metadata record, and keep the
+      // request objects alive until terminal cleanup.
+      ptr->frameBufs.clear();
+      inFlightSequences_.erase(sequenceNumber);
+      return;
+    }
 
     // Stitch all per-frame buffers into one IOBuf chain. Each segment
     // wraps its frame buffer with a takeOwnership freeFn that releases

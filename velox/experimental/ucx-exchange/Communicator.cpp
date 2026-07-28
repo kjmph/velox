@@ -549,17 +549,7 @@ void Communicator::run() {
       // alive until UCX finished any in-flight operations on them.
       // The communicator thread sweeps this list; UCX callbacks append to it
       // via deferRequestCleanup(), under the mutex.
-      {
-        std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
-        if (!deferredRequests_.empty()) {
-          deferredRequests_.erase(
-              std::remove_if(
-                  deferredRequests_.begin(),
-                  deferredRequests_.end(),
-                  [](const auto& req) { return req->isCompleted(); }),
-              deferredRequests_.end());
-        }
-      }
+      sweepDeferredRequests();
       std::this_thread::yield();
     } catch (ucxx::IOError& e) {
       LOG(ERROR) << "In Communicator main loop UCXX Exception: " << e.what();
@@ -567,6 +557,8 @@ void Communicator::run() {
     }
   }
   VLOG(3) << "Communicator stopping.";
+
+  drainRequestsForShutdown();
 
   if (worker_) {
     worker_->stopProgressThread();
@@ -589,7 +581,22 @@ void Communicator::stop() {
           << " workQueue_.size(): " << workQueue_.size();
 }
 
-void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
+bool Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
+  VELOX_CHECK_NOT_NULL(comms);
+
+  // Registration is infrequent and may race process shutdown. Holding this
+  // mutex through admission ensures the shutdown snapshot cannot miss an
+  // element that was accepted but has not reached the work queue yet.
+  std::lock_guard<std::mutex> registrationLock(registrationMutex_);
+  if (shutdownDraining_.load(std::memory_order_acquire)) {
+    if (comms->supportsCommunicatorShutdownDrain()) {
+      std::lock_guard<std::recursive_mutex> processLock(comms->processMutex_);
+      comms->forceCloseForShutdown();
+      comms->process();
+    }
+    return false;
+  }
+
   {
     std::lock_guard<std::mutex> lock(elemMutex_);
     auto ret = elements_.insert(comms);
@@ -597,6 +604,7 @@ void Communicator::registerCommElement(std::shared_ptr<CommElement> comms) {
   }
   // Also put the comms element into the work queue.
   addToWorkQueue(std::move(comms));
+  return true;
 }
 
 void Communicator::signalWorker() {
@@ -605,15 +613,22 @@ void Communicator::signalWorker() {
   }
 }
 
-void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
+bool Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
   if (!comms) {
     return;
   }
-  if (!comms->markQueued()) {
+  if (shutdownDraining_.load(std::memory_order_acquire) &&
+      !comms->supportsCommunicatorShutdownDrain()) {
     return;
   }
+  if (!comms->markQueued()) {
+    return true;
+  }
   try {
-    workQueue_.push(comms);
+    if (!workQueue_.push(comms)) {
+      comms->clearQueued();
+      return false;
+    }
   } catch (...) {
     // Failed insertion must permit a later callback to queue this element.
     comms->clearQueued();
@@ -625,6 +640,7 @@ void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
     signalWorker();
   } catch (...) {
   }
+  return true;
 }
 
 void Communicator::unregister(std::shared_ptr<CommElement> comms) {
@@ -843,6 +859,199 @@ void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
   }
 }
 
+void Communicator::deferTagReceiveCancellation(
+    std::vector<std::shared_ptr<ucxx::Request>> requests) {
+  auto batch = std::make_shared<std::vector<std::shared_ptr<ucxx::Request>>>();
+  batch->reserve(requests.size());
+  for (auto& request : requests) {
+    if (request) {
+      batch->push_back(std::move(request));
+    }
+  }
+  if (batch->empty()) {
+    return;
+  }
+
+  bool registered = false;
+  {
+    // The target requests registered their populateDelayedSubmission callbacks
+    // before their constructors returned. Register this sentinel on the same
+    // mutexed FIFO while shutdown intake is open. Whether it lands in the
+    // current or next fixed snapshot, every target is published first.
+    std::lock_guard<std::mutex> lock(requestCancellationIntakeMutex_);
+    if (!requestCancellationIntakeClosed_ && worker_) {
+      worker_->registerDelayedSubmission(batch->front(), [this, batch]() {
+        for (const auto& request : *batch) {
+          if (!request->isCompleted()) {
+            request->cancel();
+          }
+        }
+        std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+        for (auto& request : *batch) {
+          deferredRequests_.push_back(std::move(request));
+        }
+      });
+      registered = true;
+    }
+  }
+
+  if (registered) {
+    signalWorker();
+    return;
+  }
+
+  // Shutdown has already closed cancellation intake. Retain late requests
+  // explicitly so delayed UCXX callbacks can never observe freed request
+  // state. The worker is going away, so no new transfer may rely on these
+  // callbacks completing.
+  LOG(WARNING) << "Retaining " << batch->size()
+               << " UCXX cancellation request(s) received during shutdown";
+  std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+  for (auto& request : *batch) {
+    deferredRequests_.push_back(std::move(request));
+  }
+}
+
+void Communicator::sweepDeferredRequests() {
+  std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+  if (deferredRequests_.empty()) {
+    return;
+  }
+  deferredRequests_.erase(
+      std::remove_if(
+          deferredRequests_.begin(),
+          deferredRequests_.end(),
+          [](const auto& request) { return request->isCompleted(); }),
+      deferredRequests_.end());
+}
+
+void Communicator::drainRequestsForShutdown() {
+  // Serialize with admission so the snapshot contains every accepted element.
+  // Publishing the shutdown flag under this lock rejects later registrations;
+  // work-queue intake remains open for opted-in drain callbacks.
+  std::unique_lock<std::mutex> registrationLock(registrationMutex_);
+  std::vector<std::shared_ptr<CommElement>> elements;
+  auto snapshotShutdownElements = [&]() {
+    elements.clear();
+    std::lock_guard<std::mutex> lock(elemMutex_);
+    for (const auto& element : elements_) {
+      if (element->supportsCommunicatorShutdownDrain()) {
+        elements.push_back(element);
+      }
+    }
+  };
+  {
+    std::lock_guard<std::mutex> lock(elemMutex_);
+    shutdownDraining_.store(true, std::memory_order_release);
+  }
+  snapshotShutdownElements();
+  registrationLock.unlock();
+
+  // Begin graceful close while UCXX progress and work-queue intake remain
+  // alive. CPU-row sources may need callbacks for one committed data bundle
+  // and the producer's final metadata marker before they can unregister.
+  for (auto& element : elements) {
+    workQueue_.erase(element);
+    element->clearQueued();
+    std::lock_guard<std::recursive_mutex> processLock(element->processMutex_);
+    element->beginCommunicatorShutdownDrain();
+    element->process();
+  }
+  elements.clear();
+
+  const auto elementDrainDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < elementDrainDeadline) {
+    drainWorkQueue();
+    sweepDeferredRequests();
+
+    {
+      snapshotShutdownElements();
+      if (elements.empty()) {
+        break;
+      }
+    }
+    signalWorker();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // A failed endpoint or peer can make graceful drain impossible. Force the
+  // remaining elements through their local cleanup before closing callback
+  // intake. This fallback preserves request lifetimes but does not claim that
+  // the peer observed a clean protocol termination.
+  snapshotShutdownElements();
+  for (auto& element : elements) {
+    workQueue_.erase(element);
+    element->clearQueued();
+    std::lock_guard<std::recursive_mutex> processLock(element->processMutex_);
+    element->forceCloseForShutdown();
+    element->process();
+  }
+  elements.clear();
+
+  // No new elements can be admitted after shutdownDraining_ was published.
+  // Stop callback intake only after graceful and forced cleanup have run.
+  workQueue_.stopAccepting();
+  while (auto element = workQueue_.pop()) {
+    element->clearQueued();
+  }
+
+  {
+    snapshotShutdownElements();
+    if (!elements.empty()) {
+      LOG(WARNING) << "Communicator shutdown left " << elements.size()
+                   << " opted-in communication element(s) after forced close";
+    }
+  }
+
+  {
+    // deferTagReceiveCancellation() holds this mutex through its nonblocking
+    // FIFO registration. Once this store is visible, every accepted sentinel
+    // is already queued ahead of the shutdown barriers.
+    std::lock_guard<std::mutex> lock(requestCancellationIntakeMutex_);
+    requestCancellationIntakeClosed_ = true;
+  }
+
+  if (!worker_ || !worker_->isProgressThreadRunning()) {
+    return;
+  }
+
+  // Request submissions and generic-pre callbacks take independent fixed
+  // snapshots. Barrier one can share a cycle whose request snapshot missed a
+  // just-registered cancellation sentinel. Registering barrier two only after
+  // barrier one returns forces a later request snapshot to run first.
+  constexpr uint64_t kProgressCallbackTimeoutNs = 3'000'000'000ULL;
+  const bool firstBarrier =
+      worker_->registerGenericPre([]() {}, kProgressCallbackTimeoutNs);
+  const bool secondBarrier = firstBarrier &&
+      worker_->registerGenericPre([]() {}, kProgressCallbackTimeoutNs);
+  if (!secondBarrier) {
+    LOG(WARNING)
+        << "Timed out draining delayed UCXX cancellation submissions during "
+           "communicator shutdown";
+  }
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    sweepDeferredRequests();
+    size_t pending;
+    {
+      std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+      pending = deferredRequests_.size();
+    }
+    if (pending == 0) {
+      return;
+    }
+    signalWorker();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  std::lock_guard<std::mutex> lock(deferredRequestsMutex_);
+  LOG(WARNING) << "Communicator shutdown retained " << deferredRequests_.size()
+               << " incomplete UCXX request(s) after the drain timeout";
+}
+
 void Communicator::drainWorkQueue() {
   // Primary-thread work dispatch. The UCXX progress thread does not run
   // CommElement::process(). Keep the try-lock path because close() can
@@ -856,6 +1065,12 @@ void Communicator::drainWorkQueue() {
       break;
     }
     ++poppedItems;
+
+    if (shutdownDraining_.load(std::memory_order_acquire) &&
+        !comms->supportsCommunicatorShutdownDrain()) {
+      comms->clearQueued();
+      continue;
+    }
 
     std::unique_lock<std::recursive_mutex> lock(
         comms->processMutex_, std::try_to_lock);

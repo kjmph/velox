@@ -493,10 +493,11 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
                                 : planNode->partitionFunctionSpec().create(
                                       numDestinations_,
                                       /*localExchange=*/false)),
-      outputChannels_(exec::calculateOutputChannels(
-          planNode->inputType(),
-          planNode->outputType(),
-          planNode->outputType())),
+      outputChannels_(
+          exec::calculateOutputChannels(
+              planNode->inputType(),
+              planNode->outputType(),
+              planNode->outputType())),
       outputQueue_(queueManager->getTaskQueue(ctx->task->taskId())),
       // Serialized pages can outlive the output operator while UCX is sending
       // them. Keep the task, which owns the operator's child memory pools,
@@ -518,15 +519,16 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
       maxPageBytes_(configuredMaxPageBytes()),
       targetNumRowsBase_(configuredTargetNumRows()),
       serde_(getNamedVectorSerde(planNode->serdeKind())),
-      serdeOptions_(exec::getVectorSerdeOptions(
-          common::stringToCompressionKind(operatorCtx_->driverCtx()
-                                              ->queryConfig()
-                                              .shuffleCompressionKind()),
-          planNode->serdeKind(),
-          /*minCompressionRatio=*/0.8,
-          operatorCtx_->driverCtx()
-              ->queryConfig()
-              .minShuffleCompressionPageSizeBytes())) {
+      serdeOptions_(
+          exec::getVectorSerdeOptions(
+              common::stringToCompressionKind(operatorCtx_->driverCtx()
+                                                  ->queryConfig()
+                                                  .shuffleCompressionKind()),
+              planNode->serdeKind(),
+              /*minCompressionRatio=*/0.8,
+              operatorCtx_->driverCtx()
+                  ->queryConfig()
+                  .minShuffleCompressionPageSizeBytes())) {
   if (!planNode->isPartitioned()) {
     VELOX_USER_CHECK_EQ(numDestinations_, 1);
   }

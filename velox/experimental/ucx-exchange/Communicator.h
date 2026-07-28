@@ -88,12 +88,15 @@ class Communicator {
   /// @brief Registers a communication element with the communicator.
   /// This also automatically puts the element into the work queue.
   /// @param comms The element to register.
-  void registerCommElement(std::shared_ptr<CommElement> comms);
+  /// @return false if communicator shutdown has already begun. A rejected
+  /// element is closed and processed before this method returns.
+  bool registerCommElement(std::shared_ptr<CommElement> comms);
 
   /// @brief Adds an already registered communication element to the work queue
   /// such that "process" will be called on it.
   /// @param comms The element to be added to the work queue.
-  void addToWorkQueue(std::shared_ptr<CommElement> comms);
+  /// Returns false if shutdown has closed work-queue intake.
+  bool addToWorkQueue(std::shared_ptr<CommElement> comms);
 
   /// @brief Unregisters a communication element
   /// @brief comms The communication element.
@@ -154,6 +157,26 @@ class Communicator {
   /// functions (which closeBlocking() does internally).
   /// @param ep The endpoint to be cleaned up later.
   void deferEndpointCleanup(std::shared_ptr<EndpointRef> ep);
+
+  /// Defers cancellation of exact tag-receive requests to the progress thread.
+  ///
+  /// UCXX tag receives use delayed submission. Request::cancel() is a no-op
+  /// before the progress thread publishes the underlying UCP request.
+  /// Cancellation is therefore queued behind these receives on UCXX's own
+  /// delayed-submission FIFO. This preserves endpoint sharing: unrelated
+  /// requests on the same endpoint are never canceled.
+  ///
+  /// Do not pass tag sends or active-message sends. UCP only implements
+  /// request cancellation for tag receives, and UCXX AM cancellation does not
+  /// cancel the underlying wire operation.
+  void deferTagReceiveCancellation(
+      std::vector<std::shared_ptr<ucxx::Request>> requests);
+
+  /// Returns true after run() has left its service loop and begun closing
+  /// communication elements and draining request cancellation.
+  bool isShutdownDraining() const {
+    return shutdownDraining_.load(std::memory_order_acquire);
+  }
 
   /// @brief Defers cleanup of a detached, incomplete UCXX request to the main
   /// loop. The request (and the buffers it references via its arg) will be
@@ -238,6 +261,9 @@ class Communicator {
   };
   // Comparison function is the raw pointer, not the shared pointer.
   std::set<std::shared_ptr<CommElement>, PtrAddressLess> elements_;
+  // Serializes element admission with the shutdown snapshot and direct close
+  // pass. Registrations are cold-path events, unlike work-queue submissions.
+  std::mutex registrationMutex_;
   // protect elements_ by a mutex. Needs to be mutable if called from a const
   // function.
   std::mutex elemMutex_;
@@ -282,6 +308,17 @@ class Communicator {
   // any request-owned buffers are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
   std::mutex deferredRequestsMutex_;
+
+  // Serializes exact-request cancellation registration with shutdown. Each
+  // cancellation callback is queued behind its requests on UCXX's delayed
+  // request-submission FIFO. Shutdown closes this intake before crossing the
+  // final progress barriers.
+  std::mutex requestCancellationIntakeMutex_;
+  bool requestCancellationIntakeClosed_{false};
+  std::atomic<bool> shutdownDraining_{false};
+
+  void sweepDeferredRequests();
+  void drainRequestsForShutdown();
 
   // Primary-thread work dispatch.
   void drainWorkQueue();

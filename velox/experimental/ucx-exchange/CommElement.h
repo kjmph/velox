@@ -58,6 +58,26 @@ class CommElement {
   // or the communicator is finished.
   virtual void close() = 0;
 
+  /// Opts this element into Communicator-driven graceful shutdown. Legacy
+  /// exchange elements retain their existing teardown behavior until their
+  /// request types can be classified safely.
+  virtual bool supportsCommunicatorShutdownDrain() const {
+    return false;
+  }
+
+  /// Starts protocol-aware shutdown while UCXX progress and callback dispatch
+  /// remain available.
+  virtual void beginCommunicatorShutdownDrain() {
+    close();
+  }
+
+  /// Bounded shutdown fallback after graceful close callbacks failed to drain.
+  /// The Communicator still calls process() once after this hook. Most
+  /// elements already have a synchronous close and need no override.
+  virtual void forceCloseForShutdown() {
+    close();
+  }
+
   /// Per-element process exclusion. The Communicator's primary dispatch
   /// loop calls process() under this mutex; if close() or endpoint cleanup
   /// already owns it, dispatch pushes the element back to the queue and

@@ -132,16 +132,12 @@ std::shared_ptr<UcxCpuRowExchangeServer> UcxCpuRowExchangeServer::create(
 
 void UcxCpuRowExchangeServer::process() {
   while (true) {
+    drainStateEvents();
     if (abortRequested_.load(std::memory_order_acquire)) {
-      close();
+      processAbort();
       return;
     }
     if (!activated_.load(std::memory_order_acquire)) {
-      return;
-    }
-    drainStateEvents();
-    if (abortRequested_.load(std::memory_order_acquire)) {
-      close();
       return;
     }
     if (closed_.load(std::memory_order_acquire)) {
@@ -181,20 +177,25 @@ void UcxCpuRowExchangeServer::process() {
 }
 
 bool UcxCpuRowExchangeServer::activate() {
-  if (closed_.load(std::memory_order_acquire) ||
-      abortRequested_.load(std::memory_order_acquire)) {
+  AdmissionState expected = AdmissionState::Pending;
+  if (!admissionState_.compare_exchange_strong(
+          expected, AdmissionState::Accepted, std::memory_order_acq_rel)) {
     return false;
   }
-  bool expected = false;
+
+  bool expectedActivation = false;
   if (activated_.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel)) {
+          expectedActivation, true, std::memory_order_acq_rel)) {
     communicator_->addToWorkQueue(getSelfPtr());
   }
-  return !closed_.load(std::memory_order_acquire) &&
-      !abortRequested_.load(std::memory_order_acquire);
+  return true;
 }
 
 void UcxCpuRowExchangeServer::requestAbort() {
+  AdmissionState pending = AdmissionState::Pending;
+  admissionState_.compare_exchange_strong(
+      pending, AdmissionState::Rejected, std::memory_order_acq_rel);
+
   bool expected = false;
   if (!abortRequested_.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
@@ -205,29 +206,24 @@ void UcxCpuRowExchangeServer::requestAbort() {
 
 void UcxCpuRowExchangeServer::close() {
   std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  AdmissionState pending = AdmissionState::Pending;
+  admissionState_.compare_exchange_strong(
+      pending, AdmissionState::Rejected, std::memory_order_acq_rel);
+
   bool expected = false;
   if (!closed_.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
     return;
-  }
-  for (auto& req : metaRequests_) {
-    if (req && !req->isCompleted()) {
-      req->cancel();
-    }
-  }
-  for (auto& req : dataRequests_) {
-    if (req && !req->isCompleted()) {
-      req->cancel();
-    }
-  }
-  if (dataEndpointAckRequest_ && !dataEndpointAckRequest_->isCompleted()) {
-    dataEndpointAckRequest_->cancel();
   }
   pendingData_.reset();
   hasPendingData_ = false;
   outputQueue_.reset();
 
   if (communicator_) {
+    // UCP request cancellation is defined for tag receives, not tag sends.
+    // Graceful aborts reach this point only after every payload send completed
+    // and the terminal metadata marker was published. Hard-failure cleanup
+    // retains any incomplete send request instead of pretending to cancel it.
     for (auto& req : metaRequests_) {
       if (req) {
         communicator_->deferRequestCleanup(std::move(req));
@@ -240,9 +236,17 @@ void UcxCpuRowExchangeServer::close() {
       }
     }
     dataRequests_.clear();
+
+    std::vector<std::shared_ptr<ucxx::Request>> receiveRequests;
+    receiveRequests.reserve(
+        (dataEndpointAckRequest_ ? 1 : 0) + (abortRequest_ ? 1 : 0));
     if (dataEndpointAckRequest_) {
-      communicator_->deferRequestCleanup(std::move(dataEndpointAckRequest_));
+      receiveRequests.push_back(std::move(dataEndpointAckRequest_));
     }
+    if (abortRequest_) {
+      receiveRequests.push_back(std::move(abortRequest_));
+    }
+    communicator_->deferTagReceiveCancellation(std::move(receiveRequests));
   }
 
   auto self = getSelfPtr();
@@ -299,6 +303,94 @@ void UcxCpuRowExchangeServer::postDataEndpointAckReceive() {
           })
       .callbackData(ack)
       .build();
+}
+
+void UcxCpuRowExchangeServer::postAbortReceive() {
+  if (abortRequest_) {
+    return;
+  }
+
+  auto abort = std::make_shared<CpuRowAbortHeader>();
+  const uint64_t abortTag = getCpuRowAbortTag(partitionKeyHash_);
+
+  std::weak_ptr<UcxCpuRowExchangeServer> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
+  abortRequest_ = endpointRef_->endpoint_->tagRecv(
+      abort.get(),
+      sizeof(*abort),
+      ucxx::Tag{abortTag},
+      ucxx::TagMaskFull,
+      false,
+      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+        if (!callbackOnce->tryClaim()) {
+          return;
+        }
+        if (auto self = weak.lock()) {
+          self->enqueueStateEvent(
+              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                raw->onAbortRequest(status, std::move(arg));
+              });
+        }
+      },
+      abort);
+}
+
+void UcxCpuRowExchangeServer::onAbortRequest(
+    ucs_status_t status,
+    std::shared_ptr<void> arg) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_ERR_CANCELED) {
+    return;
+  }
+  if (status != UCS_OK) {
+    LOG(ERROR) << "[ExSrv-CPU " << partitionKey_.toString()
+               << "] failed to receive abort control: "
+               << ucs_status_string(status);
+    requestAbort();
+    return;
+  }
+
+  auto abort = std::static_pointer_cast<CpuRowAbortHeader>(arg);
+  if (abort->magic != kCpuRowAbortMagic ||
+      abort->version != kCpuRowAbortVersion ||
+      abort->headerSize != sizeof(CpuRowAbortHeader)) {
+    LOG(ERROR) << "[ExSrv-CPU " << partitionKey_.toString()
+               << "] invalid abort control";
+    abortRequest_.reset();
+    postAbortReceive();
+    return;
+  }
+  requestAbort();
+}
+
+void UcxCpuRowExchangeServer::processAbort() {
+  pendingData_.reset();
+  hasPendingData_ = false;
+  waitingForData_ = false;
+
+  // Rejected or shutdown-raced servers have no accepted source waiting for a
+  // terminal marker. Their only outstanding requests are cancellable receives.
+  if (admissionState_.load(std::memory_order_acquire) !=
+      AdmissionState::Accepted) {
+    close();
+    return;
+  }
+
+  // The source keeps the current metadata/data receives alive while draining.
+  // Do not publish the final marker until the bounded send window is empty.
+  if (inFlightSends_ != 0) {
+    return;
+  }
+
+  if (!finalMetadataSent_) {
+    sendFinalMetadata();
+    return;
+  }
+
+  if (!finalMetadataCompleted_) {
+    return;
+  }
+
+  close();
 }
 
 void UcxCpuRowExchangeServer::onDataEndpointAck(
@@ -397,7 +489,7 @@ void UcxCpuRowExchangeServer::onDataAvailable(
   if (closed_.load(std::memory_order_acquire)) {
     return;
   }
-  if (finalMetadataSent_) {
+  if (abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
     return;
   }
 
@@ -613,7 +705,7 @@ void UcxCpuRowExchangeServer::sendData(
 }
 
 void UcxCpuRowExchangeServer::sendFinalMetadata() {
-  if (abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
+  if (finalMetadataSent_) {
     return;
   }
 
@@ -659,6 +751,16 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
   // the metadata bytes alive until completion. Match the GPU UCX exchange
   // lifetime rule: producer output is consumed once the final marker is
   // published, not when the send completion callback eventually runs.
+  if (!outputQueue_) {
+    // An accepted source can abort before READY reaches requestData(). Create
+    // or recover the stable placeholder queue now so deleting this destination
+    // survives later producer-task initialization instead of becoming a no-op.
+    outputQueue_ = queueMgr_->getData(
+        partitionKey_.taskId,
+        partitionKey_.destination,
+        [](std::shared_ptr<UcxCpuRowPayload> /*data*/,
+           std::vector<int64_t> /*remainingBytes*/) {});
+  }
   if (outputQueue_) {
     outputQueue_->deleteResults(partitionKey_.destination);
   }
@@ -677,6 +779,10 @@ void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {
                << " Error in final metadata send: " << ucs_status_string(status)
                << " task: " << partitionKey_.toString();
     setState(ServerState::Done);
+    // A failed terminal send cannot satisfy the graceful abort handshake.
+    // Close locally; the source must observe the transport failure or use its
+    // own bounded shutdown fallback.
+    close();
   }
 }
 
@@ -702,6 +808,9 @@ void UcxCpuRowExchangeServer::sendComplete(
     // captured send state must not keep payload buffers alive.
     state->frames.clear();
 
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      return;
+    }
     if (!finalMetadataSent_) {
       setState(ServerState::ReadyToTransfer);
     } else {

@@ -47,6 +47,7 @@ class UcxCpuRowExchangeSource
     WaitingForMetadata,
     WaitingForReceiveCredit,
     WaitingForData,
+    DrainingAfterAbort,
     Done,
   };
 
@@ -67,6 +68,12 @@ class UcxCpuRowExchangeSource
   void process() override;
 
   void close();
+
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void forceCloseForShutdown() override;
 
   /// Marks this source as registered with the queue; only after this is
   /// set will deliverEndMarker() actually enqueue nullptr (otherwise we
@@ -145,6 +152,18 @@ class UcxCpuRowExchangeSource
 
   void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// Sends the per-partition abort control after an accepted handshake.
+  void sendAbort();
+
+  void onAbortSent(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Enters and advances the bounded abort drain. Backpressure is ignored:
+  /// the current bundle is received and discarded, then the source consumes
+  /// the producer's sequenced final metadata marker.
+  void startAbortDrain();
+
+  void processAbortDrain();
+
   void postReceiveWindow();
 
   void getMetadata(uint32_t sequenceNumber);
@@ -195,6 +214,9 @@ class UcxCpuRowExchangeSource
   const std::shared_ptr<UcxCpuRowExchangeQueue> queue_{nullptr};
   std::atomic<bool> closeRequested_{false};
   std::atomic<bool> closed_{false};
+  bool cleanupStarted_{false};
+  bool handshakeAccepted_{false};
+  bool abortSent_{false};
   bool atEnd_{false};
   uint32_t endSequence_{0};
 
@@ -207,6 +229,7 @@ class UcxCpuRowExchangeSource
   std::shared_ptr<ucxx::Request> handshakeRequest_{nullptr};
   std::shared_ptr<ucxx::Request> handshakeResponseRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
   std::vector<std::shared_ptr<ucxx::Request>> metadataRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
   std::shared_ptr<DataAndMetadata> pendingDataReceive_;

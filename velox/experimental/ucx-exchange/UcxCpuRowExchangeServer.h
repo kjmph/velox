@@ -66,6 +66,14 @@ class UcxCpuRowExchangeServer
 
   void close() override;
 
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void beginCommunicatorShutdownDrain() override {
+    requestAbort();
+  }
+
   void requestAbort() override;
 
   bool activate() override;
@@ -83,7 +91,17 @@ class UcxCpuRowExchangeServer
   /// Posts the data-endpoint ACK receive before the handshake response is sent.
   void postDataEndpointAckReceive();
 
+  /// Posts the per-partition abort receive before admission. A closing source
+  /// can therefore stop this server without closing the shared peer endpoint.
+  void postAbortReceive();
+
  private:
+  enum class AdmissionState : uint8_t {
+    Pending,
+    Accepted,
+    Rejected,
+  };
+
   explicit UcxCpuRowExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
@@ -116,6 +134,13 @@ class UcxCpuRowExchangeServer
   /// UCX completion handler for the data-endpoint ACK.
   void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// UCX completion handler for the per-partition abort request.
+  void onAbortRequest(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Stops new queue pulls, drains the one send window, and publishes the
+  /// sequenced final metadata marker before closing.
+  void processAbort();
+
   void maybeFinish();
 
   /// Sequentially-consistent state set.
@@ -134,6 +159,7 @@ class UcxCpuRowExchangeServer
   std::atomic<bool> closed_{false};
   std::atomic<bool> abortRequested_{false};
   std::atomic<bool> activated_{false};
+  std::atomic<AdmissionState> admissionState_{AdmissionState::Pending};
 
   uint32_t sequenceNumber_{0};
   uint32_t inFlightSends_{0};
@@ -151,6 +177,7 @@ class UcxCpuRowExchangeServer
   std::vector<std::shared_ptr<ucxx::Request>> metaRequests_;
   std::vector<std::shared_ptr<ucxx::Request>> dataRequests_;
   std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
 
   std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
   // The manager creates early placeholder queues in place and never reuses a

@@ -194,14 +194,19 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
     }
   }
 
-  const bool waitForDataEndpointAck =
-      dataEndpointMode == CpuRowDataEndpointMode::kSameHostWorkerAddress;
+  // READY-gate both endpoint modes. The source posts metadata receive zero
+  // before sending this ACK, which bounds producer progress to one committed
+  // bundle and makes a later abort drain deterministic.
+  const bool waitForDataEndpointAck = true;
   auto exchangeServer = UcxCpuRowExchangeServer::create(
       communicator, dataEpRef, key, waitForDataEndpointAck);
   exchangeServer->postDataEndpointAckReceive();
+  exchangeServer->postAbortReceive();
 
   dataEpRef->addCommElem(exchangeServer);
-  communicator->registerCommElement(exchangeServer);
+  if (!communicator->registerCommElement(exchangeServer)) {
+    return;
+  }
   const auto admission =
       UcxCpuRowOutputQueueManager::getInstanceRef()->registerExchangeServer(
           exchangeServer);

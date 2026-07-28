@@ -89,7 +89,9 @@ void Acceptor::cStyleAMCallback(
   epRef->addCommElem(exchangeServer);
 
   // Register exchangeServer with communicator.
-  communicator->registerCommElement(exchangeServer);
+  if (!communicator->registerCommElement(exchangeServer)) {
+    return;
+  }
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
           << " peerIp=" << peerIp
           << " isIntraNodeTransfer=" << isIntraNodeTransfer;

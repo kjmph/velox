@@ -26,10 +26,12 @@
 #include "velox/type/Subfield.h"
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <gtest/gtest.h>
 
@@ -972,6 +974,116 @@ TEST_F(SubfieldFilterAstTest, decimalRange) {
   EXPECT_GT(tree.size(), 0UL);
   auto vec = makeTestVector(rowType, 100);
   testFilterExecution(rowType, columnName, *filter, vec, expr);
+}
+
+TEST_F(SubfieldFilterAstTest, decimal32Range) {
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, DECIMAL(7, 2)}});
+  auto filter = std::make_unique<common::BigintRange>(
+      int64_t{99}, int64_t{149}, /*nullAllowed*/ false);
+
+  common::Subfield subfield(columnName);
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  const SubfieldFilterDecimalTypes decimalTypes{
+      {columnName, {cudf::type_id::DECIMAL32, 2}}};
+  const auto& expr = createAstFromSubfieldFilter(
+      subfield, *filter, tree, scalars, rowType, &decimalTypes);
+
+  ASSERT_EQ(scalars.size(), 2);
+  EXPECT_EQ(scalars[0]->type().id(), cudf::type_id::DECIMAL32);
+  EXPECT_EQ(scalars[1]->type().id(), cudf::type_id::DECIMAL32);
+  EXPECT_EQ(scalars[0]->type().scale(), numeric::scale_type{-2});
+  EXPECT_EQ(scalars[1]->type().scale(), numeric::scale_type{-2});
+
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<int32_t> values{98, 99, 100, 149, 150};
+  auto input = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL32, numeric::scale_type{-2}},
+      values.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      input->mutable_view().data<int32_t>(),
+      values.data(),
+      values.size() * sizeof(int32_t),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+
+  auto result =
+      cudf::compute_column(cudf::table_view{{input->view()}}, expr, stream, mr);
+  ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+  std::vector<uint8_t> actual(values.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      result->view().data<bool>(),
+      actual.size(),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  EXPECT_EQ(actual, (std::vector<uint8_t>{0, 1, 1, 1, 0}));
+}
+
+TEST_F(SubfieldFilterAstTest, decimal32SingleValue) {
+  const std::string columnName = "c0";
+  auto rowType = ROW({{columnName, DECIMAL(5, 2)}});
+  auto filter = std::make_unique<common::BigintRange>(
+      int64_t{-500}, int64_t{-500}, /*nullAllowed*/ false);
+
+  common::Subfield subfield(columnName);
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  const SubfieldFilterDecimalTypes decimalTypes{
+      {columnName, {cudf::type_id::DECIMAL32, 2}}};
+  const auto& expr = createAstFromSubfieldFilter(
+      subfield, *filter, tree, scalars, rowType, &decimalTypes);
+
+  ASSERT_EQ(scalars.size(), 1);
+  EXPECT_EQ(scalars[0]->type().id(), cudf::type_id::DECIMAL32);
+  EXPECT_EQ(scalars[0]->type().scale(), numeric::scale_type{-2});
+  auto const* root = dynamic_cast<const cudf::ast::operation*>(&expr);
+  ASSERT_NE(root, nullptr);
+  EXPECT_EQ(root->get_operator(), cudf::ast::ast_operator::NULL_LOGICAL_AND);
+  ASSERT_EQ(root->get_operands().size(), 2);
+  auto const* lower =
+      dynamic_cast<const cudf::ast::operation*>(&root->get_operands()[0].get());
+  auto const* upper =
+      dynamic_cast<const cudf::ast::operation*>(&root->get_operands()[1].get());
+  ASSERT_NE(lower, nullptr);
+  ASSERT_NE(upper, nullptr);
+  EXPECT_EQ(lower->get_operator(), cudf::ast::ast_operator::GREATER_EQUAL);
+  EXPECT_EQ(upper->get_operator(), cudf::ast::ast_operator::LESS_EQUAL);
+
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<int32_t> values{-501, -500, -499};
+  auto input = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL32, numeric::scale_type{-2}},
+      values.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      input->mutable_view().data<int32_t>(),
+      values.data(),
+      values.size() * sizeof(int32_t),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+
+  auto result =
+      cudf::compute_column(cudf::table_view{{input->view()}}, expr, stream, mr);
+  ASSERT_EQ(result->type().id(), cudf::type_id::BOOL8);
+  std::vector<uint8_t> actual(values.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      actual.data(),
+      result->view().data<bool>(),
+      actual.size(),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  EXPECT_EQ(actual, (std::vector<uint8_t>{0, 1, 0}));
 }
 
 TEST_F(SubfieldFilterAstTest, decimalInList) {

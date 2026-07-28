@@ -66,24 +66,6 @@ void UcxCpuRowDestinationQueue::Stats::recordDequeue(
   }
 }
 
-void UcxCpuRowDestinationQueue::Stats::recordRequeueFront(
-    const UcxCpuRowPayload* payload) {
-  if (payload != nullptr) {
-    const int64_t size = payload->numBytes;
-
-    bytesQueued += size;
-    rowsQueued += payload->numRows;
-    payloadsQueued++;
-
-    bytesSent -= size;
-    VELOX_DCHECK_GE(bytesSent, 0, "bytesSent must be non-negative");
-    rowsSent -= payload->numRows;
-    VELOX_DCHECK_GE(rowsSent, 0, "rowsSent must be non-negative");
-    --payloadsSent;
-    VELOX_DCHECK_GE(payloadsSent, 0, "payloadsSent must be non-negative");
-  }
-}
-
 exec::DestinationBuffer::Stats
 UcxCpuRowDestinationQueue::Stats::toOutputBufferStats() const {
   exec::DestinationBuffer::Stats out;
@@ -108,15 +90,6 @@ void UcxCpuRowDestinationQueue::enqueueBack(
     stats_.recordEnqueue(data.get());
   }
   queue_.push_back(std::move(data));
-}
-
-void UcxCpuRowDestinationQueue::enqueueFront(
-    std::shared_ptr<UcxCpuRowPayload> data) {
-  if (data == nullptr) {
-    return;
-  }
-  stats_.recordRequeueFront(data.get());
-  queue_.push_front(std::move(data));
 }
 
 UcxCpuRowDestinationQueue::Data UcxCpuRowDestinationQueue::getData(
@@ -350,7 +323,6 @@ bool UcxCpuRowOutputQueue::checkBlocked(ContinueFuture* future) {
   bool blocked = false;
   {
     std::lock_guard<std::mutex> l(mutex_);
-    reconcileQueuedStatsLocked("checkBlocked");
     maybeUnblockProducersLocked(promises);
     const auto highWaterMark = highWaterMarkLocked();
     if (queuedBytes_ >= highWaterMark) {
@@ -421,11 +393,8 @@ void UcxCpuRowOutputQueue::getData(
         // callback path that does so was bypassed.
         updateStatsWithFreedLocked(data.data->numBytes, 1L, promises);
       } else if (!data.immediate) {
-        // If the consumer is parking, make the aggregate backpressure state
-        // match the per-destination queues. This prevents producers from
-        // staying blocked after direct handoffs or bundled drains emptied the
-        // queues without tripping the low-water check.
-        reconcileQueuedStatsLocked("consumer-wait");
+        // A parked consumer also gives producers a chance to observe that the
+        // exact incremental queue accounting is below the low-water mark.
         maybeUnblockProducersLocked(promises);
       }
     } else {
@@ -464,29 +433,6 @@ std::shared_ptr<UcxCpuRowPayload> UcxCpuRowOutputQueue::tryGetData(
   return data;
 }
 
-void UcxCpuRowOutputQueue::requeueFront(
-    int destination,
-    std::shared_ptr<UcxCpuRowPayload> data) {
-  if (!data) {
-    return;
-  }
-  std::lock_guard<std::mutex> l(mutex_);
-  if (destination < 0 || static_cast<size_t>(destination) >= queues_.size()) {
-    return;
-  }
-  auto* queue = queues_[destination].get();
-  if (!queue) {
-    return;
-  }
-
-  const auto numBytes = data->numBytes;
-  queue->enqueueFront(std::move(data));
-
-  updateTotalQueuedBytesMsLocked();
-  queuedBytes_ += numBytes;
-  queuedPayloads_++;
-}
-
 void UcxCpuRowOutputQueue::noMoreData() {
   checkIfDone(true);
 }
@@ -497,6 +443,7 @@ void UcxCpuRowOutputQueue::noMoreDrivers() {
 
 void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
   std::vector<UcxCpuRowDataAvailable> finished;
+  std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (oneDriverFinished) {
@@ -523,10 +470,13 @@ void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
           arbitraryBuffer_.pop_front();
           nullCount = 0;
         } else if (++nullCount >= queues_.size()) {
-          arbitraryBuffer_.clear();
+          clearArbitraryBufferLocked(promises);
           break;
         }
         bufferId = (bufferId + 1) % queues_.size();
+      }
+      if (queues_.empty()) {
+        clearArbitraryBufferLocked(promises);
       }
     }
     for (auto& queue : queues_) {
@@ -538,6 +488,9 @@ void UcxCpuRowOutputQueue::checkIfDone(bool oneDriverFinished) {
   }
   for (auto& notification : finished) {
     notification.notify();
+  }
+  for (auto& promise : promises) {
+    promise.setValue();
   }
 }
 
@@ -599,12 +552,8 @@ void UcxCpuRowOutputQueue::enqueueArbitraryOutputLocked(
       if (pending.callback) {
         pending.data = std::move(arbitraryBuffer_.front());
         arbitraryBuffer_.pop_front();
+        // The CPU row transport has no remaining-bytes prefetch contract.
         pending.remainingBytes.clear();
-        for (const auto& item : arbitraryBuffer_) {
-          if (item != nullptr) {
-            pending.remainingBytes.push_back(item->numBytes);
-          }
-        }
         recordDirectHandoffLocked(pending);
         dataAvailableCbs.push_back(std::move(pending));
       }
@@ -706,6 +655,9 @@ void UcxCpuRowOutputQueue::deleteResults(int destination) {
     queues_[destination] = nullptr;
     isFinished = isFinishedLocked();
     updateStatsWithFreedLocked(bytes, payloads, promises);
+    if (isFinished && kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      clearArbitraryBufferLocked(promises);
+    }
   }
 
   dataAvailable.notify();
@@ -727,7 +679,7 @@ void UcxCpuRowOutputQueue::terminate() {
       LOG(WARNING) << "UcxCpuRowOutputQueue::terminate() called while task "
                    << task_->taskId() << " is still running";
     }
-    arbitraryBuffer_.clear();
+    clearArbitraryBufferLocked(promises);
     // End-of-stream marker on every destination so consumers don't
     // wait forever after a producer-side abort.
     for (auto& queue : queues_) {
@@ -736,7 +688,13 @@ void UcxCpuRowOutputQueue::terminate() {
         pendingCallbacks.push_back(queue->getAndClearNotify());
       }
     }
-    promises = std::move(promises_);
+    if (!promises_.empty()) {
+      promises.reserve(promises.size() + promises_.size());
+      for (auto& promise : promises_) {
+        promises.push_back(std::move(promise));
+      }
+      promises_.clear();
+    }
   }
 
   for (auto& callback : pendingCallbacks) {
@@ -845,13 +803,11 @@ void UcxCpuRowOutputQueue::updateStatsWithFreedLocked(
     std::vector<ContinuePromise>& promises) {
   updateTotalQueuedBytesMsLocked();
 
+  VELOX_CHECK_GE(queuedBytes_, bytes, "Queued byte accounting underflow");
+  VELOX_CHECK_GE(
+      queuedPayloads_, numPayloads, "Queued payload accounting underflow");
   queuedBytes_ -= bytes;
   queuedPayloads_ -= numPayloads;
-
-  reconcileQueuedStatsLocked("freed");
-
-  VELOX_CHECK_GE(queuedBytes_, 0);
-  VELOX_CHECK_GE(queuedPayloads_, 0);
 
   maybeUnblockProducersLocked(promises);
 }
@@ -882,30 +838,20 @@ void UcxCpuRowOutputQueue::acknowledgeDirectHandoffLocked(
   pendingDirectHandoffPayloads_ -= numPayloads;
 }
 
-void UcxCpuRowOutputQueue::reconcileQueuedStatsLocked(const char*) {
-  int64_t actualBytes = pendingDirectHandoffBytes_;
-  int64_t actualPayloads = pendingDirectHandoffPayloads_;
+void UcxCpuRowOutputQueue::clearArbitraryBufferLocked(
+    std::vector<ContinuePromise>& promises) {
+  int64_t bytes = 0;
+  int64_t payloads = 0;
   for (const auto& payload : arbitraryBuffer_) {
     if (payload != nullptr) {
-      actualBytes += payload->numBytes;
-      actualPayloads++;
+      bytes += payload->numBytes;
+      ++payloads;
     }
   }
-  for (const auto& queue : queues_) {
-    if (queue != nullptr) {
-      const auto stats = queue->stats();
-      actualBytes += stats.bytesQueued;
-      actualPayloads += stats.payloadsQueued;
-    }
+  arbitraryBuffer_.clear();
+  if (payloads > 0) {
+    updateStatsWithFreedLocked(bytes, payloads, promises);
   }
-
-  if (actualBytes == queuedBytes_ && actualPayloads == queuedPayloads_) {
-    return;
-  }
-
-  updateTotalQueuedBytesMsLocked();
-  queuedBytes_ = actualBytes;
-  queuedPayloads_ = actualPayloads;
 }
 
 void UcxCpuRowOutputQueue::maybeUnblockProducersLocked(

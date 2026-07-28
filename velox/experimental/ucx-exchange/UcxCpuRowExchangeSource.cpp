@@ -320,8 +320,7 @@ void UcxCpuRowExchangeSource::process() {
           setState(ReceiverState::ReadyToReceive);
           continue;
         }
-        if (receiveQueueExceedsHighWater()) {
-          backpressureActive_.store(true, std::memory_order_release);
+        if (pauseForBackpressureIfNeeded()) {
           return;
         }
         auto pending = std::move(pendingDataReceive_);
@@ -397,6 +396,9 @@ void UcxCpuRowExchangeSource::cleanUp() {
 }
 
 void UcxCpuRowExchangeSource::close() {
+  if (closeRequested_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
   std::lock_guard<std::recursive_mutex> processLock(processMutex_);
   bool expected = false;
   if (!closed_.compare_exchange_strong(
@@ -409,6 +411,15 @@ void UcxCpuRowExchangeSource::close() {
 }
 
 void UcxCpuRowExchangeSource::resumeFromBackpressure() {
+  // close() uses the same mutex. Therefore a callback removed from the
+  // exchange queue before close either schedules this source first or observes
+  // the close request; it cannot enqueue stale work after close has won.
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  if (closeRequested_.load(std::memory_order_acquire) ||
+      closed_.load(std::memory_order_acquire)) {
+    backpressureActive_.store(false, std::memory_order_release);
+    return;
+  }
   bool expected = true;
   if (backpressureActive_.compare_exchange_strong(
           expected, false, std::memory_order_acq_rel)) {
@@ -786,8 +797,7 @@ void UcxCpuRowExchangeSource::onDataEndpointAck(
 void UcxCpuRowExchangeSource::postReceiveWindow() {
   while (!atEnd_ && !closed_.load(std::memory_order_acquire) &&
          inFlightSequences_.size() < kMaxInFlightBundles) {
-    if (receiveQueueExceedsHighWater() && !inFlightSequences_.empty()) {
-      backpressureActive_.store(true, std::memory_order_release);
+    if (!inFlightSequences_.empty() && pauseForBackpressureIfNeeded()) {
       break;
     }
 
@@ -797,9 +807,35 @@ void UcxCpuRowExchangeSource::postReceiveWindow() {
   }
 }
 
-bool UcxCpuRowExchangeSource::receiveQueueExceedsHighWater() {
+bool UcxCpuRowExchangeSource::pauseForBackpressureIfNeeded() {
   std::lock_guard<std::mutex> l(queue_->mutex());
-  return queue_->size() > backpressureHighWaterMark();
+  // A registered source stays parked until the low-water consumer path removes
+  // its callback and clears this flag. Unrelated communicator events must not
+  // resume it merely because the queue dipped below the high-water threshold.
+  if (backpressureActive_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  if (queue_->size() <= backpressureHighWaterMark()) {
+    return false;
+  }
+
+  bool expected = false;
+  if (!backpressureActive_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return true;
+  }
+
+  std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
+  const bool registered = queue_->registerBackpressuredSourceLocked(
+      this, backpressureHighWaterMark(), [weak]() {
+        if (auto source = weak.lock()) {
+          source->resumeFromBackpressure();
+        }
+      });
+  VELOX_CHECK(
+      registered,
+      "CPU row source queue drained while holding its backpressure lock");
+  return true;
 }
 
 void UcxCpuRowExchangeSource::getMetadata(uint32_t sequenceNumber) {
@@ -893,9 +929,8 @@ void UcxCpuRowExchangeSource::onMetadata(
     return;
   }
 
-  if (receiveQueueExceedsHighWater()) {
+  if (pauseForBackpressureIfNeeded()) {
     pendingDataReceive_ = std::move(ptr);
-    backpressureActive_.store(true, std::memory_order_release);
     setState(ReceiverState::WaitingForReceiveCredit);
     return;
   }

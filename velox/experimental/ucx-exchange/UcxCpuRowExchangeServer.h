@@ -153,6 +153,10 @@ class UcxCpuRowExchangeServer
   std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
 
   std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
+  // The manager creates early placeholder queues in place and never reuses a
+  // removed task ID. Cache the exact queue after the first request instead of
+  // rebuilding the task key and taking the manager lock for every page.
+  std::shared_ptr<UcxCpuRowOutputQueue> outputQueue_;
 };
 
 } // namespace facebook::velox::ucx_exchange

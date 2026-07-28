@@ -80,6 +80,37 @@ void UcxCpuRowExchangeQueue::addPromiseLocked(
   VELOX_CHECK_LE(promises_.size(), numberOfConsumers_);
 }
 
+bool UcxCpuRowExchangeQueue::registerBackpressuredSourceLocked(
+    const void* source,
+    int32_t highWaterMark,
+    std::function<void()> resume) {
+  VELOX_CHECK_NOT_NULL(source);
+  VELOX_CHECK_GE(highWaterMark, 0);
+  VELOX_CHECK(resume, "Backpressured source resume callback is empty");
+  if (queue_.size() <= highWaterMark) {
+    return false;
+  }
+  const bool inserted =
+      backpressuredSources_.emplace(source, std::move(resume)).second;
+  VELOX_CHECK(inserted, "Source registered for backpressure more than once");
+  return true;
+}
+
+std::vector<std::function<void()>>
+UcxCpuRowExchangeQueue::takeBackpressuredSourcesLocked(int32_t lowWaterMark) {
+  VELOX_CHECK_GE(lowWaterMark, 0);
+  std::vector<std::function<void()>> callbacks;
+  if (queue_.size() > lowWaterMark || backpressuredSources_.empty()) {
+    return callbacks;
+  }
+  callbacks.reserve(backpressuredSources_.size());
+  for (auto& entry : backpressuredSources_) {
+    callbacks.push_back(std::move(entry.second));
+  }
+  backpressuredSources_.clear();
+  return callbacks;
+}
+
 UcxCpuRowReceivedPtr UcxCpuRowExchangeQueue::dequeueLocked(
     int consumerId,
     bool* atEnd,

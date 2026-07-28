@@ -17,6 +17,7 @@
 #include "velox/experimental/ucx-exchange/UcxCpuRowQueues.h"
 
 #include <atomic>
+#include <optional>
 
 #include <folly/io/IOBuf.h>
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowExchangeQueue.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowPartitionedOutput.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -68,11 +70,13 @@ class UcxCpuRowOutputQueueTest : public testing::Test {
         exec::Consumer{});
   }
 
-  static std::unique_ptr<UcxCpuRowPayload> makePayload(std::string_view bytes) {
+  static std::unique_ptr<UcxCpuRowPayload> makePayload(
+      std::string_view bytes,
+      std::optional<int64_t> accountingBytes = std::nullopt) {
     auto payload = std::make_unique<UcxCpuRowPayload>();
     payload->data = folly::IOBuf::copyBuffer(bytes);
     payload->numRows = 1;
-    payload->numBytes = bytes.size();
+    payload->numBytes = accountingBytes.value_or(bytes.size());
     return payload;
   }
 
@@ -171,14 +175,13 @@ TEST_F(UcxCpuRowOutputQueueTest, exportedPageRetainsReleaseOwner) {
       std::vector<VectorPtr>{child});
 
   Destination destination(
-      taskId,
       /*destination=*/0,
       getNamedVectorSerde("Presto"),
       /*serdeOptions=*/nullptr,
       pool_.get(),
       /*eagerFlush=*/false,
       UcxCpuRowPartitionedOutput::kTargetNumRows,
-      queueManager,
+      queueManager->getTaskQueue(taskId),
       [](uint64_t /*bytes*/, uint64_t /*rows*/) {});
   destination.beginBatch();
   destination.addRow(0);
@@ -520,6 +523,109 @@ TEST_F(UcxCpuRowOutputQueueTest, serverMayArriveBeforeFirstTaskInitialization) {
 
 TEST_F(
     UcxCpuRowOutputQueueTest,
+    earlyConsumerAndProducerCacheSameQueueIdentity) {
+  const std::string taskId = "stable-placeholder-identity";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+
+  std::shared_ptr<UcxCpuRowPayload> received;
+  auto earlyQueue = queueManager->getData(
+      taskId,
+      /*destination=*/1,
+      [&](std::shared_ptr<UcxCpuRowPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        received = std::move(data);
+      });
+  ASSERT_NE(earlyQueue, nullptr);
+  EXPECT_FALSE(earlyQueue->isInitialized());
+
+  auto task = makeTask(taskId);
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/2,
+      /*numDrivers=*/1);
+
+  auto producerQueue = queueManager->getTaskQueue(taskId);
+  EXPECT_EQ(producerQueue.get(), earlyQueue.get());
+  EXPECT_TRUE(producerQueue->isInitialized());
+
+  producerQueue->enqueue(
+      /*destination=*/1, makePayload("same-queue"), /*numRows=*/1);
+  ASSERT_NE(received, nullptr);
+  EXPECT_EQ(received->numBytes, 10);
+  EXPECT_EQ(producerQueue->stats().bufferedBytes, 0);
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    removedTaskReleasesQueueAndTaskWithoutServerOwnership) {
+  const std::string taskId = "weak-producer-queue-ownership";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto task = makeTask(taskId);
+  std::weak_ptr<exec::Task> weakTask = task;
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  auto producerQueue = queueManager->getTaskQueue(taskId);
+  std::weak_ptr<UcxCpuRowOutputQueue> weakQueue = producerQueue;
+  producerQueue.reset();
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+  task.reset();
+
+  EXPECT_TRUE(weakQueue.expired());
+  EXPECT_TRUE(weakTask.expired());
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    simulatedServerOwnershipRetainsQueueUntilServerClose) {
+  const std::string taskId = "strong-server-queue-ownership";
+  auto queueManager = std::make_shared<UcxCpuRowOutputQueueManager>();
+  auto task = makeTask(taskId);
+  std::weak_ptr<exec::Task> weakTask = task;
+  queueManager->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  int endNotifications = 0;
+  auto serverQueue = queueManager->getData(
+      taskId,
+      /*destination=*/0,
+      [&](std::shared_ptr<UcxCpuRowPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        EXPECT_EQ(data, nullptr);
+        ++endNotifications;
+      });
+  ASSERT_NE(serverQueue, nullptr);
+  std::weak_ptr<UcxCpuRowOutputQueue> weakQueue = serverQueue;
+
+  task->requestAbort().wait();
+  queueManager->removeTask(taskId);
+  task.reset();
+
+  EXPECT_EQ(endNotifications, 1);
+  EXPECT_FALSE(weakQueue.expired());
+  EXPECT_FALSE(weakTask.expired());
+
+  // The transport server is the final strong queue owner after task removal.
+  // Its close path must release the queue, which in turn releases the Task.
+  serverQueue.reset();
+  EXPECT_TRUE(weakQueue.expired());
+  EXPECT_TRUE(weakTask.expired());
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
     lateBroadcastDestinationReceivesBackfillAfterRegisteringFirst) {
   auto task = makeTask("late-broadcast-destination");
   auto queue = std::make_shared<UcxCpuRowOutputQueue>(
@@ -701,6 +807,252 @@ TEST_F(
 
   task->requestAbort().wait();
   queue->terminate();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    partitionedQueueMaintainsExactIncrementalAccounting) {
+  auto task = makeTask("partitioned-incremental-accounting");
+  auto queue = std::make_shared<UcxCpuRowOutputQueue>(
+      task,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1,
+      core::PartitionedOutputNode::Kind::kPartitioned);
+
+  queue->enqueue(
+      /*destination=*/0, makePayload("abc"), /*numRows=*/1);
+  queue->enqueue(
+      /*destination=*/0, makePayload("12345"), /*numRows=*/1);
+  auto stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 8);
+  EXPECT_EQ(stats.bufferedPages, 2);
+
+  auto first = queue->tryGetData(/*destination=*/0);
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first->numBytes, 3);
+  stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 5);
+  EXPECT_EQ(stats.bufferedPages, 1);
+
+  std::shared_ptr<UcxCpuRowPayload> received;
+  queue->getData(
+      /*destination=*/0,
+      [&](std::shared_ptr<UcxCpuRowPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        received = std::move(data);
+      });
+  ASSERT_NE(received, nullptr);
+  EXPECT_EQ(received->numBytes, 5);
+  stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+
+  queue->deleteResults(/*destination=*/0);
+  stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+
+  task->requestAbort().wait();
+  queue->terminate();
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, directHandoffAccountsUntilCallbackReturns) {
+  auto task = makeTask("direct-handoff-accounting");
+  auto queue = std::make_shared<UcxCpuRowOutputQueue>(
+      task,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1,
+      core::PartitionedOutputNode::Kind::kPartitioned);
+
+  int callbackCount = 0;
+  int64_t bytesObservedInCallback = 0;
+  queue->getData(
+      /*destination=*/0,
+      [&](std::shared_ptr<UcxCpuRowPayload> data,
+          std::vector<int64_t> /*remainingBytes*/) {
+        ++callbackCount;
+        ASSERT_NE(data, nullptr);
+        bytesObservedInCallback = queue->stats().bufferedBytes;
+      });
+
+  queue->enqueue(
+      /*destination=*/0, makePayload("direct"), /*numRows=*/1);
+  EXPECT_EQ(callbackCount, 1);
+  EXPECT_EQ(bytesObservedInCallback, 6);
+  const auto stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+  EXPECT_EQ(stats.totalBytesSent, 6);
+  EXPECT_EQ(stats.totalPagesSent, 1);
+
+  task->requestAbort().wait();
+  queue->terminate();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    dequeueBelowLowWaterUnblocksProducerWithoutReconciliation) {
+  auto task = makeTask("incremental-low-water-unblock");
+  auto queue = std::make_shared<UcxCpuRowOutputQueue>(
+      task,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1,
+      core::PartitionedOutputNode::Kind::kPartitioned);
+
+  constexpr int64_t kMaxOutputBufferBytes = 1LL << 30;
+  queue->enqueue(
+      /*destination=*/0,
+      makePayload("small allocation", kMaxOutputBufferBytes),
+      /*numRows=*/1);
+
+  ContinueFuture future;
+  EXPECT_TRUE(queue->checkBlocked(&future));
+  EXPECT_TRUE(future.valid());
+
+  auto payload = queue->tryGetData(/*destination=*/0);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_TRUE(future.isReady());
+  const auto stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+
+  task->requestAbort().wait();
+  queue->terminate();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    arbitraryQueueClearsUnassignedPayloadAccounting) {
+  auto task = makeTask("arbitrary-clear-accounting");
+  auto queue = std::make_shared<UcxCpuRowOutputQueue>(
+      task,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1,
+      core::PartitionedOutputNode::Kind::kArbitrary);
+
+  queue->enqueue(
+      /*destination=*/0, makePayload("first"), /*numRows=*/1);
+  queue->enqueue(
+      /*destination=*/0, makePayload("second"), /*numRows=*/1);
+  auto stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 11);
+  EXPECT_EQ(stats.bufferedPages, 2);
+
+  // With the only destination deleted, the shared arbitrary pool is no longer
+  // consumable and must be dropped and accounted without a full queue scan.
+  queue->deleteResults(/*destination=*/0);
+  stats = queue->stats();
+  EXPECT_EQ(stats.bufferedBytes, 0);
+  EXPECT_EQ(stats.bufferedPages, 0);
+
+  task->requestAbort().wait();
+  queue->terminate();
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    registerFirstBackpressureWakeIsLinearizedWithDrain) {
+  UcxCpuRowExchangeQueue queue(/*numberOfConsumers=*/1);
+  std::vector<ContinuePromise> promises;
+  int sourceA = 0;
+  int sourceB = 0;
+  int resumeA = 0;
+  int resumeB = 0;
+
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("a"), promises);
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("b"), promises);
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("c"), promises);
+    EXPECT_TRUE(queue.registerBackpressuredSourceLocked(
+        &sourceA, /*highWaterMark=*/1, [&]() { ++resumeA; }));
+    EXPECT_TRUE(queue.registerBackpressuredSourceLocked(
+        &sourceB, /*highWaterMark=*/1, [&]() { ++resumeB; }));
+  }
+  EXPECT_TRUE(promises.empty());
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  std::vector<std::function<void()>> resumes;
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    EXPECT_NE(queue.dequeueLocked(0, &atEnd, &future, &stalePromise), nullptr);
+    resumes = queue.takeBackpressuredSourcesLocked(/*lowWaterMark=*/1);
+    EXPECT_TRUE(resumes.empty());
+
+    EXPECT_NE(queue.dequeueLocked(0, &atEnd, &future, &stalePromise), nullptr);
+    resumes = queue.takeBackpressuredSourcesLocked(/*lowWaterMark=*/1);
+  }
+
+  ASSERT_EQ(resumes.size(), 2);
+  for (auto& resume : resumes) {
+    resume();
+  }
+  EXPECT_EQ(resumeA, 1);
+  EXPECT_EQ(resumeB, 1);
+
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    EXPECT_TRUE(
+        queue.takeBackpressuredSourcesLocked(/*lowWaterMark=*/1).empty());
+  }
+  EXPECT_EQ(resumeA, 1);
+}
+
+TEST_F(
+    UcxCpuRowOutputQueueTest,
+    drainFirstBackpressureRegistrationDoesNotPark) {
+  UcxCpuRowExchangeQueue queue(/*numberOfConsumers=*/1);
+  std::vector<ContinuePromise> promises;
+  int source = 0;
+  int resumeCount = 0;
+
+  bool atEnd = false;
+  ContinueFuture future;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("a"), promises);
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("b"), promises);
+
+    // Model the consumer winning queue_->mutex(): it crosses low water before
+    // the source can register. The later registration must observe the
+    // drained size and remain runnable instead of parking without a wake.
+    EXPECT_NE(queue.dequeueLocked(0, &atEnd, &future, &stalePromise), nullptr);
+    EXPECT_TRUE(
+        queue.takeBackpressuredSourcesLocked(/*lowWaterMark=*/1).empty());
+    EXPECT_FALSE(queue.registerBackpressuredSourceLocked(
+        &source, /*highWaterMark=*/1, [&]() { ++resumeCount; }));
+  }
+
+  EXPECT_TRUE(promises.empty());
+  EXPECT_EQ(resumeCount, 0);
+}
+
+TEST_F(UcxCpuRowOutputQueueTest, closeDropsRegisteredBackpressureCallbacks) {
+  UcxCpuRowExchangeQueue queue(/*numberOfConsumers=*/1);
+  std::vector<ContinuePromise> promises;
+  int source = 0;
+  int resumeCount = 0;
+
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("a"), promises);
+    queue.enqueueLocked(UcxCpuRowOutputQueueTest::makePayload("b"), promises);
+    EXPECT_TRUE(queue.registerBackpressuredSourceLocked(
+        &source, /*highWaterMark=*/1, [&]() { ++resumeCount; }));
+  }
+
+  queue.close();
+
+  {
+    std::lock_guard<std::mutex> lock(queue.mutex());
+    EXPECT_TRUE(
+        queue.takeBackpressuredSourcesLocked(/*lowWaterMark=*/1).empty());
+  }
+  EXPECT_TRUE(promises.empty());
+  EXPECT_EQ(resumeCount, 0);
 }
 
 } // namespace facebook::velox::ucx_exchange

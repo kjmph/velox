@@ -83,9 +83,13 @@ std::shared_ptr<facebook::velox::exec::Task> createExchangeTask(
 /// @param pool Shared pointer to the memory pool
 /// @param rowType The row type to use for the task
 /// @param numPartitions The number of output partitions
-/// @param partitionKeys The keys to use for hash partitioning (empty for
-/// round-robin)
+/// @param partitionKeys The keys to use for hash partitioning (empty for the
+/// default gather partition function).
 /// @param kMaxOutputBufferSize Maximum output buffer size
+/// @param outputTypeOverride Optional output type when the partitioned output
+/// projects a different layout, including ROW({}).
+/// @param partitionFunctionSpecOverride Optional partition function spec for
+/// scenarios such as round-robin output with no partition keys.
 /// @return Shared pointer to the created Task
 /// @param replicateNullsAndAny Whether rows with a null partition key, plus one
 /// arbitrary row, must reach every destination
@@ -98,7 +102,9 @@ std::shared_ptr<facebook::velox::exec::Task> createPartitionedOutputTask(
     uint64_t kMaxOutputBufferSize = FOUR_GBYTES,
     const std::unordered_map<std::string, std::string>& extraConfig = {},
     bool replicateNullsAndAny = false,
-    core::PartitionFunctionSpecPtr partitionFunctionSpecOverride = nullptr);
+    facebook::velox::core::PartitionFunctionSpecPtr
+        partitionFunctionSpecOverride = nullptr,
+    facebook::velox::RowTypePtr outputTypeOverride = nullptr);
 
 /// @brief Helper function to create a CudfVector for testing.
 /// Uses makeTable when tableGenerator is null, or tableGenerator->makeTable()

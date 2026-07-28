@@ -16,11 +16,18 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
-#include <velox/exec/OutputBufferManager.h>
-#include <velox/exec/Task.h>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <string_view>
-#include <unordered_set>
+#include <unordered_map>
+#include <vector>
+#include "velox/exec/OutputBufferManager.h"
+#include "velox/exec/Task.h"
+#include "velox/experimental/ucx-exchange/PartitionKey.h"
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -31,10 +38,37 @@ using UcxManagedDataAvailableCallback = std::function<void(
     vector_size_t numRows,
     std::vector<int64_t> remainingBytes)>;
 
+/// Minimal lifecycle surface used to stop producer-side GPU exchange sends
+/// when their task terminates abnormally. Keeping this independent of UCX
+/// endpoints makes admission and task-removal races independently testable.
+class UcxExchangeServerLifecycle {
+ public:
+  virtual ~UcxExchangeServerLifecycle() = default;
+
+  virtual const PartitionKey& getPartitionKey() const = 0;
+
+  /// Requests asynchronous, idempotent shutdown on the communicator thread.
+  virtual void requestAbort() = 0;
+
+  /// Enables communicator processing after registry admission. Returns false
+  /// if shutdown won the race.
+  virtual bool activate() = 0;
+
+  /// Lock-free lifecycle check used to close registration/shutdown races.
+  virtual bool isClosed() const = 0;
+};
+
 class UcxOutputQueueManager : public exec::OutputBufferManager {
  public:
-  /// Returns the process-wide output queue manager used by UCX producers and
-  /// exchange servers.
+  enum class ExchangeServerAdmission {
+    kAccepted,
+    kTaskRemoved,
+    kDuplicateServer,
+    kServerUnavailable,
+  };
+
+  /// Returns the process-wide output queue manager used by producers and
+  /// servers.
   static const std::shared_ptr<UcxOutputQueueManager>& getInstanceRef();
 
   // Public to match DefaultOutputBufferManager and support direct unit tests.
@@ -183,6 +217,15 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
       std::string_view taskId,
       int destination,
       UcxManagedDataAvailableCallback notify);
+  /// Registers a producer-side server for task lifecycle cleanup. Exact
+  /// partition keys remain claimed for the task lifetime so sequence zero
+  /// cannot be restarted against a partially consumed stream.
+  ExchangeServerAdmission registerExchangeServer(
+      const std::shared_ptr<UcxExchangeServerLifecycle>& server);
+
+  /// Removes a server from lifecycle tracking. Safe to call repeatedly.
+  void unregisterExchangeServer(
+      const std::shared_ptr<UcxExchangeServerLifecycle>& server);
 
   /// Returns true if the given task can use intra-node transfer.
   /// Returns false if the task is not yet initialized (placeholder queue
@@ -221,17 +264,24 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
   // Throws an exception if queue doesn't exist.
   std::shared_ptr<UcxOutputQueue> getQueue(std::string_view taskId);
 
-  folly::Synchronized<
-      std::unordered_map<std::string, std::shared_ptr<UcxOutputQueue>>,
-      std::mutex>
-      queues_;
+  enum class TaskRemovalKind {
+    kFinished,
+    kAborted,
+  };
 
-  // Tasks that have been removed via removeTask(). Prevents getData() from
-  // re-creating placeholder queues for tasks that are already dead, which
-  // would cause crashes when deleteResults() is called with destinations
-  // that exceed the placeholder's undersized queues_ vector.
-  folly::Synchronized<std::unordered_set<std::string>, std::mutex>
-      removedTasks_;
+  using ServerWeakPtr = std::weak_ptr<UcxExchangeServerLifecycle>;
+
+  struct State {
+    std::unordered_map<std::string, std::shared_ptr<UcxOutputQueue>> queues;
+    // UCX tags carry no generation. Task tombstones therefore persist and
+    // prevent late handshakes from recreating a zombie placeholder queue.
+    std::unordered_map<std::string, TaskRemovalKind> removedTasks;
+    // A closed server leaves an empty exact-key claim until task removal. A
+    // replacement cannot safely restart sequence zero on the old stream.
+    std::map<PartitionKey, ServerWeakPtr> activeServers;
+  };
+
+  folly::Synchronized<State, std::mutex> state_;
 };
 
 } // namespace facebook::velox::ucx_exchange

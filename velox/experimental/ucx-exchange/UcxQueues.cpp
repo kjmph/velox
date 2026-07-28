@@ -365,8 +365,10 @@ void UcxOutputQueue::addOutputBuffersLocked(int numBuffers) {
         buffer->enqueueBack(data, numRows);
       }
     }
-    // Retained broadcast payloads must precede EOS for a late destination.
-    if (atEnd_) {
+    // A retained placeholder can be expanded after manager removal. New
+    // destinations must observe termination instead of parking a new waiter.
+    // Retained broadcast payloads still precede ordinary EOS.
+    if (atEnd_ || terminated_) {
       buffer->enqueueBack(nullptr, /*numRows=*/0);
     }
     newQueues.emplace_back(std::move(buffer));
@@ -1198,6 +1200,18 @@ bool UcxOutputQueue::isFinishedLocked() {
     }
   }
   return true;
+}
+
+std::optional<exec::TaskState> UcxOutputQueue::taskState() {
+  std::shared_ptr<exec::Task> task;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    task = task_;
+  }
+  if (task == nullptr) {
+    return std::nullopt;
+  }
+  return task->state();
 }
 
 void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {

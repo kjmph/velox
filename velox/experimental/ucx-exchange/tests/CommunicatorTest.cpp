@@ -92,6 +92,14 @@ class AsyncShutdownElement final
     return forced_.load(std::memory_order_acquire);
   }
 
+  bool enqueueCallbackForTest(std::function<void()> callback) {
+    return enqueueStateEvent(shared_from_this(), std::move(callback));
+  }
+
+  bool drainCallbacksForTest() {
+    return drainStateEvents();
+  }
+
  private:
   std::atomic<bool> closeStarted_{false};
   std::atomic<bool> completionReady_{false};
@@ -128,11 +136,16 @@ TEST(
   // transport and does not exercise production endpoint sharing. Use a
   // separate context and worker so the follow-on transfer negotiates a real
   // same-host transport.
-  peerContext = ucxx::createContext({}, UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP);
+  peerContext = ucxx::contextBuilder(UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP)
+                    .configMap({})
+                    .build();
   ASSERT_NE(peerContext, nullptr);
-  peerWorker = peerContext->createWorker(true);
+  peerWorker = peerContext->workerBuilder()
+                   .delayedSubmission(true)
+                   .pythonFuture(false)
+                   .build();
   ASSERT_NE(peerWorker, nullptr);
-  auto peerAddress = peerWorker->getAddress();
+  auto peerAddress = peerWorker->addressBuilder().build();
   ASSERT_NE(peerAddress, nullptr);
   const auto peerAddressView = peerAddress->getStringView();
   ASSERT_FALSE(peerAddressView.empty());
@@ -149,10 +162,11 @@ TEST(
   ASSERT_NE(worker, nullptr);
 
   auto communicatorAddress =
-      ucxx::createAddressFromString(communicator->getWorkerAddress());
+      ucxx::AddressBuilder(communicator->getWorkerAddress()).build();
   ASSERT_NE(communicatorAddress, nullptr);
-  auto peerEndpoint = ucxx::createEndpointFromWorkerAddress(
-      peerWorker, communicatorAddress, false);
+  auto peerEndpoint = ucxx::endpointBuilder(peerWorker, communicatorAddress)
+                          .endpointErrorHandling(false)
+                          .build();
   ASSERT_NE(peerEndpoint, nullptr);
 
   auto waitUntil = [](auto predicate) {
@@ -214,18 +228,21 @@ TEST(
   auto requestContext = std::make_shared<RequestContext>(
       RequestContext{payload, completionStatus});
   constexpr uint64_t kCancelledTag = 0x7fff'0000'0000'0001ULL;
-  auto cancelledRequest = endpointRef->endpoint_->tagRecv(
-      payload->data(),
-      payload->size(),
-      ucxx::Tag{kCancelledTag},
-      ucxx::TagMaskFull,
-      false,
-      [](ucs_status_t status, std::shared_ptr<void> arg) {
-        auto context = std::static_pointer_cast<RequestContext>(arg);
-        context->completionStatus->store(status, std::memory_order_release);
-        context->payload.reset();
-      },
-      requestContext);
+  auto cancelledRequest =
+      endpointRef->endpoint_
+          ->tagRecvBuilder(
+              payload->data(),
+              payload->size(),
+              ucxx::Tag{kCancelledTag},
+              ucxx::TagMaskFull)
+          .pythonFuture(false)
+          .callbackFunction([](ucs_status_t status, std::shared_ptr<void> arg) {
+            auto context = std::static_pointer_cast<RequestContext>(arg);
+            context->completionStatus->store(status, std::memory_order_release);
+            context->payload.reset();
+          })
+          .callbackData(requestContext)
+          .build();
   payload.reset();
   requestContext.reset();
 
@@ -235,11 +252,16 @@ TEST(
   constexpr uint64_t kFollowOnTag = 0x7fff'0000'0000'0002ULL;
   std::array<uint8_t, 4> sendBytes{1, 2, 3, 4};
   std::array<uint8_t, 4> receiveBytes{};
-  auto receiveRequest = endpointRef->endpoint_->tagRecv(
-      receiveBytes.data(),
-      receiveBytes.size(),
-      ucxx::Tag{kFollowOnTag},
-      ucxx::TagMaskFull);
+  auto receiveRequest = endpointRef->endpoint_
+                            ->tagRecvBuilder(
+                                receiveBytes.data(),
+                                receiveBytes.size(),
+                                ucxx::Tag{kFollowOnTag},
+                                ucxx::TagMaskFull)
+                            .pythonFuture(false)
+                            .callbackFunction(nullptr)
+                            .callbackData(nullptr)
+                            .build();
 
   std::vector<std::shared_ptr<ucxx::Request>> requests;
   requests.push_back(cancelledRequest);
@@ -255,8 +277,14 @@ TEST(
 
   // Cancellation is request-scoped. A later transfer on the same shared
   // endpoint must still complete and carry the expected bytes.
-  auto sendRequest = peerEndpoint->tagSend(
-      sendBytes.data(), sendBytes.size(), ucxx::Tag{kFollowOnTag});
+  auto sendRequest =
+      peerEndpoint
+          ->tagSendBuilder(
+              sendBytes.data(), sendBytes.size(), ucxx::Tag{kFollowOnTag})
+          .pythonFuture(false)
+          .callbackFunction(nullptr)
+          .callbackData(nullptr)
+          .build();
 
   ASSERT_TRUE(waitUntil([&]() {
     return receiveRequest->isCompleted() && sendRequest->isCompleted();
@@ -309,18 +337,21 @@ TEST(
   auto shutdownRequestContext = std::make_shared<RequestContext>(
       RequestContext{shutdownPayload, shutdownCompletionStatus});
   constexpr uint64_t kShutdownCancelledTag = 0x7fff'0000'0000'0003ULL;
-  auto shutdownCancelledRequest = endpointRef->endpoint_->tagRecv(
-      shutdownPayload->data(),
-      shutdownPayload->size(),
-      ucxx::Tag{kShutdownCancelledTag},
-      ucxx::TagMaskFull,
-      false,
-      [](ucs_status_t status, std::shared_ptr<void> arg) {
-        auto context = std::static_pointer_cast<RequestContext>(arg);
-        context->completionStatus->store(status, std::memory_order_release);
-        context->payload.reset();
-      },
-      shutdownRequestContext);
+  auto shutdownCancelledRequest =
+      endpointRef->endpoint_
+          ->tagRecvBuilder(
+              shutdownPayload->data(),
+              shutdownPayload->size(),
+              ucxx::Tag{kShutdownCancelledTag},
+              ucxx::TagMaskFull)
+          .pythonFuture(false)
+          .callbackFunction([](ucs_status_t status, std::shared_ptr<void> arg) {
+            auto context = std::static_pointer_cast<RequestContext>(arg);
+            context->completionStatus->store(status, std::memory_order_release);
+            context->payload.reset();
+          })
+          .callbackData(shutdownRequestContext)
+          .build();
   shutdownPayload.reset();
   shutdownRequestContext.reset();
 
@@ -344,6 +375,19 @@ TEST(
   asyncShutdownElement->join();
   EXPECT_TRUE(asyncShutdownElement->processedAfterClose());
   EXPECT_FALSE(asyncShutdownElement->forced());
+
+  // A callback cannot be scheduled after the work queue closes. A failed
+  // handoff must remove the state event and release its captured owner.
+  auto callbackOwner = std::make_shared<int>(1);
+  std::weak_ptr<int> weakCallbackOwner = callbackOwner;
+  bool callbackRan = false;
+  EXPECT_FALSE(asyncShutdownElement->enqueueCallbackForTest(
+      [owner = std::move(callbackOwner), &callbackRan]() {
+        callbackRan = true;
+      }));
+  EXPECT_TRUE(weakCallbackOwner.expired());
+  EXPECT_FALSE(asyncShutdownElement->drainCallbacksForTest());
+  EXPECT_FALSE(callbackRan);
 
   // Handshakes only need the immutable address created with the worker.
   // The first read after progress stops proves startup cached it eagerly and

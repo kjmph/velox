@@ -18,14 +18,10 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "velox/common/EnumDeclare.h"
-#include "velox/common/EnumDefine.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -39,11 +35,9 @@
 #include <cuda_runtime.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
-#include <cuda/stream>
 
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/pool_memory_resource.hpp>
+#include <cuda/stream>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -82,6 +76,7 @@ class UcxExchangeSource
     WaitingForReceiveCredit,
     WaitingForData,
     WaitingForIntraNodeData,
+    DrainingAfterAbort,
     Done,
   };
 
@@ -95,10 +90,9 @@ class UcxExchangeSource
       std::string_view url,
       const std::shared_ptr<UcxExchangeQueue>& queue);
 
-  /// Publishes this source to the Communicator. The client must first account
-  /// for the source in its exchange queue and call setRegistered(), so even an
-  /// immediately completed handshake cannot deliver an unbalanced end marker.
-  /// Idempotent, and a no-op if close() won the lifecycle race.
+  /// Starts communicator processing for this source. Call only after the
+  /// owning exchange queue has registered the source so an early connection
+  /// failure can deliver its end marker correctly.
   void start();
 
   bool supportsMetrics() const {
@@ -114,6 +108,12 @@ class UcxExchangeSource
   /// of an error or an operator like Limit aborting the query
   /// once it received enough data.
   void close();
+
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void forceCloseForShutdown() override;
 
   /// @brief Marks this source as registered with the exchange queue.
   /// Must be called after addSourceLocked() increments numSources_ for this
@@ -131,6 +131,9 @@ class UcxExchangeSource
   // Backpressure thresholds. Public so UcxExchangeClient can use them.
   static constexpr int32_t kBackpressureHighWaterMark = 32;
   static constexpr int32_t kBackpressureLowWaterMark = 16;
+
+  static int32_t backpressureHighWaterMark();
+  static int32_t backpressureLowWaterMark();
 
   // Returns runtime statistics. ExchangeSource is expected to report
   // background CPU time by including a runtime metric named
@@ -163,15 +166,29 @@ class UcxExchangeSource
     Metadata,
     Data,
     HandshakeResponse,
+    HandshakeAck,
+    Abort
   };
-
-  /// Runs one state-machine turn. process() contains any exception from this
-  /// method so failures cannot terminate the Communicator loop.
   void processStateMachine();
-
+  void enqueueSerializedCallback(
+      CallbackPhase phase,
+      ucs_status_t status,
+      std::shared_ptr<void> arg) noexcept;
+  void runSerializedCallback(
+      CallbackPhase phase,
+      ucs_status_t status,
+      std::shared_ptr<void> arg) noexcept;
+  void failCallbackDispatch() noexcept;
+  void failSource(
+      std::string_view operation,
+      const char* detail = nullptr) noexcept;
+  void retireRequest(std::shared_ptr<ucxx::Request>& request);
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
+    // Abort draining does not depend on free device memory. A committed GPU
+    // send can land in this host buffer and be discarded without unpacking.
+    std::unique_ptr<uint8_t[]> discardBuf;
     cuda::stream_ref stream{
         cudaStream_t{cudaStreamDefault}}; // The stream used to allocate dataBuf
     bool receiveBytesReserved{false};
@@ -226,19 +243,12 @@ class UcxExchangeSource
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
 
-  /// Reserves receive bytes, allocates the GPU buffer, and posts the data
-  /// receive for metadata already accepted from the producer.
+  /// Starts the data receive for metadata already received from the sender.
   void startDataReceive(std::shared_ptr<DataAndMetadata> dataAndMetadata);
 
-  bool tryReserveReceiveBytes(
-      const std::shared_ptr<DataAndMetadata>& dataAndMetadata);
+  bool tryReserveReceiveBytes(std::shared_ptr<DataAndMetadata> dataAndMetadata);
 
-  void releaseReceiveBytes(
-      const std::shared_ptr<DataAndMetadata>& dataAndMetadata);
-
-  /// Releases a completed phase request immediately, or hands a genuinely
-  /// in-flight request to Communicator until UCXX marks it complete.
-  void retireRequest(std::shared_ptr<ucxx::Request>& request);
+  void releaseReceiveBytes(std::shared_ptr<DataAndMetadata> dataAndMetadata);
 
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
@@ -253,36 +263,38 @@ class UcxExchangeSource
   /// @param arg The HandshakeResponse data
   void onHandshakeResponse(ucs_status_t status, std::shared_ptr<void> arg);
 
-  /// Runs a UCXX completion after it has been serialized onto process().
-  /// Contains all exceptions so none can unwind through a C callback or tear
-  /// down the communicator loop.
-  void runSerializedCallback(
-      CallbackPhase phase,
-      ucs_status_t status,
-      std::shared_ptr<void> arg) noexcept;
+  /// Sends the initial READY acknowledgement after the first receive or
+  /// intra-process poll has been posted.
+  void sendHandshakeAck();
 
-  /// Safely hands a UCXX callback to the Communicator thread. This contains
-  /// allocation failures from std::function and the work queue.
-  void enqueueSerializedCallback(
-      CallbackPhase phase,
-      ucs_status_t status,
-      std::shared_ptr<void> arg) noexcept;
+  void onHandshakeAck(ucs_status_t status, std::shared_ptr<void> arg);
 
-  /// Records a terminal source failure and schedules state-machine cleanup.
-  void failSource(
-      std::string_view operation,
-      const char* detail = nullptr) noexcept;
+  /// Sends the per-partition abort control after an accepted handshake.
+  void sendAbort();
 
-  /// Minimal thread-safe terminal path used if callback handoff itself fails.
-  /// It deliberately leaves request/reservation cleanup to process().
-  void failCallbackDispatch() noexcept;
+  void onAbortSent(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Drains the producer's at-most-one committed payload and sequenced final
+  /// marker after close, without consumer backpressure.
+  void startAbortDrain();
+
+  void processAbortDrain();
+
+  /// Reports a local processing failure to the consumer, then uses the normal
+  /// abort protocol to drain any payload the producer may already have
+  /// committed.
+  void failAndStartAbortDrain(std::string errorMessage);
+
+  /// Reports an unrecoverable protocol/transport failure and tears down the
+  /// shared endpoint. All sibling elements are force-closed because no
+  /// wire-level drain is possible once a committed tag cannot be consumed.
+  void failAndCloseEndpoint(std::string errorMessage);
 
   /// @brief For intra-node transfer: initiates waiting for data from registry.
   void waitForIntraNodeData();
 
   /// @brief For intra-node transfer: handles data retrieved from registry.
   /// @param data The packed_columns from registry (nullptr if atEnd or error)
-  /// @param numRows Logical rows in 'data'
   /// @param atEnd True if this is end-of-stream
   void onIntraNodeData(
       std::shared_ptr<cudf::packed_columns> data,
@@ -317,8 +329,8 @@ class UcxExchangeSource
   /// @return Returns true if state was changed, false otherwise.
   bool setStateIf(ReceiverState expected, ReceiverState desired);
 
-  /// Checks queue pressure and publishes the dormant flag while holding the
-  /// same mutex consumers use to decide whether to wake sources.
+  /// Atomically with respect to consumer dequeue decisions, marks this source
+  /// dormant when the shared receive queue is above its prefetch limit.
   bool pauseForBackpressureIfNeeded();
 
   // The connection parameters
@@ -337,13 +349,16 @@ class UcxExchangeSource
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};
-  // Serializes initial publication with close(). The Communicator may process
-  // the source as soon as registerCommElement() is called.
-  std::mutex lifecycleMutex_;
-  bool started_{false};
-  bool cleanupComplete_{false};
+  std::atomic<bool> started_{false};
+  std::atomic<bool> closeRequested_{false};
   std::atomic<bool> closed_{false};
+  bool cleanupComplete_{false};
+  std::atomic<bool> callbackDispatchFailed_{false};
+  bool handshakeAccepted_{false};
+  bool handshakeAckNeeded_{false};
+  bool abortSent_{false};
   bool atEnd_{false}; // set when "atEnd" is being received.
+  bool endpointCleanupRequested_{false};
 
   /// @brief Guards exactly-once delivery of the nullptr end-of-stream marker.
   /// Only one thread can win the CAS and call enqueue(nullptr).
@@ -363,9 +378,9 @@ class UcxExchangeSource
   /// When true, intra-node transfer optimizations bypass UCXX transfers.
   bool isIntraNodeTransfer_{false};
 
-  // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
+  // Backpressure: when the queue exceeds the high-water threshold, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
-  // when the queue drains to kBackpressureLowWaterMark.
+  // when the queue drains to the low-water threshold.
   std::atomic<bool> backpressureActive_{false};
   std::shared_ptr<DataAndMetadata> pendingDataReceive_;
   std::shared_ptr<DataAndMetadata> activeDataReceive_;
@@ -373,13 +388,17 @@ class UcxExchangeSource
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
 
-  // Keep request handles classified by phase. Some UCXX operations may invoke
-  // their completion inline: assigning every phase into one shared slot can
-  // overwrite a data receive posted by a nested metadata callback.
+  // Keep send and receive requests classified by operation. UCP only supports
+  // exact cancellation for tag receives; active-message and tag sends must be
+  // retained until completion.
   std::shared_ptr<ucxx::Request> handshakeRequest_{nullptr};
   std::shared_ptr<ucxx::Request> handshakeResponseRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> handshakeAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
   std::shared_ptr<ucxx::Request> metadataRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+  bool metadataReceivePosted_{false};
+  bool dataReceivePosted_{false};
 };
 
 } // namespace facebook::velox::ucx_exchange

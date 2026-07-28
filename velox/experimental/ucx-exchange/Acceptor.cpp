@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/Acceptor.h"
+#include <cstring>
+#include <string>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #ifdef VELOX_ENABLE_CUDF
@@ -27,6 +29,26 @@
 namespace facebook::velox::ucx_exchange {
 
 #ifdef VELOX_ENABLE_CUDF
+namespace {
+
+GpuHandshakeResponseStatus toGpuHandshakeResponseStatus(
+    UcxOutputQueueManager::ExchangeServerAdmission admission) {
+  using Admission = UcxOutputQueueManager::ExchangeServerAdmission;
+  switch (admission) {
+    case Admission::kAccepted:
+      return GpuHandshakeResponseStatus::kAccepted;
+    case Admission::kTaskRemoved:
+      return GpuHandshakeResponseStatus::kTaskRemoved;
+    case Admission::kDuplicateServer:
+      return GpuHandshakeResponseStatus::kDuplicateServer;
+    case Admission::kServerUnavailable:
+      return GpuHandshakeResponseStatus::kServerUnavailable;
+  }
+  VELOX_UNREACHABLE();
+}
+
+} // namespace
+
 /*static*/
 void Acceptor::cStyleAMCallback(
     std::shared_ptr<ucxx::Request> request,
@@ -46,6 +68,14 @@ void Acceptor::cStyleAMCallback(
       buffer->getSize(),
       sizeof(HandshakeMsg));
   HandshakeMsg* handshakePtr = reinterpret_cast<HandshakeMsg*>(buffer->data());
+  const auto taskIdLength =
+      ::strnlen(handshakePtr->taskId, sizeof(handshakePtr->taskId));
+  VELOX_CHECK_LT(
+      taskIdLength,
+      sizeof(handshakePtr->taskId),
+      "AMCallback: task ID in HandshakeMsg is not NUL-terminated");
+  VELOX_CHECK_GT(
+      taskIdLength, 0, "AMCallback: task ID in HandshakeMsg is empty");
 
   // Create a exchangeServer based on the information received in the initial
   // handshake.
@@ -54,7 +84,9 @@ void Acceptor::cStyleAMCallback(
   auto epRef = communicator->findEndpointRefByHandle(ep);
   VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
 
-  const PartitionKey key = {handshakePtr->taskId, handshakePtr->destination};
+  const PartitionKey key = {
+      std::string(handshakePtr->taskId, taskIdLength),
+      handshakePtr->destination};
 
   // Determine if this is an intra-process transfer by comparing the source's
   // workerId with our Communicator's workerId. A match means both source and
@@ -92,15 +124,23 @@ void Acceptor::cStyleAMCallback(
   if (!communicator->registerCommElement(exchangeServer)) {
     return;
   }
+  const auto admission =
+      UcxOutputQueueManager::getInstanceRef()->registerExchangeServer(
+          exchangeServer);
+  const auto responseStatus = toGpuHandshakeResponseStatus(admission);
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
           << " peerIp=" << peerIp
-          << " isIntraNodeTransfer=" << isIntraNodeTransfer;
+          << " isIntraNodeTransfer=" << isIntraNodeTransfer
+          << " admission=" << static_cast<int>(responseStatus);
 
   // Send HandshakeResponse back to the source to inform about intra-node
   // transfer. This allows the source to bypass UCXX for all subsequent data
   // transfers.
   auto response = std::make_shared<HandshakeResponse>();
-  response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
+  response->isIntraNodeTransfer =
+      responseStatus == GpuHandshakeResponseStatus::kAccepted &&
+      exchangeServer->isIntraNodeTransfer();
+  response->status = responseStatus;
 
   uint32_t keyHash = fnv1a_32(key.toString());
   uint64_t responseTag = getHandshakeResponseTag(keyHash);

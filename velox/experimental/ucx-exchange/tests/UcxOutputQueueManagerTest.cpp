@@ -22,15 +22,18 @@
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <type_traits>
 #include <vector>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
@@ -45,21 +48,16 @@ class UcxOutputQueueManagerTest : public testing::Test {
 
   void SetUp() override {
     pool_ = facebook::velox::memory::memoryManager()->addLeafPool();
-    queueManager_ = UcxOutputQueueManager::getInstanceRef();
+    queueManager_ = std::make_shared<UcxOutputQueueManager>();
   }
 
   std::shared_ptr<Task> initializeTask(
       const std::string& taskId,
       int numDestinations,
       int numDrivers,
-      bool cleanup = true,
       core::PartitionedOutputNode::Kind kind =
           core::PartitionedOutputNode::Kind::kPartitioned,
       uint64_t maxOutputBufferSize = FOUR_GBYTES) {
-    if (cleanup) {
-      queueManager_->removeTask(std::string{taskId});
-    }
-
     auto task = createSourceTask(
         taskId, pool_, UcxTestData::kTestRowType, maxOutputBufferSize);
 
@@ -288,7 +286,6 @@ TEST_F(UcxOutputQueueManagerTest, implementsOutputBufferManager) {
       taskId,
       numDestinations,
       1 /*numDrivers*/,
-      true /*cleanup*/,
       core::PartitionedOutputNode::Kind::kPartitioned,
       maxOutputBufferSize);
 
@@ -387,6 +384,220 @@ TEST_F(UcxOutputQueueManagerTest, registersUcxOutputTransport) {
       nullptr);
 }
 
+class TestExchangeServerLifecycle : public UcxExchangeServerLifecycle {
+ public:
+  TestExchangeServerLifecycle(std::string taskId, uint32_t destination)
+      : key_{std::move(taskId), destination} {}
+
+  const PartitionKey& getPartitionKey() const override {
+    return key_;
+  }
+
+  void requestAbort() override {
+    bool expected = false;
+    if (abortRequested_.compare_exchange_strong(expected, true)) {
+      ++abortRequests_;
+    }
+  }
+
+  bool activate() override {
+    if (closed_.load() || abortRequested_.load()) {
+      return false;
+    }
+    activated_.store(true);
+    return true;
+  }
+
+  bool isClosed() const override {
+    return closed_.load();
+  }
+
+  int abortRequests() const {
+    return abortRequests_.load();
+  }
+
+  bool isActivated() const {
+    return activated_.load();
+  }
+
+ private:
+  const PartitionKey key_;
+  std::atomic<int> abortRequests_{0};
+  std::atomic<bool> abortRequested_{false};
+  std::atomic<bool> closed_{false};
+  std::atomic<bool> activated_{false};
+};
+
+using ExchangeServerAdmission = UcxOutputQueueManager::ExchangeServerAdmission;
+
+TEST(GpuHandshakeResponseTest, admissionStatusPreservesWireLayout) {
+  HandshakeResponse accepted;
+  EXPECT_FALSE(accepted.isIntraNodeTransfer);
+  EXPECT_EQ(accepted.status, GpuHandshakeResponseStatus::kAccepted);
+
+  HandshakeResponse rejected;
+  rejected.status = GpuHandshakeResponseStatus::kTaskRemoved;
+
+  EXPECT_EQ(sizeof(rejected), sizeof(accepted));
+  EXPECT_EQ(rejected.status, GpuHandshakeResponseStatus::kTaskRemoved);
+}
+
+TEST(GpuAbortProtocolTest, usesDedicatedTaskScopedControlTags) {
+  constexpr uint32_t kTaskHash = 0xa1b2c3d4;
+  const auto ackTag = getGpuHandshakeAckTag(kTaskHash);
+  const auto abortTag = getGpuAbortTag(kTaskHash);
+
+  EXPECT_EQ(ackTag >> 32, kTaskHash);
+  EXPECT_EQ(ackTag & 0xff000000ULL, GPU_HANDSHAKE_ACK_TAG);
+  EXPECT_EQ(ackTag & 0x00ffffffULL, 0);
+  EXPECT_EQ(abortTag >> 32, kTaskHash);
+  EXPECT_EQ(abortTag & 0xff000000ULL, GPU_ABORT_TAG);
+  EXPECT_EQ(abortTag & 0x00ffffffULL, 0);
+  EXPECT_NE(abortTag, ackTag);
+  EXPECT_NE(ackTag, getHandshakeAckTag(kTaskHash));
+  EXPECT_NE(abortTag, getCpuRowAbortTag(kTaskHash));
+  EXPECT_NE(abortTag, getMetadataTag(kTaskHash, 0));
+  EXPECT_NE(abortTag, getDataTag(kTaskHash, 0));
+
+  GpuHandshakeAckHeader ack;
+  EXPECT_EQ(ack.magic, kGpuHandshakeAckMagic);
+  EXPECT_EQ(ack.version, kGpuHandshakeAckVersion);
+  EXPECT_EQ(ack.headerSize, sizeof(GpuHandshakeAckHeader));
+
+  GpuAbortHeader abort;
+  EXPECT_EQ(abort.magic, kGpuAbortMagic);
+  EXPECT_EQ(abort.version, kGpuAbortVersion);
+  EXPECT_EQ(abort.headerSize, sizeof(GpuAbortHeader));
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    abnormalTaskRemovalAbortsAllAndOnlyMatchingServers) {
+  auto taskA = initializeTask(
+      "gpu-aborted-task-a", 2 /* numDestinations */, 1 /* numDrivers */);
+  auto taskB = initializeTask(
+      "gpu-unrelated-task-b", 1 /* numDestinations */, 1 /* numDrivers */);
+
+  auto a0 = std::make_shared<TestExchangeServerLifecycle>(taskA->taskId(), 0);
+  auto a0Duplicate =
+      std::make_shared<TestExchangeServerLifecycle>(taskA->taskId(), 0);
+  auto a1 = std::make_shared<TestExchangeServerLifecycle>(taskA->taskId(), 1);
+  auto b0 = std::make_shared<TestExchangeServerLifecycle>(taskB->taskId(), 0);
+
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(a0),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(a0Duplicate),
+      ExchangeServerAdmission::kDuplicateServer);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(a1),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(b0),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_TRUE(a0->isActivated());
+  EXPECT_FALSE(a0Duplicate->isActivated());
+  EXPECT_TRUE(a1->isActivated());
+  EXPECT_TRUE(b0->isActivated());
+  EXPECT_EQ(a0Duplicate->abortRequests(), 1);
+
+  taskA->requestAbort().wait();
+  queueManager_->removeTask(taskA->taskId());
+
+  EXPECT_EQ(a0->abortRequests(), 1);
+  EXPECT_EQ(a0Duplicate->abortRequests(), 1);
+  EXPECT_EQ(a1->abortRequests(), 1);
+  EXPECT_EQ(b0->abortRequests(), 0);
+
+  // Repeated removal preserves the tombstone and does not reissue aborts.
+  queueManager_->removeTask(taskA->taskId());
+  EXPECT_EQ(a0->abortRequests(), 1);
+  EXPECT_EQ(a1->abortRequests(), 1);
+
+  auto late = std::make_shared<TestExchangeServerLifecycle>(taskA->taskId(), 0);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(late),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_EQ(late->abortRequests(), 1);
+
+  queueManager_->unregisterExchangeServer(b0);
+  taskB->requestAbort().wait();
+  queueManager_->removeTask(taskB->taskId());
+  EXPECT_EQ(b0->abortRequests(), 0);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    finishedTaskServersDrainInsteadOfBeingAborted) {
+  const std::string taskId = "gpu-normally-finished-task";
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+  auto active = std::make_shared<TestExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(active),
+      ExchangeServerAdmission::kAccepted);
+
+  task->testingFinish();
+  queueManager_->removeTask(taskId);
+  EXPECT_EQ(active->abortRequests(), 0);
+
+  auto late = std::make_shared<TestExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(late),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_FALSE(late->isActivated());
+  EXPECT_EQ(late->abortRequests(), 1);
+
+  auto reusedTask = createSourceTask(taskId, pool_, UcxTestData::kTestRowType);
+  EXPECT_ANY_THROW(queueManager_->initializeTask(
+      reusedTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1 /* numDestinations */,
+      1 /* numDrivers */));
+  reusedTask->requestAbort().wait();
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    removedTaskTombstoneRejectsLateServerAndReinitialization) {
+  const std::string taskId = "gpu-removed-before-initialization";
+
+  queueManager_->removeTask(taskId);
+  queueManager_->removeTask(taskId);
+
+  auto late = std::make_shared<TestExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(late),
+      ExchangeServerAdmission::kTaskRemoved);
+  EXPECT_EQ(late->abortRequests(), 1);
+
+  auto task = createSourceTask(taskId, pool_, UcxTestData::kTestRowType);
+  EXPECT_ANY_THROW(queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      1 /* numDestinations */,
+      1 /* numDrivers */));
+  task->requestAbort().wait();
+}
+
+TEST_F(UcxOutputQueueManagerTest, serverMayArriveBeforeTaskInitialization) {
+  const std::string taskId = "gpu-server-before-task-initialization";
+  auto early = std::make_shared<TestExchangeServerLifecycle>(taskId, 0);
+  EXPECT_EQ(
+      queueManager_->registerExchangeServer(early),
+      ExchangeServerAdmission::kAccepted);
+  EXPECT_TRUE(early->isActivated());
+
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+  EXPECT_EQ(early->abortRequests(), 0);
+
+  task->requestAbort().wait();
+  queueManager_->removeTask(taskId);
+  EXPECT_EQ(early->abortRequests(), 1);
+}
+
 TEST_F(UcxOutputQueueManagerTest, diagnostics) {
   const std::string taskId = "diagnostics";
   initializeTask(taskId, 2 /* numDestinations */, 1 /* numDrivers */);
@@ -405,7 +616,7 @@ TEST_F(UcxOutputQueueManagerTest, diagnostics) {
 
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   vector_size_t size = 100;
-  std::string taskId = "t0";
+  std::string taskId = "basic-partitioned";
   auto task = initializeTask(taskId, 5 /* numDestinations*/, 1 /*numDrivers*/);
 
   ASSERT_FALSE(queueManager_->isFinished(taskId));
@@ -471,7 +682,7 @@ TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
 
 TEST_F(UcxOutputQueueManagerTest, basicAsyncFetch) {
   const vector_size_t size = 10;
-  const std::string taskId = "t0";
+  const std::string taskId = "basic-async-fetch";
   int numPartitions = 1;
   bool earlyTermination = false;
 
@@ -549,7 +760,7 @@ TEST_F(UcxOutputQueueManagerTest, lateTaskCreation) {
   EXPECT_EQ(mgr->isOverutilized(taskId), std::nullopt);
 
   // initialize task.
-  auto task = initializeTask(taskId, numPartitions, 1, false);
+  auto task = initializeTask(taskId, numPartitions, 1);
   // enqueue some data.
   enqueue(taskId, destination, size);
   noMoreData(taskId);
@@ -595,7 +806,8 @@ TEST_F(UcxOutputQueueManagerTest, multiFetchers) {
     SCOPED_TRACE(fmt::format("earlyTermination {}", earlyTermination));
 
     const vector_size_t size = 10;
-    const std::string taskId = "t0";
+    const std::string taskId =
+        earlyTermination ? "multi-fetchers-early" : "multi-fetchers-complete";
     int numPartitions = 10;
     initializeTask(taskId, numPartitions, 1);
 
@@ -678,14 +890,53 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateBeforeInit) {
   EXPECT_TRUE(receivedNullptr);
 }
 
+TEST_F(UcxOutputQueueManagerTest, removedPlaceholderEndsNewDestinations) {
+  const std::string taskId = "adaptive.transport.removedPlaceholder";
+  bool originalEnded = false;
+  auto stableQueue = queueManager_->getDataWithQueue(
+      taskId,
+      0,
+      [&](std::shared_ptr<UcxOutputQueue> queue,
+          std::shared_ptr<cudf::packed_columns> data,
+          vector_size_t numRows,
+          std::vector<int64_t> remainingBytes) {
+        EXPECT_NE(queue, nullptr);
+        EXPECT_EQ(data, nullptr);
+        EXPECT_EQ(numRows, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        originalEnded = true;
+      });
+  ASSERT_NE(stableQueue, nullptr);
+  EXPECT_FALSE(originalEnded);
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(originalEnded);
+
+  // Model getData retaining the exact queue immediately before removal, then
+  // entering the queue after terminate() for a previously absent destination.
+  bool lateDestinationEnded = false;
+  stableQueue->getData(
+      3,
+      [&](std::shared_ptr<cudf::packed_columns> data,
+          vector_size_t numRows,
+          std::vector<int64_t> remainingBytes) {
+        EXPECT_EQ(data, nullptr);
+        EXPECT_EQ(numRows, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        lateDestinationEnded = true;
+      });
+  EXPECT_TRUE(lateDestinationEnded);
+  // Also clear a pending callback if a regression made the assertion fail.
+  stableQueue->terminate();
+}
+
 // Test BUG B scenario (b): Producer starts but crashes before noMoreData().
 // initializeTask() was called but noMoreData() was never called.
 // removeTask() must fire pending callbacks with nullptr.
 TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
   const std::string taskId = "callbackAfterInit.fresh";
 
-  auto task = initializeTask(
-      taskId, 2 /* numDestinations */, 1 /* numDrivers */, false /* cleanup */);
+  auto task =
+      initializeTask(taskId, 2 /* numDestinations */, 1 /* numDrivers */);
 
   // Register callbacks on both destinations.
   bool callback0Fired = false;
@@ -731,8 +982,8 @@ TEST_F(UcxOutputQueueManagerTest, callbackFiredOnTerminateAfterInit) {
 
 TEST_F(UcxOutputQueueManagerTest, callbackFiredOnDeleteResults) {
   const std::string taskId = "callbackOnDeleteResults.fresh";
-  auto task = initializeTask(
-      taskId, 1 /* numDestinations */, 1 /* numDrivers */, false /* cleanup */);
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
 
   bool callbackFired = false;
   queueManager_->getData(
@@ -767,7 +1018,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastBasic) {
       taskId,
       numDestinations,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   // Broadcast must not be finished before noMoreQueues.
@@ -806,7 +1056,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastLateDestination) {
       taskId,
       2 /* numDestinations */,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   // Enqueue 2 batches before the 3rd destination arrives.
@@ -852,7 +1101,6 @@ TEST_F(
       taskId,
       1 /* numDestinations */,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   enqueue(taskId, 0, size);
@@ -912,7 +1160,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastLateRegistrationAfterEnd) {
       taskId,
       1 /* numDestinations */,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   enqueue(taskId, 0, 10);
@@ -937,7 +1184,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastNotFinishedWithoutNoMoreQueues) {
       taskId,
       2 /* numDestinations */,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   // Signal no more data.
@@ -965,7 +1211,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastEndMarkerToLateDestination) {
       taskId,
       1 /* numDestinations */,
       1 /* numDrivers */,
-      true /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
 
   enqueue(taskId, 0, 10);
@@ -988,7 +1233,7 @@ TEST_F(UcxOutputQueueManagerTest, broadcastEndMarkerToLateDestination) {
 
 TEST_F(UcxOutputQueueManagerTest, transferReservationBlocksAndWakes) {
   const std::string taskId = "adaptive.reservation";
-  auto task = initializeTask(taskId, 2, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 2, 1);
 
   EXPECT_FALSE(
       queueManager_->reserveTransferBytes(taskId, 0, 100, 100, nullptr));
@@ -1015,7 +1260,7 @@ TEST_F(UcxOutputQueueManagerTest, transferReservationBlocksAndWakes) {
 
 TEST_F(UcxOutputQueueManagerTest, enqueueConsumesReservationExactlyOnce) {
   const std::string taskId = "adaptive.enqueueReservationCommit";
-  auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 1, 1);
   auto page = makePackedColumns(10);
   const auto bytes = static_cast<int64_t>(page->gpu_data->size());
   ASSERT_GT(bytes, 0);
@@ -1058,7 +1303,6 @@ TEST_F(UcxOutputQueueManagerTest, retainedUntilTransferCompletion) {
       taskId,
       1,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kPartitioned,
       1 /* maxOutputBufferSize */);
 
@@ -1097,9 +1341,68 @@ TEST_F(UcxOutputQueueManagerTest, retainedUntilTransferCompletion) {
   queueManager_->removeTask(taskId);
 }
 
+TEST_F(UcxOutputQueueManagerTest, cancellationRetainsExactInFlightQueue) {
+  const std::string taskId = "adaptive.transport.cancelInFlight";
+  auto task = initializeTask(
+      taskId, 1, 1, core::PartitionedOutputNode::Kind::kPartitioned, 1);
+  auto server = std::make_shared<TestExchangeServerLifecycle>(taskId, 0);
+  ASSERT_EQ(
+      queueManager_->registerExchangeServer(server),
+      ExchangeServerAdmission::kAccepted);
+  enqueue(taskId, 0, 10);
+
+  std::shared_ptr<UcxOutputQueue> stableQueue;
+  std::shared_ptr<cudf::packed_columns> packet;
+  auto returnedQueue = queueManager_->getDataWithQueue(
+      taskId,
+      0,
+      [&](std::shared_ptr<UcxOutputQueue> queue,
+          std::shared_ptr<cudf::packed_columns> data,
+          vector_size_t numRows,
+          std::vector<int64_t>) {
+        EXPECT_EQ(numRows, 10);
+        stableQueue = std::move(queue);
+        packet = std::move(data);
+      });
+  ASSERT_NE(stableQueue, nullptr);
+  ASSERT_NE(packet, nullptr);
+  EXPECT_EQ(returnedQueue, stableQueue);
+  const auto bytes = static_cast<int64_t>(packet->gpu_data->size());
+  ASSERT_GT(bytes, 0);
+
+  bool terminalCallback = false;
+  queueManager_->getDataWithQueue(
+      taskId,
+      0,
+      [&](std::shared_ptr<UcxOutputQueue> queue,
+          std::shared_ptr<cudf::packed_columns> data,
+          vector_size_t numRows,
+          std::vector<int64_t> remainingBytes) {
+        // Abort must be visible before terminate wakes a pending sender.
+        EXPECT_EQ(server->abortRequests(), 1);
+        EXPECT_EQ(queue, stableQueue);
+        EXPECT_EQ(data, nullptr);
+        EXPECT_EQ(numRows, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        terminalCallback = true;
+      });
+  EXPECT_FALSE(terminalCallback);
+  task->requestAbort().wait();
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(terminalCallback);
+  EXPECT_EQ(queueManager_->stats(taskId), std::nullopt);
+  EXPECT_EQ(stableQueue->stats().bufferedBytes, bytes);
+
+  // Transfer completion owns the exact queue after its manager entry is gone.
+  packet.reset();
+  stableQueue->releaseInFlightBytes(0, bytes, 1);
+  EXPECT_EQ(stableQueue->stats().bufferedBytes, 0);
+  EXPECT_EQ(stableQueue->stats().bufferedPages, 0);
+}
+
 TEST_F(UcxOutputQueueManagerTest, adaptiveWindowDecreaseAndGrowth) {
   const std::string taskId = "adaptive.window";
-  auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 1, 1);
 
   EXPECT_EQ(queueManager_->transferWindowBytes(taskId, 0, 100, 200, 800), 200);
   // Keep enough destination-local demand present that the getter doesn't
@@ -1122,7 +1425,7 @@ TEST_F(UcxOutputQueueManagerTest, adaptiveWindowDecreaseAndGrowth) {
 
 TEST_F(UcxOutputQueueManagerTest, zeroBytePageReleasesPackedColumn) {
   const std::string taskId = "adaptive.zeroByte";
-  auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 1, 1);
   auto zeroColumnPage = makeZeroColumnPackedColumns();
   ASSERT_EQ(zeroColumnPage->gpu_data->size(), 0);
   queueManager_->enqueue(taskId, 0, std::move(zeroColumnPage), /*numRows=*/17);
@@ -1160,7 +1463,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastHistoryRetainsOneCopy) {
       taskId,
       1,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast,
       1 /* maxOutputBufferSize */);
 
@@ -1219,26 +1521,31 @@ TEST_F(UcxOutputQueueManagerTest, removeTaskTombstoneIsIdempotent) {
   EXPECT_EQ(staleQueue, nullptr);
   EXPECT_EQ(staleCallbacks, 1);
 
-  // Explicit initialization is the only operation that clears the tombstone.
-  auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
-  bool liveCallback = false;
-  auto liveQueue = queueManager_->getDataWithQueue(
+  // Tags contain no task generation; even explicit initialization cannot
+  // safely reuse a removed ID while old messages may still be unmatched.
+  auto task = createSourceTask(taskId, pool_, UcxTestData::kTestRowType);
+  VELOX_ASSERT_THROW(
+      queueManager_->initializeTask(
+          task, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1),
+      "Cannot reuse removed GPU exchange task ID");
+  task->requestAbort().wait();
+  queueManager_->removeTask(taskId);
+  EXPECT_EQ(queueManager_->stats(taskId), std::nullopt);
+  auto removedQueue = queueManager_->getDataWithQueue(
       taskId,
       0,
       [&](std::shared_ptr<UcxOutputQueue> outputQueue,
           std::shared_ptr<cudf::packed_columns> data,
-          vector_size_t /*numRows*/,
-          std::vector<int64_t> /*remainingBytes*/) {
-        EXPECT_NE(outputQueue, nullptr);
+          vector_size_t numRows,
+          std::vector<int64_t> remainingBytes) {
+        EXPECT_EQ(outputQueue, nullptr);
         EXPECT_EQ(data, nullptr);
-        liveCallback = true;
+        EXPECT_EQ(numRows, 0);
+        EXPECT_TRUE(remainingBytes.empty());
+        ++staleCallbacks;
       });
-  EXPECT_NE(liveQueue, nullptr);
-  EXPECT_FALSE(liveCallback);
-
-  task->requestAbort().wait();
-  queueManager_->removeTask(taskId);
-  EXPECT_TRUE(liveCallback);
+  EXPECT_EQ(removedQueue, nullptr);
+  EXPECT_EQ(staleCallbacks, 2);
 }
 
 TEST_F(UcxOutputQueueManagerTest, maximumConfiguredCapacityDoesNotOverflow) {
@@ -1273,7 +1580,6 @@ TEST_F(UcxOutputQueueManagerTest, fullTransferWindowRecoveryIsBounded) {
       taskId,
       2,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kPartitioned,
       100 /* maxOutputBufferSize */);
 
@@ -1305,7 +1611,6 @@ TEST_F(UcxOutputQueueManagerTest, fullTransferCanAdmitMaterializedAggregate) {
       taskId,
       2,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kPartitioned,
       100 /* maxOutputBufferSize */);
 
@@ -1331,7 +1636,6 @@ TEST_F(
       taskId,
       4,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kPartitioned,
       100 /* maxOutputBufferSize */);
 
@@ -1361,7 +1665,6 @@ TEST_F(UcxOutputQueueManagerTest, broadcastInFlightIsRetained) {
       taskId,
       2,
       1,
-      false /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast,
       1 /* maxOutputBufferSize */);
   // Disable late-destination history so this case isolates the two committed
@@ -1407,7 +1710,7 @@ TEST_F(UcxOutputQueueManagerTest, broadcastInFlightIsRetained) {
 TEST_F(UcxOutputQueueManagerTest, arbitraryPreservesRowsAndTransferAccounting) {
   const std::string taskId = "adaptive.transport.arbitrary";
   auto task = initializeTask(
-      taskId, 2, 1, true, core::PartitionedOutputNode::Kind::kArbitrary);
+      taskId, 2, 1, core::PartitionedOutputNode::Kind::kArbitrary);
   std::vector<vector_size_t> received;
   auto receive = [&](int destination) {
     queueManager_->getDataWithQueue(
@@ -1444,7 +1747,7 @@ TEST_F(UcxOutputQueueManagerTest, arbitraryPreservesRowsAndTransferAccounting) {
 TEST_F(UcxOutputQueueManagerTest, arbitraryDrainsSharedPagesBeforeEnd) {
   const std::string taskId = "adaptive.transport.arbitrary.end";
   auto task = initializeTask(
-      taskId, 2, 1, true, core::PartitionedOutputNode::Kind::kArbitrary);
+      taskId, 2, 1, core::PartitionedOutputNode::Kind::kArbitrary);
   queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 11);
   queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 19);
   EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 2);

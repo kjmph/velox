@@ -55,7 +55,9 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
   /// UcxExchangeServer.
   void removeCommElem(std::shared_ptr<CommElement> commElem);
 
-  /// @brief Closes all registered communicators and drains the set.
+  /// @brief Force-closes all registered communication elements and drains the
+  /// set. The underlying endpoint is already failed (or is about to be
+  /// removed), so an element cannot run its wire-level graceful drain here.
   /// Uses swap-and-drain pattern: swaps communicators_ into a local copy
   /// under the lock, then iterates the copy without the lock.
   /// Must be called from the Communicator main loop thread ONLY.

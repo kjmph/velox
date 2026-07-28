@@ -47,6 +47,8 @@ constexpr uint64_t DATA_TAG = 0x03000000;
 constexpr uint64_t HANDSHAKE_RESPONSE_TAG = 0x04000000;
 constexpr uint64_t HANDSHAKE_ACK_TAG = 0x05000000;
 constexpr uint64_t CPU_ROW_ABORT_TAG = 0x06000000;
+constexpr uint64_t GPU_HANDSHAKE_ACK_TAG = 0x07000000;
+constexpr uint64_t GPU_ABORT_TAG = 0x08000000;
 
 // Implementation of the fowler-noll-vo hash function for 32 bits.
 uint32_t fnv1a_32(std::string_view s);
@@ -80,6 +82,19 @@ inline uint64_t getHandshakeAckTag(uint64_t taskHash) {
 // the normal final metadata record at the next sequence number.
 inline uint64_t getCpuRowAbortTag(uint64_t taskHash) {
   return (taskHash << 32) | CPU_ROW_ABORT_TAG;
+}
+
+// Gets the tag used for GPU data-endpoint ACK communication.
+// Note: taskHash is implicitly converted to 64 bits.
+inline uint64_t getGpuHandshakeAckTag(uint64_t taskHash) {
+  return (taskHash << 32) | GPU_HANDSHAKE_ACK_TAG;
+}
+
+// Gets the tag used by a GPU source to stop one producing partition.
+// The producer responds in-band: after draining its current send, it publishes
+// the normal final metadata record at the next sequence number.
+inline uint64_t getGpuAbortTag(uint64_t taskHash) {
+  return (taskHash << 32) | GPU_ABORT_TAG;
 }
 
 /// @brief Request that is sent from the client (UcxExchangeSource) to the
@@ -193,15 +208,57 @@ struct CpuRowAbortHeader {
 static_assert(std::is_standard_layout_v<CpuRowAbortHeader>);
 static_assert(sizeof(CpuRowAbortHeader) == 8);
 
+constexpr uint32_t kGpuHandshakeAckMagic = 0x4750414b; // "GPAK"
+constexpr uint16_t kGpuHandshakeAckVersion = 1;
+constexpr uint32_t kGpuAbortMagic = 0x47504142; // "GPAB"
+constexpr uint16_t kGpuAbortVersion = 1;
+
+/// GPU data-endpoint ACK. The source sends this after it has posted its first
+/// receive (or started polling the intra-process registry). The producer does
+/// not pull output until this ACK arrives.
+struct GpuHandshakeAckHeader {
+  uint32_t magic{kGpuHandshakeAckMagic};
+  uint16_t version{kGpuHandshakeAckVersion};
+  uint16_t headerSize{sizeof(GpuHandshakeAckHeader)};
+};
+
+/// Per-partition GPU abort request. The source drains the at-most-one committed
+/// packed table and then consumes the producer's sequenced final metadata
+/// marker before releasing receive requests and CUDA buffers.
+struct GpuAbortHeader {
+  uint32_t magic{kGpuAbortMagic};
+  uint16_t version{kGpuAbortVersion};
+  uint16_t headerSize{sizeof(GpuAbortHeader)};
+};
+
+static_assert(std::is_standard_layout_v<GpuHandshakeAckHeader>);
+static_assert(sizeof(GpuHandshakeAckHeader) == 8);
+static_assert(std::is_standard_layout_v<GpuAbortHeader>);
+static_assert(sizeof(GpuAbortHeader) == 8);
+
+enum class GpuHandshakeResponseStatus : uint8_t {
+  kAccepted = 0,
+  kTaskRemoved = 1,
+  kDuplicateServer = 2,
+  kServerUnavailable = 3,
+};
+
 /// @brief Response sent from server to source after handshake.
 /// The GPU exchange path uses this to report same-process intra-node transfer
 /// availability. CPU row exchange uses CpuRowHandshakeResponseHeader instead.
 struct HandshakeResponse {
   /// True if the GPU exchange source should use IntraNodeTransferRegistry.
   bool isIntraNodeTransfer{false};
-  /// Padding for alignment
-  uint8_t padding[7]{};
+  /// Admission result. This occupies a byte that was padding in the original
+  /// response, preserving the eight-byte wire layout for accepted handshakes.
+  GpuHandshakeResponseStatus status{GpuHandshakeResponseStatus::kAccepted};
+  /// Padding for alignment and future protocol extensions.
+  uint8_t padding[6]{};
 };
+
+static_assert(std::is_standard_layout_v<HandshakeResponse>);
+static_assert(sizeof(HandshakeResponse) == 8);
+static_assert(offsetof(HandshakeResponse, status) == 1);
 
 constexpr uint32_t kMagicNumber = 0x12345678;
 /// Maximum metadata buffer size for receiving. This should be large enough

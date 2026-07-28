@@ -315,6 +315,10 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// @brief Same as isFinished but must only be called when owning the lock.
   bool isFinishedLocked();
 
+  /// Returns the producing task state, or nullopt for an early placeholder.
+  /// The queue mutex is released before acquiring the Task lifecycle lock.
+  std::optional<exec::TaskState> taskState();
+
   /// @brief Deletes all queued data and makes all subsequent getData requests
   /// for 'destination' return empty results.
   void deleteResults(int destination);

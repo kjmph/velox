@@ -576,26 +576,28 @@ void UcxCpuRowExchangeSource::sendHandshake() {
       communicator_->kAmCallbackOwner, communicator_->kAmCpuCallbackId);
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
-  handshakeRequest_ = endpointRef_->endpoint_->amSendBuilder(
-      handshakeReq->data(),
-      handshakeReq->size(),
-      UCS_MEMORY_TYPE_HOST)
-      .receiverCallbackInfo(info)
-      .pythonFuture(false)
-      .callbackFunction(
-          [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+  handshakeRequest_ =
+      endpointRef_->endpoint_
+          ->amSendBuilder(
+              handshakeReq->data(), handshakeReq->size(), UCS_MEMORY_TYPE_HOST)
+          .receiverCallbackInfo(info)
+          .pythonFuture(false)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) {
             if (!callbackOnce->tryClaim()) {
               return;
             }
             if (auto self = weak.lock()) {
               self->enqueueStateEvent(
-                  self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
                     raw->onHandshake(status, std::move(arg));
                   });
             }
           })
-      .callbackData(handshakeReq)
-      .build();
+          .callbackData(handshakeReq)
+          .build();
 }
 
 void UcxCpuRowExchangeSource::onHandshake(
@@ -634,26 +636,30 @@ void UcxCpuRowExchangeSource::receiveHandshakeResponse() {
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
-  handshakeResponseRequest_ = endpointRef_->endpoint_->tagRecvBuilder(
-      responseBuffer->data(),
-      responseBuffer->size(),
-      ucxx::Tag{responseTag},
-      ucxx::TagMaskFull)
-      .pythonFuture(false)
-      .callbackFunction(
-          [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+  handshakeResponseRequest_ =
+      endpointRef_->endpoint_
+          ->tagRecvBuilder(
+              responseBuffer->data(),
+              responseBuffer->size(),
+              ucxx::Tag{responseTag},
+              ucxx::TagMaskFull)
+          .pythonFuture(false)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) {
             if (!callbackOnce->tryClaim()) {
               return;
             }
             if (auto self = weak.lock()) {
               self->enqueueStateEvent(
-                  self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
                     raw->onHandshakeResponse(status, std::move(arg));
                   });
             }
           })
-      .callbackData(responseBuffer)
-      .build();
+          .callbackData(responseBuffer)
+          .build();
 }
 
 void UcxCpuRowExchangeSource::onHandshakeResponse(
@@ -777,25 +783,26 @@ void UcxCpuRowExchangeSource::sendDataEndpointAck() {
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
-  dataEndpointAckRequest_ = endpointRef_->endpoint_->tagSendBuilder(
-      ack.get(),
-      sizeof(*ack),
-      ucxx::Tag{ackTag})
-      .pythonFuture(false)
-      .callbackFunction(
-          [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
+  dataEndpointAckRequest_ =
+      endpointRef_->endpoint_
+          ->tagSendBuilder(ack.get(), sizeof(*ack), ucxx::Tag{ackTag})
+          .pythonFuture(false)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) {
             if (!callbackOnce->tryClaim()) {
               return;
             }
             if (auto self = weak.lock()) {
               self->enqueueStateEvent(
-                  self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
                     raw->onDataEndpointAck(status, std::move(arg));
                   });
             }
           })
-      .callbackData(ack)
-      .build();
+          .callbackData(ack)
+          .build();
 }
 
 void UcxCpuRowExchangeSource::onDataEndpointAck(
@@ -831,23 +838,26 @@ void UcxCpuRowExchangeSource::sendAbort() {
   const uint64_t abortTag = getCpuRowAbortTag(partitionKeyHash_);
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
   auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
-  abortRequest_ = endpointRef_->endpoint_->tagSend(
-      abort.get(),
-      sizeof(*abort),
-      ucxx::Tag{abortTag},
-      false,
-      [weak, callbackOnce](ucs_status_t status, std::shared_ptr<void> arg) {
-        if (!callbackOnce->tryClaim()) {
-          return;
-        }
-        if (auto self = weak.lock()) {
-          self->enqueueStateEvent(
-              self, [raw = self.get(), status, arg = std::move(arg)]() mutable {
-                raw->onAbortSent(status, std::move(arg));
-              });
-        }
-      },
-      abort);
+  abortRequest_ =
+      endpointRef_->endpoint_
+          ->tagSendBuilder(abort.get(), sizeof(*abort), ucxx::Tag{abortTag})
+          .pythonFuture(false)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) {
+            if (!callbackOnce->tryClaim()) {
+              return;
+            }
+            if (auto self = weak.lock()) {
+              self->enqueueStateEvent(
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                    raw->onAbortSent(status, std::move(arg));
+                  });
+            }
+          })
+          .callbackData(abort)
+          .build();
 }
 
 void UcxCpuRowExchangeSource::onAbortSent(
@@ -969,15 +979,19 @@ void UcxCpuRowExchangeSource::getMetadata(uint32_t sequenceNumber) {
   uint64_t metadataTag = getMetadataTag(partitionKeyHash_, sequenceNumber);
 
   std::weak_ptr<UcxCpuRowExchangeSource> weak = weak_from_this();
-  auto request = endpointRef_->endpoint_->tagRecvBuilder(
-      reinterpret_cast<void*>(metadataReq->buffer.data()),
-      kMaxMetaBufSize,
-      ucxx::Tag{metadataTag},
-      ucxx::TagMaskFull)
-      .pythonFuture(false)
-      .callbackFunction(
-          [weak, sequenceNumber, task = partitionKey_.toString()](
-              ucs_status_t status, std::shared_ptr<void> arg) {
+  auto request =
+      endpointRef_->endpoint_
+          ->tagRecvBuilder(
+              reinterpret_cast<void*>(metadataReq->buffer.data()),
+              kMaxMetaBufSize,
+              ucxx::Tag{metadataTag},
+              ucxx::TagMaskFull)
+          .pythonFuture(false)
+          .callbackFunction([weak,
+                             sequenceNumber,
+                             task = partitionKey_.toString()](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) {
             auto context =
                 std::static_pointer_cast<CpuRowMetadataReceiveContext>(arg);
             if (!context->callbackOnce.tryClaim()) {
@@ -998,8 +1012,8 @@ void UcxCpuRowExchangeSource::getMetadata(uint32_t sequenceNumber) {
                   });
             }
           })
-      .callbackData(metadataReq)
-      .build();
+          .callbackData(metadataReq)
+          .build();
   metadataRequests_.push_back(std::move(request));
 }
 
@@ -1116,41 +1130,47 @@ void UcxCpuRowExchangeSource::startDataReceive(
   // same frame; the last unique completion invokes onData with UCS_OK (or the
   // first error seen).
   for (size_t i = 0; i < numFrames; ++i) {
-    auto req = endpointRef_->endpoint_->tagRecvBuilder(
-        ptr->frameBufs[i].get(),
-        ptr->metadata.frameSizes[i],
-        ucxx::Tag{dataTag},
-        ucxx::TagMaskFull)
-        .pythonFuture(false)
-        .callbackFunction(
-            [weak, frameIndex = i, task = partitionKey_.toString()](
-                ucs_status_t status, std::shared_ptr<void> arg) {
-              auto state = std::static_pointer_cast<DataAndMetadata>(arg);
-              const auto result = state->completion->complete(frameIndex, status);
-              if (result.state == CpuRowFrameCompletionTracker::State::kDuplicate) {
-                LOG(WARNING)
-                    << "Ignoring duplicate CPU data receive completion for " << task
-                    << " sequence=" << state->sequenceNumber
-                    << " frame=" << frameIndex
-                    << " status=" << ucs_status_string(status);
-                return;
-              }
-              if (result.state == CpuRowFrameCompletionTracker::State::kPending) {
-                return;
-              }
-              if (auto self = weak.lock()) {
-                self->enqueueStateEvent(
-                    self,
-                    [raw = self.get(),
-                     sequenceNumber = state->sequenceNumber,
-                     finalStatus = result.finalStatus,
-                     arg = std::move(arg)]() mutable {
-                      raw->onData(sequenceNumber, finalStatus, std::move(arg));
-                    });
-              }
-            })
-        .callbackData(ptr)
-        .build();
+    auto req =
+        endpointRef_->endpoint_
+            ->tagRecvBuilder(
+                ptr->frameBufs[i].get(),
+                ptr->metadata.frameSizes[i],
+                ucxx::Tag{dataTag},
+                ucxx::TagMaskFull)
+            .pythonFuture(false)
+            .callbackFunction(
+                [weak, frameIndex = i, task = partitionKey_.toString()](
+                    ucs_status_t status, std::shared_ptr<void> arg) {
+                  auto state = std::static_pointer_cast<DataAndMetadata>(arg);
+                  const auto result =
+                      state->completion->complete(frameIndex, status);
+                  if (result.state ==
+                      CpuRowFrameCompletionTracker::State::kDuplicate) {
+                    LOG(WARNING)
+                        << "Ignoring duplicate CPU data receive completion for "
+                        << task << " sequence=" << state->sequenceNumber
+                        << " frame=" << frameIndex
+                        << " status=" << ucs_status_string(status);
+                    return;
+                  }
+                  if (result.state ==
+                      CpuRowFrameCompletionTracker::State::kPending) {
+                    return;
+                  }
+                  if (auto self = weak.lock()) {
+                    self->enqueueStateEvent(
+                        self,
+                        [raw = self.get(),
+                         sequenceNumber = state->sequenceNumber,
+                         finalStatus = result.finalStatus,
+                         arg = std::move(arg)]() mutable {
+                          raw->onData(
+                              sequenceNumber, finalStatus, std::move(arg));
+                        });
+                  }
+                })
+            .callbackData(ptr)
+            .build();
     dataRequests_.push_back(std::move(req));
   }
 }

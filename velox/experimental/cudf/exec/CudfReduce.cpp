@@ -308,6 +308,9 @@ cudf_velox::DecimalSumStateColumns reduceRawDecimalSumCount(
     return cudf_velox::reduceDecimal64SumCount(
         inputCol, numeric::scale_type{inputCol.type().scale()}, stream, mr);
   }
+  std::unique_ptr<cudf::column> castedInput;
+  inputCol = cudf_velox::castDecimalInputToDecimal128(
+      inputCol, castedInput, stream);
   auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
   auto sumScalar =
       cudf::reduce(inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());

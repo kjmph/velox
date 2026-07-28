@@ -239,8 +239,9 @@ TEST_F(
   // logical column, rather than exposing allocator padding or capacity.
   rmm::device_buffer data(
       dataBytes + 128, stream.view(), cudf::get_current_device_resource_ref());
-  rmm::device_buffer nullMask(
-      nullMaskBytes + 128,
+  auto nullMask = cudf::create_null_mask(
+      (nullMaskBytes + 128) * 8,
+      cudf::mask_state::UNINITIALIZED,
       stream.view(),
       cudf::get_current_device_resource_ref());
   const void* originalData = data.data();
@@ -286,26 +287,35 @@ TEST_F(CudfVectorTest, ownedTableEstimateIncludesStringAndNestedChildren) {
         cudf::get_current_device_resource_ref());
   };
 
+  auto makeNullMask = [&](std::size_t bytes) {
+    return cudf::create_null_mask(
+        bytes * 8,
+        bytes == 0 ? cudf::mask_state::UNALLOCATED
+                   : cudf::mask_state::UNINITIALIZED,
+        stream.view(),
+        cudf::get_current_device_resource_ref());
+  };
+
   std::vector<std::unique_ptr<cudf::column>> stringChildren;
   stringChildren.push_back(
       std::make_unique<cudf::column>(
           cudf::data_type{cudf::type_id::INT32},
           kNumStrings + 1,
           makeOversizedBuffer(stringOffsetsBytes),
-          rmm::device_buffer{},
+          makeNullMask(0),
           0));
   stringChildren.push_back(
       std::make_unique<cudf::column>(
           cudf::data_type{cudf::type_id::INT8},
           kNumChars,
           makeOversizedBuffer(charsBytes),
-          rmm::device_buffer{},
+          makeNullMask(0),
           0));
   auto strings = std::make_unique<cudf::column>(
       cudf::data_type{cudf::type_id::STRING},
       kNumStrings,
       rmm::device_buffer{},
-      rmm::device_buffer{},
+      makeNullMask(0),
       0,
       std::move(stringChildren));
 
@@ -315,7 +325,7 @@ TEST_F(CudfVectorTest, ownedTableEstimateIncludesStringAndNestedChildren) {
           cudf::data_type{cudf::type_id::INT32},
           kNumLists + 1,
           makeOversizedBuffer(listOffsetsBytes),
-          rmm::device_buffer{},
+          makeNullMask(0),
           0));
   listChildren.push_back(std::move(strings));
 
@@ -325,7 +335,7 @@ TEST_F(CudfVectorTest, ownedTableEstimateIncludesStringAndNestedChildren) {
           cudf::data_type{cudf::type_id::LIST},
           kNumLists,
           rmm::device_buffer{},
-          makeOversizedBuffer(listNullMaskBytes),
+          makeNullMask(listNullMaskBytes + 128),
           0,
           std::move(listChildren)));
   auto table = std::make_unique<cudf::table>(std::move(columns));
@@ -381,7 +391,7 @@ TEST_F(CudfVectorTest, rebindOwnedTableDeallocationStream) {
   vector.reset();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
 }
 
 TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
@@ -407,7 +417,7 @@ TEST_F(CudfVectorTest, rebindPackedTableDeallocationStream) {
   vector.reset();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
 }
 
 TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
@@ -430,7 +440,7 @@ TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
   auto materialized = vector.release();
 
   EXPECT_GT(resource.deallocationCount(), 0);
-  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.get());
+  EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
   targetStream.view().sync();
   EXPECT_EQ(materialized->num_columns(), 1);
   EXPECT_EQ(materialized->num_rows(), 4);
@@ -446,7 +456,7 @@ TEST_F(CudfVectorTest, packedTableReleaseRunsCallbackAfterBackingStorageReset) {
       table->view(),
       stream.view(),
       rmm::to_device_async_resource_ref_checked(&resource));
-  stream.view().synchronize();
+  stream.view().sync();
   auto tableView = cudf::unpack(packedColumns);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedColumns)});
@@ -486,7 +496,7 @@ TEST_F(
       table->view(),
       stream.view(),
       rmm::to_device_async_resource_ref_checked(&resource));
-  stream.view().synchronize();
+  stream.view().sync();
   auto tableView = cudf::unpack(packedColumns);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedColumns)});
@@ -520,7 +530,7 @@ TEST_F(CudfVectorTest, sharedOwnerReleaseDropsOwnerAfterMaterializing) {
       makeTable(
           stream.view(), rmm::to_device_async_resource_ref_checked(&resource))
           .release());
-  stream.view().synchronize();
+  stream.view().sync();
 
   auto tableView = owner->view();
   const auto numRows = owner->num_rows();

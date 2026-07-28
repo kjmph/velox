@@ -160,6 +160,27 @@ cudf::ast::literal makeRescaledIntegerLiteral(
       columnType, variant(static_cast<NativeT>(value)), scalars);
 }
 
+const cudf::ast::expression& buildEqualityExpr(
+    cudf::ast::tree& tree,
+    const cudf::ast::expression& columnRef,
+    const cudf::ast::expression& literal,
+    bool isDecimal) {
+  using Op = cudf::ast::ast_operator;
+  using Operation = cudf::ast::operation;
+
+  if (!isDecimal) {
+    return tree.push(Operation{Op::EQUAL, columnRef, literal});
+  }
+
+  // cuDF's Parquet Bloom-filter path cannot probe fixed-point literals. Keep
+  // the equivalent row and statistics predicate while avoiding that optional
+  // optimization.
+  auto const& lower =
+      tree.push(Operation{Op::GREATER_EQUAL, columnRef, literal});
+  auto const& upper = tree.push(Operation{Op::LESS_EQUAL, columnRef, literal});
+  return tree.push(Operation{Op::NULL_LOGICAL_AND, lower, upper});
+}
+
 template <
     typename RangeT,
     typename ScalarT,
@@ -294,7 +315,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
         return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
       }
       auto const& literal = addLiteral(rescaledLower.floor);
-      return tree.push(Operation{Op::EQUAL, columnRef, literal});
+      return buildEqualityExpr(
+          tree, columnRef, literal, columnTypePtr->isDecimal());
     }
 
     // Range comparison: column >= lower AND column <= upper.
@@ -389,7 +411,8 @@ const cudf::ast::expression& buildValuesListExpr(
           tree.push(Operation{Op::NOT_EQUAL, columnRef, *literal});
       exprVec.push_back(&notEqualExpr);
     } else {
-      exprVec.push_back(&tree.push(Operation{Op::EQUAL, columnRef, *literal}));
+      exprVec.push_back(&buildEqualityExpr(
+          tree, columnRef, *literal, columnTypePtr->isDecimal()));
     }
   }
 
@@ -479,8 +502,8 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
       const auto& literal = makeRescaledIntegerLiteral<Kind>(
           rescaled.floor, columnTypePtr, scalars, decimalType);
       auto const& cudfLiteral = tree.push(literal);
-      exprVec.push_back(
-          &tree.push(Operation{Op::EQUAL, columnRef, cudfLiteral}));
+      exprVec.push_back(&buildEqualityExpr(
+          tree, columnRef, cudfLiteral, columnTypePtr->isDecimal()));
     }
 
     if (exprVec.empty()) {

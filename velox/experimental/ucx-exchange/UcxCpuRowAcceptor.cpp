@@ -234,25 +234,24 @@ void UcxCpuRowAcceptor::cStyleAMCallback(
   // address so the source can create the reciprocal data endpoint before
   // posting metadata receives.
   auto callbackOnce = std::make_shared<CpuRowCallbackOnce>();
-  bootstrapEpRef->endpoint_->tagSendBuilder(
-      response->data(),
-      response->size(),
-      ucxx::Tag{responseTag})
+  bootstrapEpRef->endpoint_
+      ->tagSendBuilder(
+          response->data(), response->size(), ucxx::Tag{responseTag})
       .pythonFuture(false)
-      .callbackFunction(
-          [response, callbackOnce, keyStr = key.toString()](
-              ucs_status_t status, std::shared_ptr<void> /*arg*/) {
-            if (!callbackOnce->tryClaim()) {
-              LOG(WARNING)
-                  << "Ignoring duplicate CPU HandshakeResponse send completion for "
-                  << keyStr;
-              return;
-            }
-            if (status != UCS_OK) {
-              LOG(WARNING) << "Failed to send CPU HandshakeResponse to " << keyStr
-                           << ": " << ucs_status_string(status);
-            }
-          })
+      .callbackFunction([response, callbackOnce, keyStr = key.toString()](
+                            ucs_status_t status,
+                            std::shared_ptr<void> /*arg*/) {
+        if (!callbackOnce->tryClaim()) {
+          LOG(WARNING)
+              << "Ignoring duplicate CPU HandshakeResponse send completion for "
+              << keyStr;
+          return;
+        }
+        if (status != UCS_OK) {
+          LOG(WARNING) << "Failed to send CPU HandshakeResponse to " << keyStr
+                       << ": " << ucs_status_string(status);
+        }
+      })
       .callbackData(response)
       .build();
 }

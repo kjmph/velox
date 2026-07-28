@@ -23,14 +23,13 @@
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <tuple>
 #include <vector>
 #include "velox/common/EnumDeclare.h"
-#include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
@@ -39,16 +38,19 @@ namespace facebook::velox::ucx_exchange {
 
 class UcxExchangeServer
     : public CommElement,
+      public UcxExchangeServerLifecycle,
       public std::enable_shared_from_this<UcxExchangeServer> {
  public:
   // Public for logging and the VELOX_DEFINE_EMBEDDED_ENUM_NAME names map.
   enum class ServerState : uint32_t {
     Created,
+    WaitingForDataEndpointAck,
     ReadyToTransfer,
     WaitingForDataFromQueue,
     DataReady,
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
+    WaitingForFinalMetadataComplete,
     Done,
   };
 
@@ -70,9 +72,27 @@ class UcxExchangeServer
 
   void close() noexcept override;
 
+  bool supportsCommunicatorShutdownDrain() const override {
+    return true;
+  }
+
+  void beginCommunicatorShutdownDrain() override {
+    requestAbort();
+  }
+
+  void forceCloseForShutdown() override;
+
+  void requestAbort() override;
+
+  bool activate() override;
+
+  bool isClosed() const override {
+    return closed_.load(std::memory_order_acquire);
+  }
+
   std::string toString();
 
-  const PartitionKey& getPartitionKey() const {
+  const PartitionKey& getPartitionKey() const override {
     return partitionKey_;
   }
 
@@ -82,6 +102,33 @@ class UcxExchangeServer
   }
 
  private:
+  void processStateMachine();
+  void handleCallbackDispatchFailure() noexcept;
+  void handleProcessFailure() noexcept;
+  void retireRequest(std::shared_ptr<ucxx::Request>& request);
+  template <typename Event>
+  void dispatchCompletion(
+      const std::shared_ptr<UcxExchangeServer>& self,
+      Event&& event) noexcept {
+    if (!enqueueStateEvent(
+            self, [raw = this, event = std::forward<Event>(event)]() mutable {
+              try {
+                event();
+              } catch (...) {
+                raw->handleProcessFailure();
+              }
+            })) {
+      handleCallbackDispatchFailure();
+    }
+  }
+  std::atomic<bool> callbackDispatchFailed_{false};
+  bool cleanupComplete_{false};
+  enum class AdmissionState : uint8_t {
+    Pending,
+    Accepted,
+    Rejected,
+  };
+
   explicit UcxExchangeServer(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
@@ -91,35 +138,71 @@ class UcxExchangeServer
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
 
+  /// Posts the data-endpoint ACK receive after admission and before the
+  /// accepted handshake response is sent.
+  void postDataEndpointAckReceive();
+
+  /// Posts the per-partition abort receive after admission and before the
+  /// accepted handshake response is sent.
+  void postAbortReceive();
+
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
+
+  /// Handles data becoming available from the output queue.
+  void onDataAvailable(
+      std::shared_ptr<cudf::packed_columns> data,
+      vector_size_t numRows);
+
+  /// Handles completion of one non-terminal metadata send.
+  void metadataSendComplete(ucs_status_t status);
 
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status);
 
-  /// Handles metadata completion on the serialized state-machine thread.
-  void metadataSendComplete(ucs_status_t status, uint64_t metadataTag);
+  /// Sends the ordinary sequenced end-of-stream marker.
+  void sendFinalMetadata();
 
-  /// Contains failures while handing a C/UCXX callback to process().
-  void handleCallbackDispatchFailure(const char* callback) noexcept;
+  /// Handles completion of the terminal metadata send.
+  void finalMetadataComplete(ucs_status_t status);
 
-  /// Contains all other state-machine failures so Communicator::run() cannot
-  /// be unwound by an exchange-specific allocation or lifecycle error.
-  void handleProcessFailure(const char* error) noexcept;
+  /// Handles the data-endpoint ACK.
+  void onDataEndpointAck(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Handles a per-partition abort request.
+  void onAbortRequest(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Stops queue pulls, drains the committed transfer, and publishes the
+  /// ordinary sequenced end-of-stream marker.
+  void processAbort();
+
+  /// Starts one asynchronous output-queue request.
+  void requestData();
+
+  /// Installs a callback on the stable producer queue. A callback that races
+  /// server destruction releases any dequeued in-flight accounting itself.
+  void installDataCallback();
+
+  /// Completes a remote data bundle once both tag sends have completed.
+  void maybeCompleteRemoteSend();
+
+  /// Polls the current intra-process retrieval future.
+  bool pollIntraNodeRetrieve();
 
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
   void onIntraNodeRetrieveComplete();
 
-  /// Releases a committed intra-node payload exactly once.
-  void releaseIntraNodeInFlightBytes();
-
-  /// Releases a dequeued payload that was never committed to a transport.
+  /// Releases a dequeued packed table that was never committed to transport.
   void releasePendingData();
 
-  /// Releases a completed phase request immediately, or hands a genuinely
-  /// in-flight request to Communicator until UCXX marks it complete.
-  void retireRequest(std::shared_ptr<ucxx::Request>& request);
+  void releaseIntraNodeInFlightBytes();
+
+  /// Deletes this destination from the stable producer queue.
+  void deleteOutputResults();
+
+  /// Advances to Done after the terminal marker has completed.
+  void maybeFinish();
 
   /// @brief Sets the new state of this exchange server using
   /// sequential consistency. Logs transitions at VLOG(2).
@@ -140,24 +223,23 @@ class UcxExchangeServer
   /// via IntraNodeTransferRegistry instead of UCXX transfer.
   bool isIntraNodeTransfer_{false};
 
-  std::atomic<ServerState> state_{ServerState::Created};
+  std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};
-  /// Logical rows in 'dataPtr_', taken from the output queue rather than from
-  /// the packed table, which reports zero rows when it has no columns.
   vector_size_t dataNumRows_{0};
-  /// Protects dataPtr_. Must be recursive because sendData() holds the lock
-  /// when calling tagSend(), and for small messages UCX completes inline via
-  /// its fast-completion path, firing the sendComplete() callback on the same
-  /// thread while the lock is still held.
+  /// Protects dataPtr_ across queue callbacks, state-machine dispatch, and
+  /// close/error cleanup paths.
   std::recursive_mutex dataMutex_;
-  /// True while the communicator thread is inside process(). Inline UCXX
-  /// callbacks defer emergency close until the active send call has returned
-  /// and published its Request member.
-  std::atomic<bool> processing_{false};
   std::atomic<bool> closed_{false};
-  /// Protected by processMutex_. A separate guard makes cleanup retryable
-  /// after closed_ has already stopped new work.
-  bool cleanupComplete_{false};
+  std::atomic<bool> abortRequested_{false};
+  std::atomic<bool> activated_{false};
+  std::atomic<AdmissionState> admissionState_{AdmissionState::Pending};
+
+  bool dataEndpointAckReceived_{false};
+  bool normalMetadataInFlight_{false};
+  bool dataSendInFlight_{false};
+  bool finalMetadataSent_{false};
+  bool finalMetadataCompleted_{false};
+  bool outputResultsDeleted_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
   std::future<void> intraNodeRetrieveFuture_;
@@ -174,17 +256,18 @@ class UcxExchangeServer
   // and must therefore exist until the upcall is done.
   std::shared_ptr<ucxx::Request> metaRequest_{nullptr};
   std::shared_ptr<ucxx::Request> dataRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> dataEndpointAckRequest_{nullptr};
+  std::shared_ptr<ucxx::Request> abortRequest_{nullptr};
 
   std::chrono::time_point<std::chrono::high_resolution_clock> sendStart_;
   std::size_t bytes_{0};
-
-  // Keeps the output queue alive across manager removal and async callbacks so
-  // committed byte accounting can always be released exactly once.
-  std::shared_ptr<UcxOutputQueue> outputQueue_;
-  std::atomic<bool> intraNodeBytesInFlight_{false};
-  bool outputResultsDeleted_{false};
+  bool intraNodeBytesInFlight_{false};
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
+  // Early placeholder queues are initialized in place and task IDs cannot be
+  // reused after removal. Keep this exact queue alive so completion callbacks
+  // can release in-flight accounting after manager removal.
+  std::shared_ptr<UcxOutputQueue> outputQueue_;
 };
 
 } // namespace facebook::velox::ucx_exchange

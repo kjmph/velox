@@ -73,7 +73,7 @@ void EndpointRef::closeAndDrainCommunicators() {
   for (auto& weakElem : localCopy) {
     if (std::shared_ptr<CommElement> spt = weakElem.lock()) {
       std::lock_guard<std::recursive_mutex> lock(spt->processMutex_);
-      spt->close();
+      spt->forceCloseForShutdown();
     }
   }
   // localCopy is destroyed here, releasing all weak_ptrs.

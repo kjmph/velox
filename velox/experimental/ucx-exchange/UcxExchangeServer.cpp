@@ -14,12 +14,11 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+#include <folly/ScopeGuard.h>
 #include <glog/logging.h>
-#include <cuda/stream>
+#include <atomic>
 #include <limits>
-#include <sstream>
-#include "cuda_runtime.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
@@ -33,6 +32,8 @@ serverStateNames() {
       F14FastMap<UcxExchangeServer::ServerState, std::string_view>
           kNames = {
               {UcxExchangeServer::ServerState::Created, "Created"},
+              {UcxExchangeServer::ServerState::WaitingForDataEndpointAck,
+               "WaitingForDataEndpointAck"},
               {UcxExchangeServer::ServerState::ReadyToTransfer,
                "ReadyToTransfer"},
               {UcxExchangeServer::ServerState::WaitingForDataFromQueue,
@@ -42,6 +43,8 @@ serverStateNames() {
                "WaitingForSendComplete"},
               {UcxExchangeServer::ServerState::WaitingForIntraNodeRetrieve,
                "WaitingForIntraNodeRetrieve"},
+              {UcxExchangeServer::ServerState::WaitingForFinalMetadataComplete,
+               "WaitingForFinalMetadataComplete"},
               {UcxExchangeServer::ServerState::Done, "Done"},
           };
   return kNames;
@@ -53,15 +56,13 @@ VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     ServerState,
     serverStateNames)
 
-// Context wrappers for UCXX tagSend callbackData. These decouple the request
-// lifetime from the buffer lifetime so payload memory is freed promptly after
-// DMA completes even if cleanup must temporarily retain an in-flight request.
+// Context wrappers for UCXX tagSend callbackData. These decouple the
+// ucxx::Request lifetime (which must survive for UCP wireup replay) from
+// the buffer lifetime.
 //
-// The Request holds a shared_ptr to the context via callbackData. The
-// context holds a shared_ptr to the actual buffer. When the send completion
-// callback fires, it moves the buffer out of the context, releasing the GPU
-// (or CPU) memory. The context remains alive as an empty shell for the
-// lifetime of the Request, which is safe and costs negligible memory.
+// The Request holds a shared_ptr to the context via callbackData. The context
+// holds a shared_ptr to the actual buffer until the UCXX completion callback
+// releases it.
 struct MetaSendContext {
   std::shared_ptr<uint8_t> metadata;
   std::atomic<bool> callbackClaimed{false};
@@ -85,33 +86,15 @@ struct DataSendContext {
     return callbackClaimed.compare_exchange_strong(
         expected, true, std::memory_order_acq_rel);
   }
-
-  void releaseAccounting() {
-    data.reset();
-    outputQueue->releaseInFlightBytes(destination, bytes, 1);
-  }
 };
 
-struct DequeuedDataContext {
-  std::shared_ptr<UcxOutputQueue> outputQueue;
-  std::shared_ptr<cudf::packed_columns> data;
-  vector_size_t numRows{0};
-  int destination{0};
+struct ControlReceiveCallbackOnce {
   std::atomic<bool> callbackClaimed{false};
 
-  bool tryClaimCallback() {
+  bool tryClaim() {
     bool expected = false;
     return callbackClaimed.compare_exchange_strong(
         expected, true, std::memory_order_acq_rel);
-  }
-
-  void releaseAccounting() {
-    if (!data) {
-      return;
-    }
-    outputQueue->releaseInFlightBytes(
-        destination, static_cast<int64_t>(data->gpu_data->size()), 1);
-    data.reset();
   }
 };
 
@@ -128,7 +111,7 @@ UcxExchangeServer::UcxExchangeServer(
     std::shared_ptr<EndpointRef> endpointRef,
     const PartitionKey& key,
     bool isIntraNodeTransfer)
-    : CommElement(communicator, endpointRef),
+    : CommElement(communicator, endpointRef, true),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
@@ -154,365 +137,207 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::create(
 }
 
 void UcxExchangeServer::process() {
-  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
-  processing_.store(true, std::memory_order_release);
-  struct ProcessingGuard {
-    std::atomic<bool>& processing;
-    ~ProcessingGuard() {
-      processing.store(false, std::memory_order_release);
-    }
-  } processingGuard{processing_};
-
+  std::lock_guard<std::recursive_mutex> lock(processMutex_);
   try {
-    // Callback threads only enqueue state events. Apply those events under the
-    // same exclusion as the state machine and close/error cleanup.
-    try {
-      drainStateEvents();
-    } catch (const std::exception& error) {
-      LOG(ERROR) << "@" << partitionKey_.taskId
-                 << " failed to dispatch exchange-server callback: "
-                 << error.what();
-      setState(ServerState::Done);
-    } catch (...) {
-      LOG(ERROR) << "@" << partitionKey_.taskId
-                 << " failed to dispatch exchange-server callback";
-      setState(ServerState::Done);
+    if (callbackDispatchFailed_.exchange(false, std::memory_order_acq_rel)) {
+      handleProcessFailure();
+      return;
     }
+    processStateMachine();
+  } catch (...) {
+    handleProcessFailure();
+  }
+}
 
-    // Check if close() was called - avoid processing if we're shutting down.
+void UcxExchangeServer::handleCallbackDispatchFailure() noexcept {
+  callbackDispatchFailed_.store(true, std::memory_order_release);
+  try {
+    communicator_->addToWorkQueue(getSelfPtr());
+  } catch (...) {
+  }
+}
+
+void UcxExchangeServer::handleProcessFailure() noexcept {
+  // A partially submitted bundle cannot be repaired by sending a final marker
+  // alone. Endpoint cleanup force-closes every sibling and all exact receives.
+  try {
+    if (endpointRef_) {
+      communicator_->deferEndpointCleanup(endpointRef_);
+    }
+  } catch (...) {
+  }
+  state_.store(ServerState::Done, std::memory_order_release);
+  close();
+}
+
+void UcxExchangeServer::retireRequest(std::shared_ptr<ucxx::Request>& request) {
+  if (!request) {
+    return;
+  }
+  if (request->isCompleted()) {
+    request.reset();
+    return;
+  }
+
+  // Preserve our reference until insertion succeeds. Incomplete UCXX callback
+  // state remains communicator-owned until isCompleted() becomes true.
+  communicator_->deferRequestCleanup(request);
+  request.reset();
+}
+
+void UcxExchangeServer::processStateMachine() {
+  while (true) {
+    drainStateEvents();
     if (closed_.load(std::memory_order_acquire)) {
       if (!cleanupComplete_) {
         close();
       }
       return;
     }
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      processAbort();
+      return;
+    }
+    if (!activated_.load(std::memory_order_acquire)) {
+      return;
+    }
+
     switch (state_) {
       case ServerState::Created:
-        setState(ServerState::ReadyToTransfer);
-        communicator_->addToWorkQueue(getSelfPtr());
-        break;
-      case ServerState::ReadyToTransfer: {
-        // Fetch the data from UcxQueueManager and store it in the dataPtr_;
-        setState(ServerState::WaitingForDataFromQueue);
-        // Register the callback with the destination queue to get data.
-        // If the queue doesn't exist yet, getData will create an empty
-        // queue and the callback will be triggered once the corresponding
-        // source task has initialized the queue and added data to it.
-        // Use weak_ptr to prevent use-after-free if close() is called during
-        // callback
-        std::weak_ptr<UcxExchangeServer> weakQueue = weak_from_this();
-        const auto destination = partitionKey_.destination;
-        auto callbackContext = std::make_shared<DequeuedDataContext>();
-        auto outputQueue = queueMgr_->getDataWithQueue(
-            partitionKey_.taskId,
-            partitionKey_.destination,
-            [weakQueue, destination, callbackContext](
-                std::shared_ptr<UcxOutputQueue> stableQueue,
-                std::shared_ptr<cudf::packed_columns> data,
-                vector_size_t numRows,
-                std::vector<int64_t> /*remainingBytes*/) {
-              auto self = weakQueue.lock();
-              if (!self) {
-                if (data) {
-                  stableQueue->releaseInFlightBytes(
-                      destination,
-                      static_cast<int64_t>(data->gpu_data->size()),
-                      1);
-                }
-                return;
-              }
-              // Serialize the enqueue-or-release decision with close(). This
-              // prevents close from draining and unregistering between a
-              // callback's closed check and its state-event enqueue.
-              std::lock_guard<std::recursive_mutex> processLock(
-                  self->processMutex_);
-              if (self->closed_.load(std::memory_order_acquire)) {
-                if (data) {
-                  stableQueue->releaseInFlightBytes(
-                      destination,
-                      static_cast<int64_t>(data->gpu_data->size()),
-                      1);
-                }
-                return;
-              }
-              callbackContext->outputQueue = std::move(stableQueue);
-              callbackContext->data = std::move(data);
-              callbackContext->numRows = numRows;
-              callbackContext->destination = destination;
-              const bool dispatched = self->enqueueStateEvent(
-                  self, [raw = self.get(), callbackContext]() {
-                    try {
-                      if (!callbackContext->tryClaimCallback()) {
-                        return;
-                      }
-                      if (raw->closed_.load(std::memory_order_acquire)) {
-                        callbackContext->releaseAccounting();
-                        return;
-                      }
-
-                      std::lock_guard<std::recursive_mutex> lock(
-                          raw->dataMutex_);
-                      if (raw->dataPtr_) {
-                        LOG(ERROR) << "@" << raw->partitionKey_.taskId
-                                   << " received data while a prior payload is "
-                                      "still pending";
-                        callbackContext->releaseAccounting();
-                        raw->setState(ServerState::Done);
-                        return;
-                      }
-                      raw->outputQueue_ = callbackContext->outputQueue;
-                      raw->dataPtr_ = std::move(callbackContext->data);
-                      raw->dataNumRows_ = callbackContext->numRows;
-                      VLOG(3) << "@" << raw->partitionKey_.taskId
-                              << " Found data for client: "
-                              << raw->partitionKey_.toString();
-                      raw->setState(ServerState::DataReady);
-                    } catch (...) {
-                      // If ownership was not moved into dataPtr_, make one
-                      // exact accounting attempt before terminating.
-                      if (callbackContext->data) {
-                        try {
-                          callbackContext->releaseAccounting();
-                        } catch (...) {
-                        }
-                      }
-                      raw->handleCallbackDispatchFailure(
-                          "output queue state event");
-                    }
-                  });
-              if (!dispatched) {
-                // deque::push_back has a strong exception guarantee. The claim
-                // also protects against a work-queue failure after insertion:
-                // a later dispatch observes that cleanup already won.
-                if (callbackContext->tryClaimCallback()) {
-                  try {
-                    callbackContext->releaseAccounting();
-                  } catch (...) {
-                    // Preserve the callback boundary even if invariant cleanup
-                    // itself detects corrupted accounting.
-                  }
-                }
-                self->handleCallbackDispatchFailure("output queue");
-              }
-            });
-        {
-          std::lock_guard<std::recursive_mutex> lock(dataMutex_);
-          outputQueue_ = std::move(outputQueue);
+        if (!dataEndpointAckReceived_) {
+          setState(ServerState::WaitingForDataEndpointAck);
+          return;
         }
-        this->communicator_->addToWorkQueue(getSelfPtr());
-      } break;
+        setState(ServerState::ReadyToTransfer);
+        continue;
+      case ServerState::WaitingForDataEndpointAck:
+        return;
+      case ServerState::ReadyToTransfer:
+        requestData();
+        return;
       case ServerState::WaitingForDataFromQueue:
-        // Waiting for data is handled by an upcall from the data queue. Nothing
-        // to do
-        break;
+        return;
       case ServerState::DataReady:
         sendData();
-        break;
+        return;
       case ServerState::WaitingForSendComplete:
-        // Waiting for send complete is handled by an upcall from UCXX. Nothing
-        // to do
-        break;
+        return;
       case ServerState::WaitingForIntraNodeRetrieve:
-        // Intra-node transfer: check if the source has retrieved the data
-        if (intraNodeRetrieveFuture_.valid()) {
-          auto status =
-              intraNodeRetrieveFuture_.wait_for(std::chrono::milliseconds(0));
-          if (status == std::future_status::ready) {
-            try {
-              intraNodeRetrieveFuture_.get(); // Clear the future
-            } catch (const IntraNodeTransferCancelled&) {
-              VLOG(2) << "@" << partitionKey_.taskId
-                      << " intra-node destination cancelled sequence "
-                      << sequenceNumber_;
-              releaseIntraNodeInFlightBytes();
-              setState(ServerState::Done);
-              communicator_->addToWorkQueue(getSelfPtr());
-              break;
-            } catch (const std::exception& error) {
-              LOG(ERROR) << "@" << partitionKey_.taskId
-                         << " intra-node retrieval failed: " << error.what();
-              releaseIntraNodeInFlightBytes();
-              setState(ServerState::Done);
-              communicator_->addToWorkQueue(getSelfPtr());
-              break;
-            } catch (...) {
-              LOG(ERROR) << "@" << partitionKey_.taskId
-                         << " intra-node retrieval failed";
-              releaseIntraNodeInFlightBytes();
-              setState(ServerState::Done);
-              communicator_->addToWorkQueue(getSelfPtr());
-              break;
-            }
-            intraNodePollCount_ = 0;
-            onIntraNodeRetrieveComplete();
-          } else {
-            // Not ready yet, re-queue to check later
-            ++intraNodePollCount_;
-            if (intraNodePollCount_ % 100 == 0) {
-              VLOG(2) << "[INTRA] [ExSrv " << partitionKey_.toString()
-                      << " seq=" << sequenceNumber_
-                      << "] still waiting for source retrieval, polls="
-                      << intraNodePollCount_;
-            }
-            communicator_->addToWorkQueue(getSelfPtr());
-          }
+        if (pollIntraNodeRetrieve()) {
+          continue;
         }
-        break;
+        return;
+      case ServerState::WaitingForFinalMetadataComplete:
+        if (isIntraNodeTransfer_) {
+          if (pollIntraNodeRetrieve()) {
+            maybeFinish();
+            continue;
+          }
+          return;
+        }
+        maybeFinish();
+        if (getState() == ServerState::Done) {
+          continue;
+        }
+        return;
       case ServerState::Done:
         close();
-        break;
+        return;
     };
-    // Inline callbacks can fail their work-queue handoff while sendData() is
-    // still publishing the Request member. Finish that call first, then close
-    // safely in this same communicator turn.
-    if (getState() == ServerState::Done && !cleanupComplete_) {
-      close();
-    }
-  } catch (const std::exception& error) {
-    handleProcessFailure(error.what());
-  } catch (...) {
-    handleProcessFailure("unknown exchange-server exception");
   }
+}
+
+bool UcxExchangeServer::activate() {
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  AdmissionState expected = AdmissionState::Pending;
+  if (!admissionState_.compare_exchange_strong(
+          expected, AdmissionState::Accepted, std::memory_order_acq_rel)) {
+    return false;
+  }
+
+  // Only the admitted server may own these task-scoped tags. Post both
+  // receives before returning to the acceptor, which sends the accepted
+  // handshake response immediately after registration.
+  postDataEndpointAckReceive();
+  postAbortReceive();
+
+  bool expectedActivation = false;
+  if (activated_.compare_exchange_strong(
+          expectedActivation, true, std::memory_order_acq_rel)) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+  return true;
+}
+
+void UcxExchangeServer::requestAbort() {
+  AdmissionState pending = AdmissionState::Pending;
+  admissionState_.compare_exchange_strong(
+      pending, AdmissionState::Rejected, std::memory_order_acq_rel);
+
+  bool expected = false;
+  if (!abortRequested_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeServer::forceCloseForShutdown() {
+  close();
+  // close() can synchronously clear an output-queue callback while another
+  // thread has already dequeued its payload. Drain events that won that race;
+  // later callbacks observe closed_ and release through their queue context.
+  drainStateEvents();
 }
 
 void UcxExchangeServer::close() noexcept {
   try {
-    std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+    std::lock_guard<std::recursive_mutex> lock(processMutex_);
+    AdmissionState pending = AdmissionState::Pending;
+    admissionState_.compare_exchange_strong(
+        pending, AdmissionState::Rejected, std::memory_order_acq_rel);
+    closed_.store(true, std::memory_order_release);
     if (cleanupComplete_) {
       return;
     }
-    closed_.store(true, std::memory_order_release);
-
-    auto logCleanupFailure = [&](const char* operation) noexcept {
-      try {
-        LOG(ERROR) << "@" << partitionKey_.taskId
-                   << " exchange-server cleanup failed during " << operation;
-      } catch (...) {
-      }
-    };
-    auto scheduleRetry = [&]() noexcept {
-      try {
-        communicator_->addToWorkQueue(getSelfPtr());
-      } catch (...) {
-        // The communicator still owns this registered server. A later shutdown
-        // or endpoint drain can retry close even if host OOM prevents requeue.
-      }
-    };
-
-    // A queue callback can have dequeued a page immediately before close won
-    // processMutex_. Dispatch it in the closed state so it releases accounting
-    // rather than stranding the page in the event queue.
-    try {
-      drainStateEvents();
-    } catch (...) {
-      logCleanupFailure("callback drain");
-    }
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Close UcxExchangeServer to remote "
-            << partitionKey_.toString();
-
-    // The registry owns the published GPU page between publish() and poll().
-    // Closing either side must remove that entry before producer accounting is
-    // released, otherwise the page and retrieval future can live forever while
-    // the flow-control counters incorrectly report the bytes as free.
+    drainStateEvents();
     if (isIntraNodeTransfer_ && intraNodeRetrieveFuture_.valid()) {
+      IntraNodeTransferRegistry::getInstance()->cancelTransfer(
+          {partitionKey_.taskId, partitionKey_.destination, sequenceNumber_});
       try {
-        IntraNodeTransferRegistry::getInstance()->cancelTransfer(
-            {partitionKey_.taskId, partitionKey_.destination, sequenceNumber_});
-        try {
-          intraNodeRetrieveFuture_.get();
-        } catch (const IntraNodeTransferCancelled&) {
-          // This close initiated the cancellation. The exceptional future is
-          // only a control signal for an otherwise-running producer.
-        }
-      } catch (...) {
-        logCleanupFailure("intra-node transfer cancellation");
-        scheduleRetry();
-        return;
+        intraNodeRetrieveFuture_.get();
+      } catch (const IntraNodeTransferCancelled&) {
       }
     }
-
-    // Tag sends cannot be safely cancelled after UCX has committed them.
-    // Pass a copy to deferred cleanup and clear our reference only after the
-    // vector insertion succeeds. This makes host-allocation failure retryable
-    // without exposing the Request callback to use-after-free.
-    bool requestsDeferred = true;
-    auto deferRequest = [&](std::shared_ptr<ucxx::Request>& request) noexcept {
-      if (!request) {
-        return;
-      }
-      try {
-        if (request->isCompleted()) {
-          request.reset();
-          return;
-        }
-        communicator_->deferRequestCleanup(request);
-        request.reset();
-      } catch (...) {
-        requestsDeferred = false;
-        logCleanupFailure("request deferral");
-      }
-    };
-    if (communicator_) {
-      deferRequest(metaRequest_);
-      deferRequest(dataRequest_);
+    // Retain member ownership until each potentially allocating handoff
+    // commits.
+    retireRequest(metaRequest_);
+    retireRequest(dataRequest_);
+    std::vector<std::shared_ptr<ucxx::Request>> receives;
+    if (dataEndpointAckRequest_) {
+      receives.push_back(dataEndpointAckRequest_);
     }
-    if (!requestsDeferred) {
-      scheduleRetry();
-      return;
+    if (abortRequest_) {
+      receives.push_back(abortRequest_);
     }
-
-    // A dequeued page is accounted until it is either claimed by a transport
-    // callback or explicitly abandoned here. Both helpers are exact-once.
-    try {
-      releasePendingData();
-    } catch (...) {
-      logCleanupFailure("pending-data accounting");
-    }
-    try {
-      releaseIntraNodeInFlightBytes();
-    } catch (...) {
-      logCleanupFailure("intra-node accounting");
-    }
-    if (outputQueue_ && !outputResultsDeleted_) {
-      try {
-        // Clear an installed getData callback and discard queued output on
-        // every error/cancellation close, not only the ordinary end marker.
-        outputQueue_->deleteResults(partitionKey_.destination);
-        outputResultsDeleted_ = true;
-      } catch (...) {
-        logCleanupFailure("output deletion");
-        scheduleRetry();
-        return;
-      }
-    }
-
+    communicator_->deferTagReceiveCancellation(std::move(receives));
+    dataEndpointAckRequest_.reset();
+    abortRequest_.reset();
+    releasePendingData();
+    releaseIntraNodeInFlightBytes();
+    deleteOutputResults();
+    auto self = getSelfPtr();
+    queueMgr_->unregisterExchangeServer(self);
     if (endpointRef_) {
-      try {
-        endpointRef_->removeCommElem(getSelfPtr());
-        endpointRef_ = nullptr;
-      } catch (...) {
-        logCleanupFailure("endpoint unregister");
-        scheduleRetry();
-        return;
-      }
+      endpointRef_->removeCommElem(self);
+      endpointRef_.reset();
     }
-    try {
-      communicator_->unregister(getSelfPtr());
-    } catch (...) {
-      logCleanupFailure("communicator unregister");
-      scheduleRetry();
-      return;
-    }
+    communicator_->unregister(std::move(self));
     cleanupComplete_ = true;
   } catch (...) {
-    // close() is reachable from endpoint and UCXX callback paths. Never let an
-    // exchange-specific cleanup failure unwind through those boundaries.
     try {
       communicator_->addToWorkQueue(getSelfPtr());
     } catch (...) {
-      // The registered communicator/endpoint references still retain this
-      // server for a later shutdown retry.
     }
   }
 }
@@ -530,6 +355,273 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::getSelfPtr() {
   return shared_from_this();
 }
 
+void UcxExchangeServer::postDataEndpointAckReceive() {
+  if (dataEndpointAckRequest_) {
+    return;
+  }
+
+  auto ack = std::make_shared<GpuHandshakeAckHeader>();
+  const uint64_t ackTag = getGpuHandshakeAckTag(partitionKeyHash_);
+  std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<ControlReceiveCallbackOnce>();
+  dataEndpointAckRequest_ =
+      endpointRef_->endpoint_
+          ->tagRecvBuilder(
+              ack.get(), sizeof(*ack), ucxx::Tag{ackTag}, ucxx::TagMaskFull)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) noexcept {
+            if (!callbackOnce->tryClaim()) {
+              return;
+            }
+            if (auto self = weak.lock()) {
+              self->dispatchCompletion(
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                    raw->onDataEndpointAck(status, std::move(arg));
+                  });
+            }
+          })
+          .callbackData(ack)
+          .build();
+}
+
+void UcxExchangeServer::postAbortReceive() {
+  if (abortRequest_) {
+    return;
+  }
+
+  auto abort = std::make_shared<GpuAbortHeader>();
+  const uint64_t abortTag = getGpuAbortTag(partitionKeyHash_);
+  std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
+  auto callbackOnce = std::make_shared<ControlReceiveCallbackOnce>();
+  abortRequest_ =
+      endpointRef_->endpoint_
+          ->tagRecvBuilder(
+              abort.get(),
+              sizeof(*abort),
+              ucxx::Tag{abortTag},
+              ucxx::TagMaskFull)
+          .callbackFunction([weak, callbackOnce](
+                                ucs_status_t status,
+                                std::shared_ptr<void> arg) noexcept {
+            if (!callbackOnce->tryClaim()) {
+              return;
+            }
+            if (auto self = weak.lock()) {
+              self->dispatchCompletion(
+                  self,
+                  [raw = self.get(), status, arg = std::move(arg)]() mutable {
+                    raw->onAbortRequest(status, std::move(arg));
+                  });
+            }
+          })
+          .callbackData(abort)
+          .build();
+}
+
+void UcxExchangeServer::onDataEndpointAck(
+    ucs_status_t status,
+    std::shared_ptr<void> arg) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_ERR_CANCELED) {
+    return;
+  }
+  if (status != UCS_OK) {
+    LOG(ERROR) << "[ExSrv " << partitionKey_.toString()
+               << "] failed to receive data endpoint ACK: "
+               << ucs_status_string(status);
+    requestAbort();
+    return;
+  }
+
+  auto ack = std::static_pointer_cast<GpuHandshakeAckHeader>(arg);
+  if (ack->magic != kGpuHandshakeAckMagic ||
+      ack->version != kGpuHandshakeAckVersion ||
+      ack->headerSize != sizeof(GpuHandshakeAckHeader)) {
+    LOG(ERROR) << "[ExSrv " << partitionKey_.toString()
+               << "] invalid GPU data endpoint ACK";
+    requestAbort();
+    return;
+  }
+
+  dataEndpointAckReceived_ = true;
+  if (getState() == ServerState::WaitingForDataEndpointAck) {
+    setState(ServerState::ReadyToTransfer);
+  }
+}
+
+void UcxExchangeServer::onAbortRequest(
+    ucs_status_t status,
+    std::shared_ptr<void> arg) {
+  if (closed_.load(std::memory_order_acquire) || status == UCS_ERR_CANCELED) {
+    return;
+  }
+  if (status != UCS_OK) {
+    LOG(ERROR) << "[ExSrv " << partitionKey_.toString()
+               << "] failed to receive abort control: "
+               << ucs_status_string(status);
+    requestAbort();
+    return;
+  }
+
+  auto abort = std::static_pointer_cast<GpuAbortHeader>(arg);
+  if (abort->magic != kGpuAbortMagic || abort->version != kGpuAbortVersion ||
+      abort->headerSize != sizeof(GpuAbortHeader)) {
+    LOG(ERROR) << "[ExSrv " << partitionKey_.toString()
+               << "] invalid GPU abort control";
+    // UCXX can replay a completion while wireup is settling. Retain the
+    // completed request and its callback state before posting the replacement.
+    retireRequest(abortRequest_);
+    postAbortReceive();
+    return;
+  }
+  requestAbort();
+}
+
+void UcxExchangeServer::requestData() {
+  setState(ServerState::WaitingForDataFromQueue);
+  installDataCallback();
+}
+
+void UcxExchangeServer::installDataCallback() {
+  std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
+  const auto destination = partitionKey_.destination;
+  auto notify = [weak, destination](
+                    std::shared_ptr<UcxOutputQueue> stableQueue,
+                    std::shared_ptr<cudf::packed_columns> data,
+                    vector_size_t numRows,
+                    std::vector<int64_t>) noexcept {
+    auto self = weak.lock();
+    auto releaseUncommitted = folly::makeGuard([&]() noexcept {
+      if (data) {
+        try {
+          stableQueue->releaseInFlightBytes(
+              destination, data->gpu_data->size(), 1);
+        } catch (...) {
+          if (self) {
+            self->handleCallbackDispatchFailure();
+          }
+        }
+      }
+    });
+    try {
+      if (!self) {
+        return;
+      }
+      std::lock_guard<std::recursive_mutex> lock(self->processMutex_);
+      if (self->closed_.load(std::memory_order_acquire)) {
+        return;
+      }
+      // Exact queue ownership is known before synchronous callbacks or manager
+      // removal. No allocation failure may strand the dequeued accounting.
+      if (!self->enqueueStateEvent(
+              self, [raw = self.get(), stableQueue, data, numRows]() mutable {
+                raw->outputQueue_ = std::move(stableQueue);
+                raw->onDataAvailable(std::move(data), numRows);
+              })) {
+        self->handleCallbackDispatchFailure();
+        return;
+      }
+      releaseUncommitted.dismiss();
+    } catch (...) {
+      if (self) {
+        self->handleCallbackDispatchFailure();
+      }
+    }
+  };
+  if (outputQueue_) {
+    std::weak_ptr<UcxOutputQueue> weakQueue = outputQueue_;
+    outputQueue_->getData(
+        destination,
+        [weakQueue, notify = std::move(notify)](
+            std::shared_ptr<cudf::packed_columns> data,
+            vector_size_t numRows,
+            std::vector<int64_t> remaining) mutable {
+          auto stableQueue = weakQueue.lock();
+          VELOX_CHECK_NOT_NULL(stableQueue);
+          notify(
+              std::move(stableQueue),
+              std::move(data),
+              numRows,
+              std::move(remaining));
+        });
+  } else {
+    outputQueue_ = queueMgr_->getDataWithQueue(
+        partitionKey_.taskId, destination, std::move(notify));
+  }
+}
+
+void UcxExchangeServer::onDataAvailable(
+    std::shared_ptr<cudf::packed_columns> data,
+    vector_size_t numRows) {
+  auto releaseUncommitted = folly::makeGuard([&]() noexcept {
+    if (data) {
+      try {
+        outputQueue_->releaseInFlightBytes(
+            partitionKey_.destination, data->gpu_data->size(), 1);
+      } catch (...) {
+        handleCallbackDispatchFailure();
+      }
+    }
+  });
+  if (closed_.load(std::memory_order_acquire) ||
+      abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
+    return;
+  }
+
+  VLOG(3) << "@" << partitionKey_.taskId
+          << " Found data for client: " << partitionKey_.toString();
+  std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+  VELOX_CHECK_NULL(dataPtr_, "Data pointer exists: Illegal state!");
+  dataPtr_ = std::move(data);
+  dataNumRows_ = numRows;
+  setState(ServerState::DataReady);
+}
+
+void UcxExchangeServer::processAbort() {
+  releasePendingData();
+
+  // A rejected server has no accepted source waiting for an end marker.
+  if (admissionState_.load(std::memory_order_acquire) !=
+      AdmissionState::Accepted) {
+    close();
+    return;
+  }
+
+  if (getState() == ServerState::Done) {
+    close();
+    return;
+  }
+
+  // An intra-process table has already been published. The source's abort
+  // drain retrieves (and discards) it before looking for the final marker.
+  if (intraNodeRetrieveFuture_.valid() && !pollIntraNodeRetrieve()) {
+    return;
+  }
+
+  // Remote metadata and data sends are both committed once submitted. Wait
+  // for both callbacks before publishing the next sequenced metadata record.
+  if (normalMetadataInFlight_ || dataSendInFlight_) {
+    return;
+  }
+
+  if (!finalMetadataSent_) {
+    sendFinalMetadata();
+    return;
+  }
+
+  if (isIntraNodeTransfer_ && intraNodeRetrieveFuture_.valid()) {
+    if (!pollIntraNodeRetrieve()) {
+      return;
+    }
+  }
+  if (!finalMetadataCompleted_) {
+    return;
+  }
+
+  close();
+}
+
 void UcxExchangeServer::sendData() {
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
@@ -540,383 +632,228 @@ void UcxExchangeServer::sendData() {
                   ? " size=" + std::to_string(dataPtr_->gpu_data->size())
                   : "");
 
+  if (!dataPtr_) {
+    sendFinalMetadata();
+    return;
+  }
+
   if (isIntraNodeTransfer_) {
-    // INTRA-NODE TRANSFER PATH: Use registry for all communication, no UCXX
-    // needed
     sendStart_ = std::chrono::high_resolution_clock::now();
+    bytes_ = dataPtr_->gpu_data->size();
 
-    if (dataPtr_) {
-      bytes_ = dataPtr_->gpu_data->size();
-      VELOX_CHECK_LE(
-          bytes_,
-          static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
-          "UCX payload size exceeds signed accounting range");
-      VELOX_CHECK_NOT_NULL(
-          outputQueue_, "Dequeued payload has no stable output queue");
+    VLOG(3) << "@" << partitionKey_.taskId
+            << " Intra-node transfer: publishing data for sequence "
+            << sequenceNumber_ << " of size " << bytes_;
 
-      VLOG(3) << "@" << partitionKey_.taskId
-              << " Intra-node transfer: publishing data for sequence "
-              << sequenceNumber_ << " of size " << bytes_;
+    IntraNodeTransferKey key{
+        partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+    intraNodeRetrieveFuture_ =
+        IntraNodeTransferRegistry::getInstance()->publish(
+            key, dataPtr_, dataNumRows_, /*atEnd=*/false);
+    dataPtr_.reset();
+    intraNodeAtEndPublished_ = false;
+    intraNodeBytesInFlight_ = true;
 
-      IntraNodeTransferKey key{
-          partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      // dataPtr_ is already a shared_ptr, pass directly to share ownership.
-      intraNodeRetrieveFuture_ =
-          IntraNodeTransferRegistry::getInstance()->publish(
-              key, dataPtr_, dataNumRows_, /*atEnd=*/false);
-      bool expected = false;
-      VELOX_CHECK(
-          intraNodeBytesInFlight_.compare_exchange_strong(
-              expected, true, std::memory_order_acq_rel),
-          "Previous intra-node payload is still in flight");
-      dataPtr_.reset();
-      dataNumRows_ = 0;
-      intraNodeAtEndPublished_ = false;
+    setState(ServerState::WaitingForIntraNodeRetrieve);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
 
-      // Transition to WaitingForIntraNodeRetrieve state
-      setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
-    } else {
-      // Data pointer is null, so no more data will be coming.
-      // Publish atEnd marker to registry
-      VLOG(3) << "@" << partitionKey_.taskId
-              << " Intra-node transfer: publishing atEnd for sequence "
-              << sequenceNumber_;
+  auto data = dataPtr_;
+  VELOX_CHECK_NOT_NULL(outputQueue_);
+  bytes_ = data->gpu_data->size();
 
-      IntraNodeTransferKey key{
-          partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      intraNodeRetrieveFuture_ =
-          IntraNodeTransferRegistry::getInstance()->publish(
-              key, nullptr, /*numRows=*/0, /*atEnd=*/true);
-      intraNodeAtEndPublished_ = true;
+  MetadataMsg metadataMsg;
+  // Copy metadata because broadcast destinations can share packed_columns.
+  metadataMsg.cudfMetadata =
+      std::make_unique<std::vector<uint8_t>>(*data->metadata);
+  metadataMsg.dataSizeBytes = bytes_;
+  metadataMsg.numRows = dataNumRows_;
+  metadataMsg.remainingBytes = {};
+  metadataMsg.atEnd = false;
+  auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
 
-      if (outputQueue_) {
-        outputQueue_->deleteResults(partitionKey_.destination);
-      } else {
-        queueMgr_->deleteResults(
-            partitionKey_.taskId, partitionKey_.destination);
-      }
-      outputResultsDeleted_ = true;
+  const uint64_t metadataTag =
+      getMetadataTag(partitionKeyHash_, sequenceNumber_);
+  const uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
+  retireRequest(metaRequest_);
+  retireRequest(dataRequest_);
 
-      // Wait for source to acknowledge atEnd before finishing
-      setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
-    }
-  } else {
-    // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
-    std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
+  auto metaCtx = std::make_shared<MetaSendContext>();
+  metaCtx->metadata = serializedMetadata;
+  std::weak_ptr<UcxExchangeServer> weakMeta = weak_from_this();
 
-    if (dataPtr_) {
-      // Copy metadata (not move) because in broadcast mode, the same
-      // packed_columns may be shared across multiple destination queues.
-      // Metadata is small (CPU-side), so copying is negligible.
-      metadataMsg->cudfMetadata =
-          std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
-      metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
-      metadataMsg->numRows = dataNumRows_;
-      metadataMsg->remainingBytes = {};
-      metadataMsg->atEnd = false;
-    } else {
-      VLOG(3) << "@" << partitionKey_.taskId << " Final exchange for "
-              << partitionKey_.toString();
-      metadataMsg->cudfMetadata = nullptr;
-      metadataMsg->dataSizeBytes = 0;
-      metadataMsg->numRows = 0;
-      metadataMsg->remainingBytes = {};
-      metadataMsg->atEnd = true;
-    }
+  normalMetadataInFlight_ = true;
+  dataSendInFlight_ = true;
+  sendStart_ = std::chrono::high_resolution_clock::now();
+  setState(ServerState::WaitingForSendComplete);
 
-    auto [serializedMetadata, serMetaSize] = metadataMsg->serialize();
-
-    // send metadata.
-    uint64_t metadataTag =
-        getMetadataTag(this->partitionKeyHash_, this->sequenceNumber_);
-    // Use weak_ptr to prevent use-after-free if close() is called during
-    // callback
-    std::weak_ptr<UcxExchangeServer> weakMeta = weak_from_this();
-    retireRequest(metaRequest_);
-
-    // Wrap serialized metadata so the completion can release its payload
-    // independently of the request shell.
-    auto metaCtx = std::make_shared<MetaSendContext>();
-    metaCtx->metadata = serializedMetadata;
-
-    try {
-      metaRequest_ =
-          endpointRef_->endpoint_
-              ->tagSendBuilder(
-                  metaCtx->metadata.get(), serMetaSize, ucxx::Tag{metadataTag})
-              .callbackFunction([metadataTag, weakMeta](
-                                    ucs_status_t status,
-                                    std::shared_ptr<void> arg) noexcept {
+  metaRequest_ =
+      endpointRef_->endpoint_
+          ->tagSendBuilder(
+              metaCtx->metadata.get(), serMetaSize, ucxx::Tag{metadataTag})
+          .callbackFunction(
+              [weakMeta, metadataTag, task = partitionKey_.toString()](
+                  ucs_status_t status, std::shared_ptr<void> arg) noexcept {
                 auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
                 if (!ctx->tryClaimCallback()) {
                   return;
                 }
-                // Release the payload once; a duplicate callback must not
-                // advance the server state or release ownership twice.
                 ctx->metadata.reset();
-                if (auto self = weakMeta.lock();
-                    self && !self->closed_.load(std::memory_order_acquire)) {
-                  if (!self->enqueueStateEvent(
-                          self, [raw = self.get(), status, metadataTag]() {
-                            try {
-                              raw->metadataSendComplete(status, metadataTag);
-                            } catch (...) {
-                              raw->handleCallbackDispatchFailure(
-                                  "metadata state event");
-                            }
-                          })) {
-                    self->handleCallbackDispatchFailure("metadata send");
-                  }
+                if (auto self = weakMeta.lock()) {
+                  self->dispatchCompletion(self, [raw = self.get(), status]() {
+                    raw->metadataSendComplete(status);
+                  });
                 }
               })
-              .callbackData(metaCtx)
-              .build();
-    } catch (const std::exception& error) {
-      LOG(ERROR) << "@" << partitionKey_.taskId
-                 << " failed to submit metadata send: " << error.what();
-      releasePendingData();
-      setState(ServerState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
-      return;
-    } catch (...) {
-      LOG(ERROR) << "@" << partitionKey_.taskId
-                 << " failed to submit metadata send";
-      releasePendingData();
-      setState(ServerState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
-      return;
-    }
+          .callbackData(metaCtx)
+          .build();
 
-    // An inline callback that could not enqueue its state event uses Done as
-    // the fail-safe. Do not overwrite it by committing a data send.
-    if (getState() == ServerState::Done) {
-      releasePendingData();
-      return;
-    }
+  VLOG(3) << "@" << partitionKey_.taskId << " Sending rmm::buffer: " << std::hex
+          << data->gpu_data.get()
+          << " pointing to device memory: " << data->gpu_data->data()
+          << std::dec << " to task " << partitionKey_.toString() << ":"
+          << sequenceNumber_ << " of size " << bytes_;
 
-    // send the data chunk (if any)
-    if (dataPtr_) {
-      sendStart_ = std::chrono::high_resolution_clock::now();
-      bytes_ = dataPtr_->gpu_data->size();
-      VELOX_CHECK_LE(
-          bytes_,
-          static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
-          "UCX payload size exceeds signed accounting range");
-      VELOX_CHECK_NOT_NULL(
-          outputQueue_, "Dequeued payload has no stable output queue");
-
-      VLOG(3) << "@" << partitionKey_.taskId
-              << " Sending rmm::buffer: " << std::hex
-              << dataPtr_->gpu_data.get()
-              << " pointing to device memory: " << std::hex
-              << dataPtr_->gpu_data->data() << std::dec << " to task "
-              << partitionKey_.toString() << ":" << this->sequenceNumber_
-              << std::dec << " of size " << bytes_;
-
-      setState(ServerState::WaitingForSendComplete);
-      uint64_t dataTag =
-          getDataTag(this->partitionKeyHash_, this->sequenceNumber_);
-      // Use weak_ptr to prevent use-after-free if close() is called during
-      // callback
-      std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
-      retireRequest(dataRequest_);
-
-      // Wrap the GPU data buffer so completion can release both payload and
-      // accounting independently of the request shell.
-      auto dataCtx = std::make_shared<DataSendContext>();
-      dataCtx->data = dataPtr_;
-      dataCtx->outputQueue = outputQueue_;
-      dataCtx->destination = partitionKey_.destination;
-      dataCtx->bytes = static_cast<int64_t>(bytes_);
-
-      try {
-        dataRequest_ =
-            endpointRef_->endpoint_
-                ->tagSendBuilder(
-                    dataCtx->data->gpu_data->data(),
-                    dataCtx->data->gpu_data->size(),
-                    ucxx::Tag{dataTag})
-                .callbackFunction([weakData](
-                                      ucs_status_t status,
-                                      std::shared_ptr<void> arg) noexcept {
-                  auto ctx = std::static_pointer_cast<DataSendContext>(arg);
-                  if (!ctx->tryClaimCallback()) {
-                    return;
-                  }
-                  // Zero-byte, zero-column-schema pages still release one
-                  // packed column accounting unit.
-                  auto self = weakData.lock();
-                  try {
-                    ctx->releaseAccounting();
-                  } catch (...) {
-                    if (self) {
-                      self->handleCallbackDispatchFailure(
-                          "data send accounting");
-                    }
-                    return;
-                  }
-                  if (self && !self->closed_.load(std::memory_order_acquire)) {
-                    if (!self->enqueueStateEvent(
-                            self, [raw = self.get(), status]() {
-                              try {
-                                raw->sendComplete(status);
-                              } catch (...) {
-                                raw->handleCallbackDispatchFailure(
-                                    "data state event");
-                              }
-                            })) {
-                      self->handleCallbackDispatchFailure("data send");
-                    }
-                  }
-                })
-                .callbackData(dataCtx)
-                .build();
-      } catch (const std::exception& error) {
-        if (dataCtx->tryClaimCallback()) {
-          try {
-            dataCtx->releaseAccounting();
-          } catch (...) {
-            LOG(ERROR) << "@" << partitionKey_.taskId
-                       << " failed to release rejected data send accounting";
-          }
-        }
-        dataPtr_.reset();
-        dataNumRows_ = 0;
-        LOG(ERROR) << "@" << partitionKey_.taskId
-                   << " failed to submit data send: " << error.what();
-        setState(ServerState::Done);
-        communicator_->addToWorkQueue(getSelfPtr());
-        return;
-      } catch (...) {
-        if (dataCtx->tryClaimCallback()) {
-          try {
-            dataCtx->releaseAccounting();
-          } catch (...) {
-            LOG(ERROR) << "@" << partitionKey_.taskId
-                       << " failed to release rejected data send accounting";
-          }
-        }
-        dataPtr_.reset();
-        dataNumRows_ = 0;
-        LOG(ERROR) << "@" << partitionKey_.taskId
-                   << " failed to submit data send";
-        setState(ServerState::Done);
-        communicator_->addToWorkQueue(getSelfPtr());
-        return;
-      }
-      // UCXX's callback context now owns the payload until DMA completion.
+  auto dataCtx = std::make_shared<DataSendContext>();
+  dataCtx->data = std::move(data);
+  dataCtx->outputQueue = outputQueue_;
+  dataCtx->destination = partitionKey_.destination;
+  dataCtx->bytes = bytes_;
+  std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
+  auto releaseRejectedData = folly::makeGuard([&]() noexcept {
+    if (dataCtx->tryClaimCallback()) {
+      dataCtx->data.reset();
       dataPtr_.reset();
-      dataNumRows_ = 0;
-    } else {
-      // Data pointer is null, so no more data will be coming.
-      VLOG(3) << "@" << partitionKey_.taskId
-              << " Finished transferring partition for task "
-              << partitionKey_.toString();
-      if (outputQueue_) {
-        outputQueue_->deleteResults(partitionKey_.destination);
-      } else {
-        queueMgr_->deleteResults(
-            partitionKey_.taskId, partitionKey_.destination);
+      try {
+        dataCtx->outputQueue->releaseInFlightBytes(
+            dataCtx->destination, dataCtx->bytes, 1);
+      } catch (...) {
       }
-      outputResultsDeleted_ = true;
-      setState(ServerState::Done);
-      communicator_->addToWorkQueue(getSelfPtr());
     }
-  }
+  });
+
+  dataRequest_ =
+      endpointRef_->endpoint_
+          ->tagSendBuilder(
+              dataCtx->data->gpu_data->data(),
+              dataCtx->data->gpu_data->size(),
+              ucxx::Tag{dataTag})
+          .callbackFunction(
+              [weakData](
+                  ucs_status_t status, std::shared_ptr<void> arg) noexcept {
+                auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+                if (!ctx->tryClaimCallback()) {
+                  return;
+                }
+                ctx->data.reset();
+                try {
+                  ctx->outputQueue->releaseInFlightBytes(
+                      ctx->destination, ctx->bytes, 1L);
+                } catch (...) {
+                  if (auto self = weakData.lock()) {
+                    self->handleCallbackDispatchFailure();
+                  }
+                  return;
+                }
+
+                if (auto self = weakData.lock()) {
+                  self->dispatchCompletion(self, [raw = self.get(), status]() {
+                    raw->sendComplete(status);
+                  });
+                }
+              })
+          .callbackData(dataCtx)
+          .build();
+  releaseRejectedData.dismiss();
+  dataPtr_.reset();
+  dataNumRows_ = 0;
 }
 
-void UcxExchangeServer::handleCallbackDispatchFailure(
-    const char* callback) noexcept {
-  try {
-    LOG(ERROR) << "@" << partitionKey_.taskId << " could not dispatch "
-               << callback << " callback to the server state machine";
-  } catch (...) {
+void UcxExchangeServer::sendFinalMetadata() {
+  if (finalMetadataSent_) {
+    return;
   }
-  try {
-    setState(ServerState::Done);
-  } catch (...) {
-    state_.store(ServerState::Done, std::memory_order_release);
-  }
-  try {
+  finalMetadataSent_ = true;
+  VLOG(3) << "@" << partitionKey_.taskId << " Final exchange for "
+          << partitionKey_.toString() << " sequence " << sequenceNumber_;
+
+  if (isIntraNodeTransfer_) {
+    sendStart_ = std::chrono::high_resolution_clock::now();
+    IntraNodeTransferKey key{
+        partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+    intraNodeRetrieveFuture_ =
+        IntraNodeTransferRegistry::getInstance()->publish(
+            key, nullptr, /*numRows=*/0, /*atEnd=*/true);
+    intraNodeAtEndPublished_ = true;
+    setState(ServerState::WaitingForFinalMetadataComplete);
+    deleteOutputResults();
     communicator_->addToWorkQueue(getSelfPtr());
     return;
-  } catch (...) {
   }
 
-  // An inline completion can run before tagSend() publishes its Request into
-  // the member field. The active process turn observes Done and closes after
-  // tagSend returns. An asynchronous completion has no such unpublished
-  // request and can make one best-effort, noexcept cleanup attempt here.
-  if (!processing_.load(std::memory_order_acquire) &&
-      !closed_.load(std::memory_order_acquire)) {
-    close();
-  }
+  MetadataMsg metadataMsg;
+  metadataMsg.cudfMetadata = nullptr;
+  metadataMsg.dataSizeBytes = 0;
+  metadataMsg.numRows = 0;
+  metadataMsg.remainingBytes = {};
+  metadataMsg.atEnd = true;
+  auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
+  const uint64_t metadataTag =
+      getMetadataTag(partitionKeyHash_, sequenceNumber_);
+
+  retireRequest(metaRequest_);
+  retireRequest(dataRequest_);
+
+  auto metaCtx = std::make_shared<MetaSendContext>();
+  metaCtx->metadata = serializedMetadata;
+  std::weak_ptr<UcxExchangeServer> weakMeta = weak_from_this();
+  setState(ServerState::WaitingForFinalMetadataComplete);
+  metaRequest_ =
+      endpointRef_->endpoint_
+          ->tagSendBuilder(
+              metaCtx->metadata.get(), serMetaSize, ucxx::Tag{metadataTag})
+          .callbackFunction(
+              [weakMeta](
+                  ucs_status_t status, std::shared_ptr<void> arg) noexcept {
+                auto ctx = std::static_pointer_cast<MetaSendContext>(arg);
+                if (!ctx->tryClaimCallback()) {
+                  return;
+                }
+                ctx->metadata.reset();
+                if (auto self = weakMeta.lock()) {
+                  self->dispatchCompletion(self, [raw = self.get(), status]() {
+                    raw->finalMetadataComplete(status);
+                  });
+                }
+              })
+          .callbackData(metaCtx)
+          .build();
+  deleteOutputResults();
 }
 
-void UcxExchangeServer::handleProcessFailure(const char* error) noexcept {
-  try {
-    LOG(ERROR) << "@" << partitionKey_.taskId
-               << " exchange-server state machine failed: " << error;
-  } catch (...) {
-  }
-
-  try {
-    setState(ServerState::Done);
-  } catch (...) {
-    state_.store(ServerState::Done, std::memory_order_release);
-  }
-
-  try {
-    communicator_->addToWorkQueue(getSelfPtr());
-    return;
-  } catch (...) {
-    // If even scheduling cleanup fails (for example under host OOM), perform
-    // one best-effort close now. closed_ makes this terminal rather than a
-    // repeatedly requeued failure.
-  }
-  try {
-    close();
-  } catch (...) {
-  }
-}
-
-void UcxExchangeServer::metadataSendComplete(
-    ucs_status_t status,
-    uint64_t metadataTag) {
+void UcxExchangeServer::metadataSendComplete(ucs_status_t status) {
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " metadata send completion dispatched after close, ignoring";
     return;
   }
-  if (status == UCS_OK) {
-    VLOG(3) << "@" << partitionKey_.taskId << " metadata successfully sent to "
-            << partitionKey_.toString() << " with tag: " << std::hex
-            << metadataTag;
+  normalMetadataInFlight_ = false;
+  if (status != UCS_OK) {
+    LOG(ERROR) << "@" << partitionKey_.taskId
+               << " Error in metadata send: " << ucs_status_string(status)
+               << " task: " << partitionKey_.toString();
+    setState(ServerState::Done);
     return;
   }
-
-  VLOG(0) << "@" << partitionKey_.taskId << " Error in sendData, send metadata "
-          << ucs_status_string(status)
-          << " failed for task: " << partitionKey_.toString();
-  setState(ServerState::Done);
-  communicator_->addToWorkQueue(getSelfPtr());
+  maybeCompleteRemoteSend();
 }
 
 void UcxExchangeServer::sendComplete(ucs_status_t status) {
-  // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " sendComplete called after close, ignoring";
     return;
   }
-  if (getState() == ServerState::Done) {
-    return;
-  }
-  if (status == UCS_OK) {
-    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+  dataSendInFlight_ = false;
 
+  if (status == UCS_OK) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = end - sendStart_;
     auto micros =
@@ -929,110 +866,149 @@ void UcxExchangeServer::sendComplete(ucs_status_t status) {
             << " ms ";
     VLOG(3) << "@" << partitionKey_.taskId << " throughput: " << throughput
             << " MByte/s";
-
-    this->sequenceNumber_++;
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Send complete; advancing to next sequence.";
-    setState(ServerState::ReadyToTransfer);
+    maybeCompleteRemoteSend();
   } else {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Error in sendComplete, send complete "
-            << ucs_status_string(status);
+    LOG(ERROR) << "@" << partitionKey_.taskId
+               << " Error in data send: " << ucs_status_string(status);
     setState(ServerState::Done);
   }
-  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeServer::maybeCompleteRemoteSend() {
+  if (normalMetadataInFlight_ || dataSendInFlight_ ||
+      getState() == ServerState::Done) {
+    return;
+  }
+  ++sequenceNumber_;
+  VLOG(3) << "@" << partitionKey_.taskId
+          << " Send complete; advancing to next sequence.";
+  if (!abortRequested_.load(std::memory_order_acquire)) {
+    setState(ServerState::ReadyToTransfer);
+  }
+}
+
+void UcxExchangeServer::finalMetadataComplete(ucs_status_t status) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (status != UCS_OK) {
+    LOG(ERROR) << "@" << partitionKey_.taskId
+               << " Error in final metadata send: " << ucs_status_string(status)
+               << " task: " << partitionKey_.toString();
+    setState(ServerState::Done);
+    return;
+  }
+  finalMetadataCompleted_ = true;
+  maybeFinish();
+}
+
+bool UcxExchangeServer::pollIntraNodeRetrieve() {
+  if (!intraNodeRetrieveFuture_.valid()) {
+    return true;
+  }
+  auto status = intraNodeRetrieveFuture_.wait_for(std::chrono::milliseconds(0));
+  if (status != std::future_status::ready) {
+    ++intraNodePollCount_;
+    if (intraNodePollCount_ % 100 == 0) {
+      VLOG(2) << "[INTRA] [ExSrv " << partitionKey_.toString()
+              << " seq=" << sequenceNumber_
+              << "] still waiting for source retrieval, polls="
+              << intraNodePollCount_;
+    }
+    communicator_->addToWorkQueue(getSelfPtr());
+    return false;
+  }
+
+  intraNodeRetrieveFuture_.get();
+  intraNodePollCount_ = 0;
+  onIntraNodeRetrieveComplete();
+  return true;
 }
 
 void UcxExchangeServer::onIntraNodeRetrieveComplete() {
-  // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " onIntraNodeRetrieveComplete called after close, ignoring";
     return;
   }
 
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = end - sendStart_;
-  auto micros =
-      std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-  auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
+  if (!intraNodeAtEndPublished_) {
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = end - sendStart_;
+    auto micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
 
-  VLOG(3)
-      << "@" << partitionKey_.taskId << " Intra-node transfer duration: "
-      << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count()
-      << " ms ";
-  VLOG(3) << "@" << partitionKey_.taskId
-          << " Intra-node transfer throughput: " << throughput << " MByte/s";
-
-  VLOG(3) << "@" << partitionKey_.taskId
-          << " Intra-node transfer complete for sequence " << sequenceNumber_;
+    VLOG(3) << "@" << partitionKey_.taskId << " Intra-node transfer duration: "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
+                   .count()
+            << " ms ";
+    VLOG(3) << "@" << partitionKey_.taskId
+            << " Intra-node transfer throughput: " << throughput << " MByte/s";
+  }
 
   releaseIntraNodeInFlightBytes();
 
   if (intraNodeAtEndPublished_) {
-    // This was the final atEnd marker, we're done
     VLOG(3) << "@" << partitionKey_.taskId
-            << " Intra-node transfer: atEnd acknowledged, finishing";
-    setState(ServerState::Done);
+            << " Intra-node transfer: atEnd retrieved, finishing";
+    finalMetadataCompleted_ = true;
+    maybeFinish();
   } else {
-    // More data may be coming, continue transfer loop
-    this->sequenceNumber_++;
-    setState(ServerState::ReadyToTransfer);
+    ++sequenceNumber_;
+    if (!abortRequested_.load(std::memory_order_acquire)) {
+      setState(ServerState::ReadyToTransfer);
+    }
   }
-  communicator_->addToWorkQueue(getSelfPtr());
-}
-
-void UcxExchangeServer::releaseIntraNodeInFlightBytes() {
-  if (!intraNodeBytesInFlight_.exchange(false, std::memory_order_acq_rel)) {
-    return;
-  }
-  VELOX_CHECK_LE(
-      bytes_, static_cast<std::size_t>(std::numeric_limits<int64_t>::max()));
-  std::shared_ptr<UcxOutputQueue> outputQueue;
-  {
-    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
-    outputQueue = outputQueue_;
-  }
-  VELOX_CHECK_NOT_NULL(
-      outputQueue, "Intra-node payload has no stable output queue");
-  outputQueue->releaseInFlightBytes(
-      partitionKey_.destination, static_cast<int64_t>(bytes_), 1);
 }
 
 void UcxExchangeServer::releasePendingData() {
-  std::shared_ptr<UcxOutputQueue> outputQueue;
-  int64_t bytes = 0;
+  std::shared_ptr<cudf::packed_columns> pending;
   {
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
-    if (!dataPtr_) {
-      return;
-    }
-    VELOX_CHECK_LE(
-        dataPtr_->gpu_data->size(),
-        static_cast<std::size_t>(std::numeric_limits<int64_t>::max()));
-    bytes = static_cast<int64_t>(dataPtr_->gpu_data->size());
-    outputQueue = outputQueue_;
-    dataPtr_.reset();
-    dataNumRows_ = 0;
+    pending = std::move(dataPtr_);
+  }
+  if (!pending) {
+    return;
   }
   VELOX_CHECK_NOT_NULL(
-      outputQueue, "Dequeued payload has no stable output queue");
-  outputQueue->releaseInFlightBytes(partitionKey_.destination, bytes, 1);
+      outputQueue_, "Dequeued GPU data has no stable output queue");
+  outputQueue_->releaseInFlightBytes(
+      partitionKey_.destination, pending->gpu_data->size(), 1L);
 }
 
-void UcxExchangeServer::retireRequest(std::shared_ptr<ucxx::Request>& request) {
-  if (!request) {
+void UcxExchangeServer::releaseIntraNodeInFlightBytes() {
+  if (!intraNodeBytesInFlight_) {
     return;
   }
-  if (request->isCompleted()) {
-    request.reset();
-    return;
-  }
+  VELOX_CHECK_NOT_NULL(
+      outputQueue_, "Intra-node GPU data has no stable output queue");
+  outputQueue_->releaseInFlightBytes(partitionKey_.destination, bytes_, 1L);
+  intraNodeBytesInFlight_ = false;
+}
 
-  // Preserve our reference until insertion succeeds. Incomplete UCXX callback
-  // state remains communicator-owned until isCompleted() becomes true.
-  communicator_->deferRequestCleanup(request);
-  request.reset();
+void UcxExchangeServer::deleteOutputResults() {
+  if (outputResultsDeleted_) {
+    return;
+  }
+  if (!outputQueue_) {
+    // The accepted source can abort before READY reaches requestData(). Use
+    // the ordinary server callback here: getData() may synchronously dequeue
+    // one table, and that table still needs its in-flight accounting released
+    // after the stable queue pointer has been returned.
+    installDataCallback();
+  }
+  if (outputQueue_) {
+    outputQueue_->deleteResults(partitionKey_.destination);
+  }
+  outputResultsDeleted_ = true;
+}
+
+void UcxExchangeServer::maybeFinish() {
+  if (finalMetadataCompleted_ && !normalMetadataInFlight_ &&
+      !dataSendInFlight_ && !intraNodeRetrieveFuture_.valid() &&
+      getState() != ServerState::Done) {
+    ++sequenceNumber_;
+    setState(ServerState::Done);
+  }
 }
 
 } // namespace facebook::velox::ucx_exchange

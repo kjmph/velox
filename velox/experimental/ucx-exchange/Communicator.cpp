@@ -24,13 +24,12 @@
 #include <ucxx/utils/ucx.h>
 #include <unistd.h>
 #include <algorithm>
-#include <iostream>
-#include "UcxExchangeModules.h"
 #include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <iostream>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -357,7 +356,8 @@ void Communicator::run() {
     // Keep wakeup enabled so external signals can interrupt a blocking worker
     // and so ucxx can wake the progress thread when needed.
     context_ = ucxx::contextBuilder(
-        UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_WAKEUP).build();
+                   UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_WAKEUP)
+                   .build();
   }
 
   // UCXX progress runs on a dedicated thread below, while exchange state
@@ -369,8 +369,10 @@ void Communicator::run() {
                 .pythonFuture(false)
                 .build();
 
-  listener_ = worker_->listenerBuilder(
-      port_, Communicator::cStyleListenerCallback, this).build();
+  listener_ =
+      worker_
+          ->listenerBuilder(port_, Communicator::cStyleListenerCallback, this)
+          .build();
 
 #ifdef VELOX_ENABLE_CUDF
   // Setup the active message callback that handles the
@@ -615,11 +617,11 @@ void Communicator::signalWorker() {
 
 bool Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
   if (!comms) {
-    return;
+    return false;
   }
   if (shutdownDraining_.load(std::memory_order_acquire) &&
       !comms->supportsCommunicatorShutdownDrain()) {
-    return;
+    return false;
   }
   if (!comms->markQueued()) {
     return true;

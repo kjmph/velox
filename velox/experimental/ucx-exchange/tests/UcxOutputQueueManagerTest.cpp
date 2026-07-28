@@ -470,6 +470,59 @@ TEST(GpuAbortProtocolTest, usesDedicatedTaskScopedControlTags) {
   EXPECT_EQ(abort.headerSize, sizeof(GpuAbortHeader));
 }
 
+TEST(GpuMetadataProtocolTest, preservesLogicalRowCount) {
+  MetadataMsg metadata;
+  metadata.cudfMetadata = std::make_unique<std::vector<uint8_t>>(
+      std::initializer_list<uint8_t>{1, 2, 3, 4});
+  metadata.dataSizeBytes = 37;
+  metadata.numRows = 123;
+  metadata.remainingBytes = {19, 7};
+  metadata.atEnd = false;
+
+  auto [serialized, size] = metadata.serialize();
+  EXPECT_EQ(size, metadata.getSerializedSize());
+  auto decoded = MetadataMsg::deserializeMetadataMsg(serialized.get(), size);
+  EXPECT_EQ(*decoded.cudfMetadata, *metadata.cudfMetadata);
+  EXPECT_EQ(decoded.dataSizeBytes, metadata.dataSizeBytes);
+  EXPECT_EQ(decoded.numRows, metadata.numRows);
+  EXPECT_EQ(decoded.remainingBytes, metadata.remainingBytes);
+  EXPECT_EQ(decoded.atEnd, metadata.atEnd);
+
+  // The combined wire format requires the complete, bounded record.
+  EXPECT_ANY_THROW(
+      MetadataMsg::deserializeMetadataMsg(serialized.get(), size - 1));
+}
+
+TEST_F(UcxOutputQueueManagerTest, preservesLogicalRowCount) {
+  const std::string taskId = "logical-row-count";
+  constexpr vector_size_t kNumRows = 17;
+  initializeTask(taskId, 1, 1);
+  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), kNumRows);
+
+  std::shared_ptr<cudf::packed_columns> received;
+  vector_size_t receivedRows = 0;
+  auto stableQueue = queueManager_->getDataWithQueue(
+      taskId,
+      0,
+      [&](std::shared_ptr<UcxOutputQueue>,
+          std::shared_ptr<cudf::packed_columns> data,
+          vector_size_t numRows,
+          std::vector<int64_t>) {
+        received = std::move(data);
+        receivedRows = numRows;
+      });
+  ASSERT_NE(received, nullptr);
+  ASSERT_NE(stableQueue, nullptr);
+  EXPECT_EQ(receivedRows, kNumRows);
+  EXPECT_EQ(cudf::unpack(*received).num_rows(), 0);
+  const auto bytes = received->gpu_data->size();
+  received.reset();
+  stableQueue->releaseInFlightBytes(0, bytes, 1);
+  noMoreData(taskId);
+  fetchEndMarker(taskId, 0);
+  queueManager_->removeTask(taskId);
+}
+
 TEST_F(
     UcxOutputQueueManagerTest,
     abnormalTaskRemovalAbortsAllAndOnlyMatchingServers) {

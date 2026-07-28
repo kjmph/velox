@@ -114,7 +114,8 @@ std::shared_ptr<Task> createPartitionedOutputTask(
     uint64_t kMaxOutputBufferSize,
     const std::unordered_map<std::string, std::string>& extraConfig,
     bool replicateNullsAndAny,
-    core::PartitionFunctionSpecPtr partitionFunctionSpecOverride) {
+    core::PartitionFunctionSpecPtr partitionFunctionSpecOverride,
+    RowTypePtr outputTypeOverride) {
   VLOG(3) << "Creating PartitionedOutput task with " << numPartitions
           << " partitions";
 
@@ -132,21 +133,24 @@ std::shared_ptr<Task> createPartitionedOutputTask(
       pool.get(), rowType, BufferPtr(nullptr), vectorSize, vecPtrs);
 
   // Build the plan: Values -> PartitionedOutput
-  auto planFragment =
-      exec::test::PlanBuilder()
-          .values({rowVector})
-          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
-          .planFragment();
-
-  if (partitionFunctionSpecOverride != nullptr) {
+  auto planFragment = exec::test::PlanBuilder()
+                          .values({rowVector})
+                          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
+                          .planFragment();
+  if (outputTypeOverride != nullptr ||
+      partitionFunctionSpecOverride != nullptr) {
     const auto partitionedOutput =
         std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
             planFragment.planNode);
     VELOX_CHECK_NOT_NULL(partitionedOutput);
-    planFragment.planNode =
-        core::PartitionedOutputNode::Builder(*partitionedOutput)
-            .partitionFunctionSpec(std::move(partitionFunctionSpecOverride))
-            .build();
+    core::PartitionedOutputNode::Builder builder(*partitionedOutput);
+    if (outputTypeOverride != nullptr) {
+      builder.outputType(std::move(outputTypeOverride));
+    }
+    if (partitionFunctionSpecOverride != nullptr) {
+      builder.partitionFunctionSpec(std::move(partitionFunctionSpecOverride));
+    }
+    planFragment.planNode = builder.build();
   }
 
   std::shared_ptr<folly::Executor> executor(

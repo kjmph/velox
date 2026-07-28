@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/synchronization/EventCount.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
@@ -36,6 +37,8 @@
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
 #include "velox/core/QueryConfig.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
+#include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -1474,6 +1477,112 @@ TEST_P(UcxExchangeTest, pollingDoesNotStarveDeferredCleanup) {
   // deadline, so a failed assertion does not strand the communicator thread.
   element->stopPolling.store(true);
   EXPECT_EQ(status, std::future_status::ready);
+}
+
+TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
+  {
+    const auto p = GetParam();
+    if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+        p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+        p.tableType != TableType::NARROW) {
+      GTEST_SKIP() << "zeroColumnLogicalRowCount: runs only once";
+    }
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool originalIntraNode = config.intraNodeExchange;
+  auto restoreIntraNode =
+      folly::makeGuard([&]() { config.intraNodeExchange = originalIntraNode; });
+  const auto rowType = ROW({}, {});
+
+  const auto runScenario = [&](bool intraNode,
+                               int numPartitions,
+                               int numChunks,
+                               int numRowsPerChunk,
+                               bool projectNonEmptyInput) {
+    config.intraNodeExchange = intraNode;
+    const auto taskPrefix = getUniqueTaskPrefix();
+    const auto srcTaskId = taskPrefix + "zeroColumnSource";
+
+    std::shared_ptr<BaseTableGenerator> tableGenerator;
+    auto inputType = rowType;
+    if (projectNonEmptyInput) {
+      auto inputData = std::make_shared<UcxTestData>();
+      inputData->initialize(numRowsPerChunk);
+      inputType = inputData->getRowType();
+      tableGenerator = std::move(inputData);
+    }
+    core::PartitionFunctionSpecPtr partitionFunctionSpec;
+    if (numPartitions > 1) {
+      partitionFunctionSpec =
+          std::make_shared<exec::RoundRobinPartitionFunctionSpec>();
+    }
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        inputType,
+        numPartitions,
+        {},
+        FOUR_GBYTES,
+        {},
+        false,
+        std::move(partitionFunctionSpec),
+        rowType);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        1);
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, 1, numChunks, numRowsPerChunk, tableGenerator);
+
+    std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+    for (int partition = 0; partition < numPartitions; ++partition) {
+      core::PlanNodeId exchangeNodeId;
+      auto sinkTask = createExchangeTask(
+          taskPrefix + "zeroColumnSink" + std::to_string(partition),
+          rowType,
+          partition,
+          exchangeNodeId);
+      auto sinkDriver =
+          std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+      std::vector<exec::Split> splits{remoteSplit(srcTaskId, partition)};
+      sinkDriver->addSplits(splits);
+      sinkDrivers.push_back(std::move(sinkDriver));
+    }
+
+    sourceDriver->run();
+    for (auto& sinkDriver : sinkDrivers) {
+      sinkDriver->run();
+    }
+    sourceDriver->joinThreads();
+    for (auto& sinkDriver : sinkDrivers) {
+      sinkDriver->joinThreads();
+    }
+
+    const auto expectedRows = static_cast<size_t>(numChunks) * numRowsPerChunk;
+    ASSERT_EQ(expectedRows % numPartitions, 0);
+    for (const auto& sinkDriver : sinkDrivers) {
+      EXPECT_EQ(sinkDriver->numRows(), expectedRows / numPartitions);
+    }
+    queueManager_->removeTask(srcTaskId);
+  };
+
+  // Q9's exact shape: project a non-empty source row to ROW({}) and send it
+  // over remote UCX.
+  runScenario(
+      /*intraNode=*/false,
+      /*numPartitions=*/1,
+      /*numChunks=*/1,
+      /*numRowsPerChunk=*/1,
+      /*projectNonEmptyInput=*/true);
+  // Also cover accumulation, partitioning, and the intra-process handoff.
+  runScenario(
+      /*intraNode=*/true,
+      /*numPartitions=*/3,
+      /*numChunks=*/3,
+      /*numRowsPerChunk=*/7,
+      /*projectNonEmptyInput=*/false);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

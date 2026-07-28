@@ -149,7 +149,7 @@ class UcxCpuRowExchangeSource
 
   void getMetadata(uint32_t sequenceNumber);
 
-  bool receiveQueueExceedsHighWater();
+  bool pauseForBackpressureIfNeeded();
 
   void onMetadata(
       uint32_t sequenceNumber,
@@ -193,6 +193,7 @@ class UcxCpuRowExchangeSource
   std::map<uint32_t, UcxCpuRowReceivedPtr> completedData_;
 
   const std::shared_ptr<UcxCpuRowExchangeQueue> queue_{nullptr};
+  std::atomic<bool> closeRequested_{false};
   std::atomic<bool> closed_{false};
   bool atEnd_{false};
   uint32_t endSequence_{0};

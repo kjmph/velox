@@ -332,23 +332,21 @@ using exec::BlockingReason;
 UcxCpuRowPartitionedOutput::Destination::~Destination() = default;
 
 UcxCpuRowPartitionedOutput::Destination::Destination(
-    std::string taskId,
     int destination,
     VectorSerde* serde,
     VectorSerde::Options* serdeOptions,
     memory::MemoryPool* pool,
     bool eagerFlush,
     int32_t targetNumRowsBase,
-    std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr,
+    std::weak_ptr<UcxCpuRowOutputQueue> outputQueue,
     std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued)
-    : taskId_(std::move(taskId)),
-      destination_(destination),
+    : destination_(destination),
       serde_(serde),
       serdeOptions_(serdeOptions),
       pool_(pool),
       eagerFlush_(eagerFlush),
       targetNumRowsBase_(targetNumRowsBase),
-      queueMgr_(std::move(queueMgr)),
+      outputQueue_(std::move(outputQueue)),
       recordEnqueued_(std::move(recordEnqueued)),
       rows_(raw_vector<vector_size_t>(pool)) {
   setTargetSizePct();
@@ -447,17 +445,15 @@ BlockingReason UcxCpuRowPartitionedOutput::Destination::flush(
     payload->numRows = static_cast<int32_t>(flushedRows);
     payload->numBytes = flushedBytes;
 
-    auto queueManager = queueMgr_.lock();
-    VELOX_CHECK_NOT_NULL(
-        queueManager, "CPU UCX output queue manager has expired");
-    queueManager->enqueue(
-        taskId_, destination_, std::move(payload), flushedRows);
+    auto outputQueue = outputQueue_.lock();
+    VELOX_CHECK_NOT_NULL(outputQueue, "CPU UCX output queue has expired");
+    outputQueue->enqueue(destination_, std::move(payload), flushedRows);
     recordEnqueued_(flushedBytes, flushedRows);
 
     if (future == nullptr) {
       return BlockingReason::kNotBlocked;
     }
-    const bool blocked = queueManager->checkBlocked(taskId_, future);
+    const bool blocked = outputQueue->checkBlocked(future);
     return blocked ? BlockingReason::kWaitForConsumer
                    : BlockingReason::kNotBlocked;
   };
@@ -501,7 +497,7 @@ UcxCpuRowPartitionedOutput::UcxCpuRowPartitionedOutput(
           planNode->inputType(),
           planNode->outputType(),
           planNode->outputType())),
-      queueMgr_(std::move(queueManager)),
+      outputQueue_(queueManager->getTaskQueue(ctx->task->taskId())),
       // Serialized pages can outlive the output operator while UCX is sending
       // them. Keep the task, which owns the operator's child memory pools,
       // alive until the last IOBuf range is released. This mirrors
@@ -568,21 +564,20 @@ void UcxCpuRowPartitionedOutput::initializeInput(RowVectorPtr input) {
 
 void UcxCpuRowPartitionedOutput::initializeDestinations() {
   if (destinations_.empty()) {
-    auto taskId = operatorCtx_->taskId();
     for (int i = 0; i < numDestinations_; ++i) {
-      destinations_.push_back(std::make_unique<Destination>(
-          taskId,
-          i,
-          serde_,
-          serdeOptions_.get(),
-          pool(),
-          eagerFlush_,
-          targetNumRowsBase_,
-          sharedQueueManager(),
-          [this](uint64_t bytes, uint64_t rows) {
-            auto lockedStats = stats_.wlock();
-            lockedStats->addOutputVector(bytes, rows);
-          }));
+      destinations_.push_back(
+          std::make_unique<Destination>(
+              i,
+              serde_,
+              serdeOptions_.get(),
+              pool(),
+              eagerFlush_,
+              targetNumRowsBase_,
+              outputQueue_,
+              [this](uint64_t bytes, uint64_t rows) {
+                auto lockedStats = stats_.wlock();
+                lockedStats->addOutputVector(bytes, rows);
+              }));
     }
   }
 }
@@ -706,16 +701,15 @@ void UcxCpuRowPartitionedOutput::finishOutput() {
     destination->flush(bufferReleaseFn_, /*future=*/nullptr);
     destination->setFinished();
   }
-  sharedQueueManager()->noMoreData(operatorCtx_->task()->taskId());
+  sharedOutputQueue()->noMoreData();
   finished_ = true;
 }
 
-std::shared_ptr<UcxCpuRowOutputQueueManager>
-UcxCpuRowPartitionedOutput::sharedQueueManager() const {
-  auto queueManager = queueMgr_.lock();
-  VELOX_CHECK_NOT_NULL(
-      queueManager, "CPU UCX output queue manager has expired");
-  return queueManager;
+std::shared_ptr<UcxCpuRowOutputQueue>
+UcxCpuRowPartitionedOutput::sharedOutputQueue() const {
+  auto outputQueue = outputQueue_.lock();
+  VELOX_CHECK_NOT_NULL(outputQueue, "CPU UCX output queue has expired");
+  return outputQueue;
 }
 
 RowVectorPtr UcxCpuRowPartitionedOutput::getOutput() {

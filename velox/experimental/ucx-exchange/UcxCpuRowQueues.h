@@ -80,7 +80,6 @@ class UcxCpuRowDestinationQueue {
   struct Stats {
     void recordEnqueue(const UcxCpuRowPayload* payload);
     void recordDequeue(const UcxCpuRowPayload* payload);
-    void recordRequeueFront(const UcxCpuRowPayload* payload);
 
     exec::DestinationBuffer::Stats toOutputBufferStats() const;
 
@@ -99,10 +98,6 @@ class UcxCpuRowDestinationQueue {
   /// the same payload can be referenced from multiple destination queues
   /// in broadcast mode without copying.
   void enqueueBack(std::shared_ptr<UcxCpuRowPayload> data);
-
-  /// Enqueues at the front; used when a transfer fails and the payload
-  /// needs to be retried.
-  void enqueueFront(std::shared_ptr<UcxCpuRowPayload> data);
 
   struct Data {
     std::shared_ptr<UcxCpuRowPayload> data;
@@ -210,10 +205,6 @@ class UcxCpuRowOutputQueue
   /// a notify callback when the queue is empty.
   std::shared_ptr<UcxCpuRowPayload> tryGetData(int destination);
 
-  /// Put a payload back at the head of a destination queue after an
-  /// optimistic tryGetData() drain.
-  void requeueFront(int destination, std::shared_ptr<UcxCpuRowPayload> data);
-
   /// Indicates that one driver finished producing. The queue closes
   /// once all drivers report and all queued data has drained.
   void noMoreData();
@@ -267,7 +258,7 @@ class UcxCpuRowOutputQueue
       std::vector<ContinuePromise>& promises);
   void recordDirectHandoffLocked(const UcxCpuRowDataAvailable& notification);
   void acknowledgeDirectHandoffLocked(int64_t bytes, int64_t numPayloads);
-  void reconcileQueuedStatsLocked(const char* reason);
+  void clearArbitraryBufferLocked(std::vector<ContinuePromise>& promises);
   void maybeUnblockProducersLocked(std::vector<ContinuePromise>& promises);
   void updateTotalQueuedBytesMsLocked();
   int64_t getAverageQueueTimeMsLocked() const;

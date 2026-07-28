@@ -15,6 +15,7 @@
  */
 #pragma once
 #include <cinttypes>
+#include <functional>
 #include <memory>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/future/VeloxPromise.h"
@@ -79,6 +80,20 @@ class UcxCpuRowExchangeQueue {
     return queue_.size();
   }
 
+  /// Registers a source that stopped posting receives because this queue is
+  /// above 'highWaterMark'. Returns false without registering if the queue has
+  /// already drained. Caller must hold mutex().
+  bool registerBackpressuredSourceLocked(
+      const void* source,
+      int32_t highWaterMark,
+      std::function<void()> resume);
+
+  /// Removes and returns callbacks for all currently backpressured sources once
+  /// the queue reaches 'lowWaterMark'. Caller must hold mutex(); callbacks must
+  /// be invoked only after releasing it.
+  std::vector<std::function<void()>> takeBackpressuredSourcesLocked(
+      int32_t lowWaterMark);
+
   void addSourceLocked() {
     VELOX_CHECK(!noMoreSources_, "addSource called after noMoreSources");
     numSources_++;
@@ -91,6 +106,7 @@ class UcxCpuRowExchangeQueue {
  private:
   std::vector<ContinuePromise> closeLocked() {
     queue_.clear();
+    backpressuredSources_.clear();
     return clearAllPromisesLocked();
   }
 
@@ -145,6 +161,7 @@ class UcxCpuRowExchangeQueue {
   std::deque<UcxCpuRowReceivedPtr> queue_;
   // Map from consumer id to the waiting promise.
   folly::F14FastMap<int, ContinuePromise> promises_;
+  folly::F14FastMap<const void*, std::function<void()>> backpressuredSources_;
 
   std::string error_;
 };

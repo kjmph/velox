@@ -81,14 +81,13 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   /// chain into UcxCpuRowOutputQueueManager when full or finishing.
   struct Destination {
     Destination(
-        std::string taskId,
         int destination,
         VectorSerde* serde,
         VectorSerde::Options* serdeOptions,
         memory::MemoryPool* pool,
         bool eagerFlush,
         int32_t targetNumRowsBase,
-        std::shared_ptr<UcxCpuRowOutputQueueManager> queueMgr,
+        std::weak_ptr<UcxCpuRowOutputQueue> outputQueue,
         std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued);
     ~Destination();
 
@@ -148,14 +147,13 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
     void createVectorStreamGroup(const RowVectorPtr& output);
     void clearVectorStreamGroup();
 
-    const std::string taskId_;
     const int destination_;
     VectorSerde* const serde_;
     VectorSerde::Options* const serdeOptions_;
     memory::MemoryPool* const pool_;
     const bool eagerFlush_;
     const int32_t targetNumRowsBase_;
-    const std::weak_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
+    const std::weak_ptr<UcxCpuRowOutputQueue> outputQueue_;
     const std::function<void(uint64_t bytes, uint64_t rows)> recordEnqueued_;
 
     uint64_t bytesInCurrent_{0};
@@ -178,14 +176,14 @@ class UcxCpuRowPartitionedOutput : public exec::Operator {
   void estimateRowSizes();
   void collectNullRows();
   void finishOutput();
-  std::shared_ptr<UcxCpuRowOutputQueueManager> sharedQueueManager() const;
+  std::shared_ptr<UcxCpuRowOutputQueue> sharedOutputQueue() const;
 
   const std::vector<column_index_t> keyChannels_;
   const int numDestinations_;
   const bool replicateNullsAndAny_;
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
   const std::vector<column_index_t> outputChannels_;
-  const std::weak_ptr<UcxCpuRowOutputQueueManager> queueMgr_;
+  const std::weak_ptr<UcxCpuRowOutputQueue> outputQueue_;
   const std::function<void()> bufferReleaseFn_;
   const int64_t maxBufferedBytes_;
   const bool eagerFlush_;

@@ -72,7 +72,7 @@ UcxCpuRowReceivedPtr UcxCpuRowExchangeClient::next(
     ContinueFuture* future) {
   UcxCpuRowReceivedPtr data;
   ContinuePromise stalePromise = ContinuePromise::makeEmpty();
-  std::vector<std::shared_ptr<UcxCpuRowExchangeSource>> sourcesToResume;
+  std::vector<std::function<void()>> sourcesToResume;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
     if (closed_) {
@@ -87,17 +87,14 @@ UcxCpuRowReceivedPtr UcxCpuRowExchangeClient::next(
     }
 
     // A parked consumer on an empty/low queue is also a receive-credit signal.
-    // If sources stopped posting receives due to backpressure, requiring a
-    // successful dequeue to resume them can deadlock: no source is active, so
-    // no future dequeue can happen. resumeFromBackpressure() is idempotent via
-    // CAS, so waking all sources at low-water is cheap and closes that edge.
-    if (queue_->size() <= UcxCpuRowExchangeSource::backpressureLowWaterMark()) {
-      sourcesToResume.assign(sources_.begin(), sources_.end());
-    }
+    // Source registration and this drain are linearized by queue_->mutex(), so
+    // a source cannot park after the final low-water dequeue and lose its wake.
+    sourcesToResume = queue_->takeBackpressuredSourcesLocked(
+        UcxCpuRowExchangeSource::backpressureLowWaterMark());
   }
 
-  for (auto& source : sourcesToResume) {
-    source->resumeFromBackpressure();
+  for (auto& resume : sourcesToResume) {
+    resume();
   }
   if (stalePromise.valid()) {
     stalePromise.setValue();

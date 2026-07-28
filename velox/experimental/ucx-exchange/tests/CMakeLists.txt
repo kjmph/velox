@@ -60,6 +60,7 @@ target_link_libraries(
 add_executable(
   ucx_cpu_row_output_queue_test
   UcxCpuRowOutputQueueTest.cpp
+  ../UcxCpuRowExchangeQueue.cpp
   ../UcxCpuRowOutputQueueManager.cpp
   ../UcxCpuRowPartitionedOutput.cpp
   ../UcxCpuRowQueues.cpp

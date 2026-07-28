@@ -115,7 +115,7 @@ class UcxCpuRowOutputQueueManager : public exec::OutputBufferManager {
   /// fires when data arrives. A nullptr `data` argument signals end of
   /// stream. If the destination doesn't yet exist, additional queues
   /// are created (placeholder mechanism for late getData arrivals).
-  void getData(
+  std::shared_ptr<UcxCpuRowOutputQueue> getData(
       std::string_view taskId,
       int destination,
       UcxCpuRowDataAvailableCallback notify);
@@ -128,12 +128,10 @@ class UcxCpuRowOutputQueueManager : public exec::OutputBufferManager {
       std::string_view taskId,
       int destination);
 
-  /// Reinsert a payload at the head of a destination queue. This is the
-  /// inverse of tryGetData() for server-side bundle assembly.
-  void requeueFront(
-      std::string_view taskId,
-      int destination,
-      std::shared_ptr<UcxCpuRowPayload> data);
+  /// Returns the stable queue instance for an initialized producer task.
+  /// Task IDs cannot be reused after removal and early placeholder queues are
+  /// initialized in place, so output operators can safely cache this identity.
+  std::shared_ptr<UcxCpuRowOutputQueue> getTaskQueue(std::string_view taskId);
 
   /// Registers a producer-side exchange server for task-lifecycle cleanup.
   /// Registration and task removal are linearized by the same mutex. A server

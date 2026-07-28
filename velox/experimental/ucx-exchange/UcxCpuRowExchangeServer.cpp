@@ -225,6 +225,7 @@ void UcxCpuRowExchangeServer::close() {
   }
   pendingData_.reset();
   hasPendingData_ = false;
+  outputQueue_.reset();
 
   if (communicator_) {
     for (auto& req : metaRequests_) {
@@ -350,8 +351,9 @@ void UcxCpuRowExchangeServer::fillSendWindow() {
       continue;
     }
 
-    auto data =
-        queueMgr_->tryGetData(partitionKey_.taskId, partitionKey_.destination);
+    auto data = outputQueue_
+        ? outputQueue_->tryGetData(partitionKey_.destination)
+        : nullptr;
     if (data) {
       sendData(std::move(data));
       continue;
@@ -369,21 +371,24 @@ void UcxCpuRowExchangeServer::requestData() {
   setState(ServerState::WaitingForDataFromQueue);
 
   std::weak_ptr<UcxCpuRowExchangeServer> weakSelf = weak_from_this();
-  queueMgr_->getData(
-      partitionKey_.taskId,
-      partitionKey_.destination,
-      [weakSelf](
-          std::shared_ptr<UcxCpuRowPayload> data,
-          std::vector<int64_t> /*remainingBytes*/) {
-        auto self = weakSelf.lock();
-        if (!self) {
-          return;
-        }
-        self->enqueueStateEvent(
-            self, [raw = self.get(), data = std::move(data)]() mutable {
-              raw->onDataAvailable(std::move(data));
-            });
-      });
+  auto notify = [weakSelf](
+                    std::shared_ptr<UcxCpuRowPayload> data,
+                    std::vector<int64_t> /*remainingBytes*/) {
+    auto self = weakSelf.lock();
+    if (!self) {
+      return;
+    }
+    self->enqueueStateEvent(
+        self, [raw = self.get(), data = std::move(data)]() mutable {
+          raw->onDataAvailable(std::move(data));
+        });
+  };
+  if (outputQueue_) {
+    outputQueue_->getData(partitionKey_.destination, std::move(notify));
+  } else {
+    outputQueue_ = queueMgr_->getData(
+        partitionKey_.taskId, partitionKey_.destination, std::move(notify));
+  }
 }
 
 void UcxCpuRowExchangeServer::onDataAvailable(
@@ -418,8 +423,9 @@ void UcxCpuRowExchangeServer::sendData(
     combinedBytes = firstChunk->numBytes;
     chunks.push_back(std::move(firstChunk));
     while (combinedBytes < kBundleTargetBytes) {
-      auto extra = queueMgr_->tryGetData(
-          partitionKey_.taskId, partitionKey_.destination);
+      VELOX_CHECK_NOT_NULL(
+          outputQueue_, "CPU row output queue is missing while bundling");
+      auto extra = outputQueue_->tryGetData(partitionKey_.destination);
       if (!extra) {
         break;
       }
@@ -653,7 +659,9 @@ void UcxCpuRowExchangeServer::sendFinalMetadata() {
   // the metadata bytes alive until completion. Match the GPU UCX exchange
   // lifetime rule: producer output is consumed once the final marker is
   // published, not when the send completion callback eventually runs.
-  queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
+  if (outputQueue_) {
+    outputQueue_->deleteResults(partitionKey_.destination);
+  }
 }
 
 void UcxCpuRowExchangeServer::finalMetadataComplete(ucs_status_t status) {

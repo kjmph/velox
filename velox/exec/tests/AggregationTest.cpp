@@ -1141,6 +1141,81 @@ TEST_F(AggregationTest, partialDistinctWithAbandon) {
              .assertResults("SELECT distinct c0, sum(c0) FROM tmp group by c0");
 }
 
+TEST_F(AggregationTest, intermediateWithAbandonAndReorderedInputs) {
+  auto makeData = [&](vector_size_t size, int32_t offset) {
+    return makeRowVector(
+        {"integer_key", "string_key", "sum_state"},
+        {makeFlatVector<int32_t>(size, [=](auto row) { return offset + row; }),
+         makeFlatVector<std::string>(
+             size,
+             [=](auto row) { return fmt::format("key_{}", offset + row); }),
+         makeFlatVector<int64_t>(
+             size, [=](auto row) { return offset + row + 1; })});
+  };
+
+  std::vector<RowVectorPtr> vectors = {
+      makeData(2, 0), makeData(3, 2), makeData(4, 5)};
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId intermediateNodeId;
+  auto plan =
+      PlanBuilder()
+          .values(vectors)
+          .groupId(
+              {"integer_key", "string_key"},
+              {{"integer_key", "string_key"}, {"integer_key", "string_key"}},
+              {"sum_state"})
+          .addNode([](auto nodeId, auto source) -> core::PlanNodePtr {
+            auto stringKey = std::make_shared<core::FieldAccessTypedExpr>(
+                VARCHAR(), "string_key");
+            auto integerKey = std::make_shared<core::FieldAccessTypedExpr>(
+                INTEGER(), "integer_key");
+            auto groupId = std::make_shared<core::FieldAccessTypedExpr>(
+                BIGINT(), "group_id");
+            auto sumState = std::make_shared<core::FieldAccessTypedExpr>(
+                BIGINT(), "sum_state");
+
+            core::AggregationNode::Aggregate aggregate;
+            aggregate.call = std::make_shared<core::CallTypedExpr>(
+                BIGINT(), "sum", sumState);
+            aggregate.rawInputTypes = {BIGINT()};
+
+            return std::make_shared<core::AggregationNode>(
+                nodeId,
+                core::AggregationNode::Step::kIntermediate,
+                std::vector<core::FieldAccessTypedExprPtr>{
+                    stringKey, integerKey, groupId},
+                std::vector<core::FieldAccessTypedExprPtr>{},
+                std::vector<std::string>{"sum_state"},
+                std::vector<core::AggregationNode::Aggregate>{aggregate},
+                /*ignoreNullKeys=*/false,
+                /*noGroupsSpanBatches=*/false,
+                std::move(source));
+          })
+          .capturePlanNodeId(intermediateNodeId)
+          .singleAggregation({"string_key", "integer_key"}, {"sum(sum_state)"})
+          .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .config(QueryConfig::kAbandonPartialAggregationMinRows, 1)
+                  .config(QueryConfig::kAbandonPartialAggregationMinPct, 0)
+                  .maxDrivers(1)
+                  .plan(plan)
+                  .assertResults(
+                      "SELECT string_key, integer_key, 2 * sum(sum_state) "
+                      "FROM tmp "
+                      "GROUP BY 1, 2");
+
+  ASSERT_GT(
+      toPlanStats(task->taskStats())
+          .at(intermediateNodeId)
+          .customStats
+          .at(std::string(HashAggregation::kAbandonedPartialAggregationRows))
+          .sum,
+      0);
+}
+
 TEST_F(AggregationTest, distinctWithGroupingKeysReordered) {
   rowType_ =
       ROW({"c0", "c1", "c2", "c3", "c4"},

@@ -1663,7 +1663,20 @@ void GroupingSet::toIntermediate(
   VELOX_CHECK(abandonedPartialAggregation_);
   VELOX_CHECK_EQ(result.use_count(), 1);
   if (!isRawInput_) {
-    result = input;
+    // Intermediate states can pass through unchanged, but their input channels
+    // may not match the aggregation's output layout.
+    result->resize(input->size());
+    for (auto i = 0; i < keyChannels_.size(); ++i) {
+      const auto inputKeyChannel =
+          keyChannels_[groupingKeyOutputProjections_[i]];
+      result->childAt(i) = input->childAt(inputKeyChannel);
+    }
+    for (const auto& aggregate : aggregates_) {
+      VELOX_CHECK(!aggregate.inputs.empty());
+      VELOX_CHECK_NE(aggregate.inputs.front(), kConstantChannel);
+      result->childAt(aggregate.output) =
+          input->childAt(aggregate.inputs.front());
+    }
     return;
   }
   auto numRows = input->size();

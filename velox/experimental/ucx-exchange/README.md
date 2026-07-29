@@ -17,6 +17,11 @@ upgrading these research branches.
 
 The UCX exchange needs a system UCX built with CUDA support. On CentOS, `VELOX_ENABLE_CUDF=ON scripts/setup-centos-adapters.sh` installs UCX after CUDA, together with the other adapter dependencies. To install only CUDA and UCX, run `scripts/setup-centos-adapters.sh install_cuda install_ucx`.
 
+UCXX must use the pinned 0.53 source plus the checked-in control-plane fairness
+patch. Both bundled dependency resolvers apply it automatically. For a `SYSTEM`
+installation, apply the same patch before building UCXX; see
+[the dependency and fairness instructions](tests/CONTROL_PLANE_FAIRNESS.md).
+
 ## CMake Configuration
 
 When building for the first time, this error occurs:

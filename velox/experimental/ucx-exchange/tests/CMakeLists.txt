@@ -35,6 +35,38 @@ target_link_libraries(
 )
 
 add_executable(
+  ucx_communicator_progress_fairness_test
+  CommunicatorProgressFairnessTest.cpp
+)
+
+add_test(
+  NAME ucx_communicator_progress_fairness_test
+  COMMAND ucx_communicator_progress_fairness_test
+)
+
+set_tests_properties(
+  ucx_communicator_progress_fairness_test
+  PROPERTIES TIMEOUT 180
+)
+
+if(VELOX_ENABLE_CUDF)
+  set_tests_properties(
+    ucx_communicator_progress_fairness_test
+    PROPERTIES LABELS cuda_driver
+  )
+endif()
+
+target_link_libraries(
+  ucx_communicator_progress_fairness_test
+  PRIVATE
+    velox_ucx_exchange
+    Folly::folly
+    GTest::gtest
+    GTest::gtest_main
+    Threads::Threads
+)
+
+add_executable(
   ucx_cpu_row_completion_tracker_test
   CpuRowFrameCompletionTrackerTest.cpp
   CpuRowPayloadCopyTest.cpp

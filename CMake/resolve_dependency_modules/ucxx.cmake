@@ -16,11 +16,11 @@ include_guard(GLOBAL)
 
 # Match the UCXX and rapids-cmake revisions used by cudf.cmake so CPU-only and
 # combined cuDF builds cannot resolve two incompatible dependency copies.
-set(VELOX_UCXX_rapids_cmake_VERSION 26.08)
-set(VELOX_UCXX_rapids_cmake_COMMIT 323d37beeb2030cd5c9e7e981810915d59ecda09)
+set(VELOX_UCXX_rapids_cmake_VERSION 26.12)
+set(VELOX_UCXX_rapids_cmake_COMMIT 037d4c5489cc13f5b378b54197238a6e2cdbff17)
 set(
   VELOX_UCXX_rapids_cmake_BUILD_SHA256_CHECKSUM
-  bacf4aa0b253ddbc7b103793815909b5d61cee5604b2be14d715351b675e9de5
+  946ebc43d81dc7359e973df54bc0749f281a0b65b32a299b00ee6a66507b0a04
 )
 set(
   VELOX_UCXX_rapids_cmake_SOURCE_URL
@@ -57,6 +57,8 @@ block(SCOPE_FOR VARIABLES)
     URL_HASH SHA256=${VELOX_UCXX_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     UPDATE_DISCONNECTED 1
+    PATCH_COMMAND git init -q && git apply
+      ${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch
   )
   FetchContent_MakeAvailable(rapids-cmake ucxx)
 endblock()

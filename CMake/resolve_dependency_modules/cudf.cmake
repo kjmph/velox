@@ -178,6 +178,8 @@ block(SCOPE_FOR VARIABLES)
       SOURCE_SUBDIR
       cpp
       UPDATE_DISCONNECTED 1
+      PATCH_COMMAND git init -q && git apply
+        ${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch
     )
     FetchContent_MakeAvailable(ucxx)
   endif()

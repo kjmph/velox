@@ -123,9 +123,9 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     cudf::table_view tableView,
-    std::shared_ptr<cudf::table> owner,
+    ViewOwner owner,
     cuda::stream_ref stream,
-    uint64_t flatSize)
+    std::optional<uint64_t> flatSize)
     : RowVector(
           pool,
           std::move(type),
@@ -136,10 +136,29 @@ CudfVector::CudfVector(
       tableStorage_{std::move(owner)},
       tabView_{tableView},
       stream_{stream},
-      flatSize_{flatSize} {
-  VELOX_CHECK_NOT_NULL(std::get<std::shared_ptr<cudf::table>>(tableStorage_));
+      flatSize_{
+          flatSize.has_value() ? flatSize.value()
+                               : estimateTableSize(tableView)} {
+  VELOX_CHECK_NOT_NULL(std::get<ViewOwner>(tableStorage_));
   VELOX_CHECK_EQ(tabView_.num_rows(), size);
 }
+
+CudfVector::CudfVector(
+    velox::memory::MemoryPool* pool,
+    TypePtr type,
+    vector_size_t size,
+    cudf::table_view tableView,
+    std::shared_ptr<cudf::table> owner,
+    cuda::stream_ref stream,
+    uint64_t flatSize)
+    : CudfVector(
+          pool,
+          std::move(type),
+          size,
+          tableView,
+          ViewOwner{std::move(owner)},
+          stream,
+          flatSize) {}
 
 CudfVector::~CudfVector() {
   // Release the GPU allocation first. device_buffer deallocation is ordered on
@@ -214,8 +233,8 @@ std::unique_ptr<cudf::table> CudfVector::release() {
     runReleaseCallback(/*synchronizeStream=*/false);
     return materializedTable;
   }
-  if (auto* ownerPtr =
-          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+
+  if (auto* ownerPtr = std::get_if<ViewOwner>(&tableStorage_)) {
     auto materializedTable =
         std::make_unique<cudf::table>(tabView_, stream_, get_output_mr());
     stream_.sync();
@@ -259,8 +278,7 @@ bool CudfVector::rebindStream(cuda::stream_ref stream) {
     return true;
   }
 
-  if (auto* ownerPtr =
-          std::get_if<std::shared_ptr<cudf::table>>(&tableStorage_)) {
+  if (auto* ownerPtr = std::get_if<ViewOwner>(&tableStorage_)) {
     return *ownerPtr != nullptr && stream_.get() == stream.get();
   }
 

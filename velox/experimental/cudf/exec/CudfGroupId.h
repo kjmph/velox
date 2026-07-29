@@ -22,7 +22,13 @@
 
 #include <cudf/types.hpp>
 
+namespace cudf {
+class table;
+}
+
 namespace facebook::velox::cudf_velox {
+
+class CudfVector;
 
 /// GPU implementation of the GroupId operator for GROUPING SETS, CUBE, and
 /// ROLLUP operations. Takes a single input batch and produces N output batches
@@ -41,7 +47,7 @@ class CudfGroupId : public CudfOperatorBase {
   }
 
   bool isFinished() override {
-    return noMoreInput_ && inputColumns_.empty();
+    return noMoreInput_ && !input_;
   }
 
  protected:
@@ -50,6 +56,9 @@ class CudfGroupId : public CudfOperatorBase {
 
  private:
   static constexpr column_index_t kMissingGroupingKey =
+      std::numeric_limits<column_index_t>::max();
+
+  static constexpr column_index_t kNoNullColumn =
       std::numeric_limits<column_index_t>::max();
 
   /// A grouping set contains a subset of all the grouping keys. This list
@@ -67,11 +76,14 @@ class CudfGroupId : public CudfOperatorBase {
   /// create all-null columns for keys not in a grouping set.
   std::vector<cudf::data_type> groupingKeyCudfTypes_;
 
-  /// Stored input columns for cycling through grouping sets.
-  std::vector<std::unique_ptr<cudf::column>> inputColumns_;
+  /// Maps each grouping key to its cached all-null column. Keys present in
+  /// every grouping set use kNoNullColumn.
+  std::vector<column_index_t> nullColumnMappings_;
 
-  /// Size of the current input batch.
-  cudf::size_type inputSize_{0};
+  /// Input and synthesized null columns retained while cycling through
+  /// grouping sets. Outputs share ownership of these buffers.
+  std::shared_ptr<CudfVector> input_;
+  std::shared_ptr<cudf::table> nullColumns_;
 
   /// Stream associated with the input data.
   cuda::stream_ref inputStream_{cudaStream_t{cudaStreamDefault}};

@@ -27,27 +27,30 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <variant>
 
 namespace facebook::velox::cudf_velox {
 
 // Vector class which holds GPU data from cuDF.
-// Can be constructed either from an owned cudf::table or from packed_table.
-// When constructed from packed_table, the data remains packed and tabView_
-// references the table view inside packed_table without copying the underlying
-// GPU data.
+// Can be constructed from an owned cudf::table, a packed_table, or a
+// table_view with opaque shared ownership. Packed and shared-view
+// constructions avoid copying the underlying GPU data.
 //
 // CudfVector assumes that the input table data is already ready to consume.
 // Constructors and rebindStream() do not insert CUDA stream waits for work that
 // populated the input buffers; callers must establish that ordering before
-// constructing or rebinding a CudfVector.
+// constructing or rebinding a CudfVector. All buffers retained by a ViewOwner
+// must also be safe to deallocate on the supplied stream; opaque view ownership
+// cannot be rebound to a different stream.
 class CudfVector : public RowVector {
  public:
   /// Invoked after the vector releases its packed GPU storage. A non-null
   /// exception indicates that synchronizing the storage's final stream failed,
   /// so callers must not treat the allocation as safely reusable.
   using ReleaseCallback = std::function<void(std::exception_ptr)>;
+  using ViewOwner = std::shared_ptr<void>;
 
   /// Constructs a CudfVector from an owned cudf::table.
   CudfVector(
@@ -68,9 +71,22 @@ class CudfVector : public RowVector {
       cuda::stream_ref stream,
       ReleaseCallback releaseCallback = nullptr);
 
-  /// Constructs a CudfVector from a table view backed by a shared owner table.
-  /// The view may be a slice of owner->view(); the owner is retained until this
-  /// vector is destroyed or materialized via release().
+  /// Constructs a CudfVector from a table view backed by shared storage. The
+  /// owner is retained until this vector is destroyed or materialized via
+  /// release(). The view may reference one or more objects retained by owner.
+  /// The logical flat size is inferred from the view unless supplied, e.g. for
+  /// a slice whose size should be apportioned from its owner.
+  CudfVector(
+      velox::memory::MemoryPool* pool,
+      TypePtr type,
+      vector_size_t size,
+      cudf::table_view tableView,
+      ViewOwner owner,
+      cuda::stream_ref stream,
+      std::optional<uint64_t> flatSize = std::nullopt);
+
+  /// Compatibility overload for a view backed by a single shared table with
+  /// an explicitly supplied logical flat size.
   CudfVector(
       velox::memory::MemoryPool* pool,
       TypePtr type,
@@ -90,9 +106,8 @@ class CudfVector : public RowVector {
     return tabView_;
   }
 
-  /// Releases ownership of the underlying table.
-  /// If constructed from packed_table, materializes a table from the view
-  /// first (which copies the data).
+  /// Releases ownership of the underlying table. Packed and shared-view
+  /// storage is materialized from the view first, which copies the data.
   std::unique_ptr<cudf::table> release();
 
   /// Rebinds owned table buffers to use 'stream' for future deallocation.
@@ -112,16 +127,15 @@ class CudfVector : public RowVector {
 
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override;
 
-  // Storage for an owned table, packed table, or shared owner table.
+  // Storage for an owned table, packed table, or opaque shared view owner.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<
       std::unique_ptr<cudf::table>,
       std::unique_ptr<cudf::packed_table>,
-      std::shared_ptr<cudf::table>>;
+      ViewOwner>;
   TableStorage tableStorage_;
 
-  // Table view - always valid, points to either table_->view() or
-  // packedTable_->table.
+  // Table view - always valid, backed by the active TableStorage alternative.
   cudf::table_view tabView_;
 
   cuda::stream_ref stream_;

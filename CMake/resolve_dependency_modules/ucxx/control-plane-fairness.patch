@@ -1,0 +1,1590 @@
+diff --git a/cpp/include/ucxx/delayed_submission.h b/cpp/include/ucxx/delayed_submission.h
+index e745e7a..2e47ffa 100644
+--- a/cpp/include/ucxx/delayed_submission.h
++++ b/cpp/include/ucxx/delayed_submission.h
+@@ -1,11 +1,13 @@
+ /**
+- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
++ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES.
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ #pragma once
+ 
++#include <algorithm>
+ #include <deque>
+ #include <functional>
++#include <limits>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -39,6 +41,12 @@ typedef std::function<void()> DelayedSubmissionCallbackType;
+  */
+ typedef uint64_t ItemIdType;
+ 
++/**
++ * Maximum number of delayed requests submitted before checking for newly
++ * scheduled high-priority control callbacks.
++ */
++inline constexpr size_t kDefaultDelayedRequestSubmissionBatchSize = 64;
++
+ /**
+  * @brief Base type for a collection of delayed submissions.
+  *
+@@ -138,17 +146,29 @@ class BaseDelayedSubmissionCollection {
+   /**
+    * @brief Process all pending callbacks.
+    *
+-   * Process all pending generic. Generic callbacks are deemed completed when their
+-   * execution completes.
++   * Process every callback pending when this method starts. Callbacks scheduled
++   * while processing remain queued.
+    */
+-  void process()
++  void process() { processSome(std::numeric_limits<size_t>::max()); }
++
++  /**
++   * @brief Process up to a fixed number of pending callbacks.
++   *
++   * Process at most `maxItems` callbacks that were pending when this method
++   * started. Items scheduled while processing remain queued.
++   *
++   * @param[in] maxItems maximum number of queued items to remove.
++   *
++   * @returns number of items removed from the queue, including canceled items.
++   */
++  size_t processSome(size_t maxItems)
+   {
+     // Process only those that were already inserted to prevent from never
+     // returning if `_collection` grows indefinitely.
+     size_t toProcess = 0;
+     {
+       std::lock_guard<std::mutex> lock(_mutex);
+-      toProcess = _collection.size();
++      toProcess = std::min(maxItems, _collection.size());
+     }
+ 
+     for (size_t i = 0; i < toProcess; ++i) {
+@@ -169,6 +189,19 @@ class BaseDelayedSubmissionCollection {
+       std::lock_guard<std::mutex> lock(_mutex);
+       _processing = std::nullopt;
+     }
++
++    return toProcess;
++  }
++
++  /**
++   * @brief Get the number of pending items.
++   *
++   * @returns number of items currently queued.
++   */
++  [[nodiscard]] size_t pendingCount()
++  {
++    std::lock_guard<std::mutex> lock(_mutex);
++    return _collection.size();
+   }
+ 
+   /**
+@@ -259,6 +292,8 @@ class GenericDelayedSubmissionCollection
+  */
+ class DelayedSubmissionCollection {
+  private:
++  GenericDelayedSubmissionCollection _controlPre{
++    "control pre"};  ///< High-priority pre-progress operations that may overtake requests.
+   GenericDelayedSubmissionCollection _genericPre{
+     "generic pre"};  ///< The collection of all known generic pre-progress operations.
+   GenericDelayedSubmissionCollection _genericPost{
+@@ -290,16 +325,18 @@ class DelayedSubmissionCollection {
+   /**
+    * @brief Process pending delayed request submission and generic-pre callback operations.
+    *
+-   * Process all pending delayed request submissions and generic callbacks. Generic
+-   * callbacks are deemed completed when their execution completes. On the other hand, the
+-   * execution of the delayed request submission callbacks does not imply completion of the
+-   * operation, only that it has been submitted. The completion of each delayed request
+-   * submission is handled externally by the implementation of the object being processed,
+-   * for example by checking the result of `ucxx::Request::isCompleted()`.
+-   *
+-   * Generic callbacks may be used to to pass information between threads on the subject
+-   * that requests have been in fact processed, therefore, requests are processed first,
+-   * then generic callbacks are.
++   * Process pending high-priority control callbacks, the original snapshot of
++   * delayed requests, and generic callbacks. Control callbacks are checked
++   * before and between bounded request chunks. Generic callbacks are deemed
++   * completed when their execution completes. On the other hand, execution of
++   * delayed request callbacks only means they have been submitted. Request
++   * completion is handled externally, for example through
++   * `ucxx::Request::isCompleted()`.
++   *
++   * Generic callbacks may be used to pass information between threads about
++   * requests having been submitted. Therefore the complete request snapshot is
++   * processed before generic callbacks. Requests added while processing remain
++   * queued for the next call.
+    */
+   void processPre();
+ 
+@@ -326,11 +363,25 @@ class DelayedSubmissionCollection {
+    */
+   void registerRequest(std::shared_ptr<Request> request, DelayedSubmissionCallbackType callback);
+ 
++  /**
++   * @brief Register a high-priority callback to execute during `processPre()`.
++   *
++   * Control callbacks are checked before delayed request submission and between
++   * bounded request chunks. Unlike generic-pre callbacks, they may overtake
++   * requests and must not be used as a request-submission barrier.
++   *
++   * @param[in] callback callback to execute before progressing the worker.
++   *
++   * @returns the ID of the scheduled item, which may be used for cancellation.
++   */
++  [[nodiscard]] ItemIdType registerControlPre(DelayedSubmissionCallbackType callback);
++
+   /**
+    * @brief Register a generic callback to execute during `processPre()`.
+    *
+-   * Register a generic callback that will be executed when `processPre()` is called.
+-   * Lifetime of the callback must be ensured by the caller.
++   * Register a generic callback that will be executed after the request snapshot
++   * captured by `processPre()`. It may therefore be used as a request-submission
++   * barrier. Lifetime of the callback must be ensured by the caller.
+    *
+    * @param[in] callback  the callback that will be executed by `processPre()`.
+    *
+@@ -363,6 +414,13 @@ class DelayedSubmissionCollection {
+    */
+   void cancelGenericPre(ItemIdType id);
+ 
++  /**
++   * @brief Cancel a pending high-priority control callback.
++   *
++   * @param[in] id ID returned by `registerControlPre()`.
++   */
++  void cancelControlPre(ItemIdType id);
++
+   /**
+    * @brief Cancel a generic callback scheduled for `processPost()` execution.
+    *
+diff --git a/cpp/include/ucxx/utils/progress.h b/cpp/include/ucxx/utils/progress.h
+new file mode 100644
+index 0000000..88d2f37
+--- /dev/null
++++ b/cpp/include/ucxx/utils/progress.h
+@@ -0,0 +1,57 @@
++/**
++ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++#pragma once
++
++#include <cstddef>
++
++namespace ucxx::utils {
++
++/**
++ * Maximum number of consecutive UCP progress calls made by one UCXX progress
++ * operation.
++ *
++ * A progress thread also owns delayed request submission and generic control
++ * callbacks. Returning to its outer scheduling loop after a finite amount of
++ * data-plane work prevents continuously busy UCP workers from starving those
++ * queues.
++ */
++inline constexpr size_t kDefaultProgressDrainMaxIterations = 256;
++
++/**
++ * Result from a bounded progress drain.
++ */
++struct ProgressDrainResult {
++  bool madeProgress{false};  ///< At least one progress call reported work.
++  bool reachedIdle{false};   ///< A progress call reported that no work remained.
++  size_t iterations{0};      ///< Number of progress calls made.
++};
++
++/**
++ * Progress until the worker reports idle or the fairness budget is exhausted.
++ *
++ * @param[in] progressOnce  callable returning true when it progressed work.
++ * @param[in] maxIterations maximum number of calls before yielding.
++ *
++ * @returns drain status, including whether the worker reached idle.
++ */
++template <typename ProgressOnce>
++ProgressDrainResult progressUntilIdleOrBudget(
++  ProgressOnce&& progressOnce, size_t maxIterations = kDefaultProgressDrainMaxIterations)
++{
++  ProgressDrainResult result{};
++
++  for (size_t i = 0; i < maxIterations; ++i) {
++    ++result.iterations;
++    if (!progressOnce()) {
++      result.reachedIdle = true;
++      break;
++    }
++    result.madeProgress = true;
++  }
++
++  return result;
++}
++
++}  // namespace ucxx::utils
+diff --git a/cpp/include/ucxx/worker.h b/cpp/include/ucxx/worker.h
+index 37c1d3c..8215a9b 100644
+--- a/cpp/include/ucxx/worker.h
++++ b/cpp/include/ucxx/worker.h
+@@ -144,13 +144,53 @@ class Worker : public Component {
+   [[nodiscard]] std::shared_ptr<Request> registerInflightRequest(std::shared_ptr<Request> request);
+ 
+   /**
+-   * @brief Progress the worker until all communication events are completed.
++   * @brief Register either a control-pre or generic-pre callback.
+    *
+-   * Iteratively calls `progressOnce()` until all communication events are completed.
++   * @param[in] callback callback to execute in the progress thread.
++   * @param[in] period maximum wait in nanoseconds, or zero for no timeout.
++   * @param[in] highPriority whether to use the control-pre queue.
++   *
++   * @returns whether the callback completed before the timeout.
++   */
++  bool registerPre(DelayedSubmissionCallbackType callback, uint64_t period, bool highPriority);
++
++  /**
++   * @brief Progress the worker until idle or an iteration limit is reached.
++   *
++   * @param[in] maxIterations maximum number of calls to `progressOnce()`.
+    *
+    * @returns whether any communication events have been progressed.
+    */
+-  bool progressPending();
++  bool progressPending(size_t maxIterations);
++
++  /**
++   * @brief Progress with a limit suitable for the dedicated progress thread.
++   *
++   * The finite limit returns control to the thread's outer scheduling loop so
++   * delayed request submissions and generic control callbacks cannot be
++   * starved by a continuously busy worker.
++   *
++   * @returns whether any communication events have been progressed.
++   */
++  bool progressForThread();
++
++  /**
++   * @brief Progress a blocking worker event with progress-thread fairness.
++   *
++   * @param[in] epollTimeout timeout in ms when waiting for a worker event.
++   *
++   * @returns whether any communication events have been progressed.
++   */
++  bool progressWorkerEventForThread(int epollTimeout);
++
++  /**
++   * @brief Progress and process scheduled cancellations with an iteration limit.
++   *
++   * @param[in] maxIterations maximum number of calls in each progress drain.
++   *
++   * @returns whether any communication events have been progressed.
++   */
++  bool progressWithBudget(size_t maxIterations);
+ 
+   /**
+    * @brief Set the preferred buffer type for CUDA allocations.
+@@ -439,6 +479,23 @@ class Worker : public Component {
+   void registerDelayedSubmission(std::shared_ptr<Request> request,
+                                  DelayedSubmissionCallbackType callback);
+ 
++  /**
++   * @brief Register a high-priority callback before worker progress.
++   *
++   * Control-pre callbacks are serviced before delayed requests and between
++   * bounded request-submission chunks. They may therefore overtake requests
++   * already queued on the worker and must not be used as a request-submission
++   * barrier. This is intended for independent control-plane operations such as
++   * endpoint creation.
++   *
++   * @param[in] callback callback to execute in the progress thread.
++   * @param[in] period time in nanoseconds to wait for completion.
++   *
++   * @returns `true` if the callback executed, or `false` if it timed out.
++   */
++  [[nodiscard]] bool registerControlPre(DelayedSubmissionCallbackType callback,
++                                        uint64_t period = 0);
++
+   /**
+    * @brief Register callback to be executed in progress thread before progressing.
+    *
+@@ -447,9 +504,11 @@ class Worker : public Component {
+    * be executed in the current or next iteration, this depends on where the progress thread
+    * is in the current iteration when this callback is registered.
+    *
+-   * The purpose of this method is to schedule operations to be executed in the progress
+-   * thread, such as endpoint creation and closing, so that progressing doesn't ever need
+-   * to occur in the application thread when using a progress thread.
++   * The purpose of this method is to schedule operations that must run after
++   * the current delayed-request snapshot, such as endpoint closing or request
++   * cancellation, so that progressing does not need to occur in the
++   * application thread. Use `registerControlPre()` for independent operations
++   * that may safely overtake delayed requests.
+    *
+    * If `period` is `0` this is a blocking call that only returns when the callback has been
+    * executed and will always return `true`, and if `period` is a positive integer the time
+diff --git a/cpp/src/delayed_submission.cpp b/cpp/src/delayed_submission.cpp
+index 6d3c236..1e89df9 100644
+--- a/cpp/src/delayed_submission.cpp
++++ b/cpp/src/delayed_submission.cpp
+@@ -1,5 +1,5 @@
+ /**
+- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
++ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES.
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ #include <memory>
+@@ -69,7 +69,23 @@ bool DelayedSubmissionCollection::isDelayedRequestSubmissionEnabled() const
+ 
+ void DelayedSubmissionCollection::processPre()
+ {
+-  _requests.process();
++  // Control callbacks, such as endpoint creation, do not depend on prior
++  // request submission and must not wait behind an arbitrarily large request
++  // snapshot.
++  _controlPre.process();
++
++  // Preserve the existing generic-pre barrier contract: capture the original
++  // request snapshot and submit all of it before generic-pre callbacks. Requests
++  // added while processing remain queued for the next iteration. Checking the
++  // control queue between bounded chunks lets newly scheduled control work
++  // preempt aggregate request-submission work without reordering the barrier.
++  size_t requestsRemaining = _requests.pendingCount();
++  while (requestsRemaining > 0) {
++    const size_t processed =
++      _requests.processSome(std::min(requestsRemaining, kDefaultDelayedRequestSubmissionBatchSize));
++    requestsRemaining -= processed;
++    _controlPre.process();
++  }
+ 
+   _genericPre.process();
+ }
+@@ -82,6 +98,11 @@ void DelayedSubmissionCollection::registerRequest(std::shared_ptr<Request> reque
+   std::ignore = _requests.schedule({request, callback});
+ }
+ 
++ItemIdType DelayedSubmissionCollection::registerControlPre(DelayedSubmissionCallbackType callback)
++{
++  return _controlPre.schedule(callback);
++}
++
+ ItemIdType DelayedSubmissionCollection::registerGenericPre(DelayedSubmissionCallbackType callback)
+ {
+   return _genericPre.schedule(callback);
+@@ -94,6 +115,8 @@ ItemIdType DelayedSubmissionCollection::registerGenericPost(DelayedSubmissionCal
+ 
+ void DelayedSubmissionCollection::cancelGenericPre(ItemIdType id) { _genericPre.cancel(id); }
+ 
++void DelayedSubmissionCollection::cancelControlPre(ItemIdType id) { _controlPre.cancel(id); }
++
+ void DelayedSubmissionCollection::cancelGenericPost(ItemIdType id) { _genericPost.cancel(id); }
+ 
+ }  // namespace ucxx
+diff --git a/cpp/src/endpoint.cpp b/cpp/src/endpoint.cpp
+index 056d4ca..e966b86 100644
+--- a/cpp/src/endpoint.cpp
++++ b/cpp/src/endpoint.cpp
+@@ -156,7 +156,7 @@ void Endpoint::create(ucp_ep_params_t* params)
+ 
+     size_t maxAttempts = 3;
+     for (uint64_t i = 0; i < maxAttempts; ++i) {
+-      if (worker->registerGenericPre(
++      if (worker->registerControlPre(
+             [this, &worker, &params, &status]() {
+               status = ucp_ep_create(worker->getHandle(), params, &_handle);
+             },
+diff --git a/cpp/src/worker.cpp b/cpp/src/worker.cpp
+index 94b6538..14094d5 100644
+--- a/cpp/src/worker.cpp
++++ b/cpp/src/worker.cpp
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ #include <functional>
+ #include <ios>
++#include <limits>
+ #include <memory>
+ #include <mutex>
+ #include <queue>
+@@ -30,6 +31,7 @@
+ #include <ucxx/typedefs.h>
+ #include <ucxx/utils/callback_notifier.h>
+ #include <ucxx/utils/file_descriptor.h>
++#include <ucxx/utils/progress.h>
+ #include <ucxx/utils/ucx.h>
+ #include <ucxx/worker.h>
+ 
+@@ -304,19 +306,15 @@ bool Worker::waitProgress()
+ 
+ bool Worker::progressOnce() { return ucp_worker_progress(_handle) != 0; }
+ 
+-bool Worker::progressPending()
++bool Worker::progressPending(size_t maxIterations)
+ {
+-  bool ret = false, prog = false;
+-  do {
+-    prog = progressOnce();
+-    ret |= prog;
+-  } while (prog);
+-  return ret;
++  return utils::progressUntilIdleOrBudget([this]() { return progressOnce(); }, maxIterations)
++    .madeProgress;
+ }
+ 
+-bool Worker::progress()
++bool Worker::progressWithBudget(size_t maxIterations)
+ {
+-  bool ret                     = progressPending();
++  bool ret                     = progressPending(maxIterations);
+   bool progressScheduledCancel = false;
+ 
+   {
+@@ -326,14 +324,37 @@ bool Worker::progress()
+     progressScheduledCancel =
+       _inflightRequestsToCancel != nullptr && _inflightRequestsToCancel->size() > 0;
+   }
+-  if (progressScheduledCancel) ret |= progressPending();
++  if (progressScheduledCancel) ret |= progressPending(maxIterations);
+ 
+   // Requests that were not completed now must be canceled.
+-  if (cancelInflightRequests(3000000000 /* 3s */, 3) > 0) ret |= progressPending();
++  if (cancelInflightRequests(3000000000 /* 3s */, 3) > 0) ret |= progressPending(maxIterations);
+ 
+   return ret;
+ }
+ 
++bool Worker::progress() { return progressWithBudget(std::numeric_limits<size_t>::max()); }
++
++bool Worker::progressForThread()
++{
++  return progressWithBudget(utils::kDefaultProgressDrainMaxIterations);
++}
++
++bool Worker::progressWorkerEventForThread(const int epollTimeout)
++{
++  int ret;
++  epoll_event ev;
++
++  if (progressForThread()) return true;
++
++  if ((_epollFileDescriptor == -1) || !arm()) return false;
++
++  do {
++    ret = epoll_wait(_epollFileDescriptor, &ev, 1, epollTimeout);
++  } while ((ret == -1) && (errno == EINTR || errno == EAGAIN));
++
++  return false;
++}
++
+ void Worker::registerDelayedSubmission(std::shared_ptr<Request> request,
+                                        DelayedSubmissionCallbackType callback)
+ {
+@@ -350,7 +371,7 @@ void Worker::registerDelayedSubmission(std::shared_ptr<Request> request,
+   }
+ }
+ 
+-bool Worker::registerGenericPre(DelayedSubmissionCallbackType callback, uint64_t period)
++bool Worker::registerPre(DelayedSubmissionCallbackType callback, uint64_t period, bool highPriority)
+ {
+   if (std::this_thread::get_id() == getProgressThreadId()) {
+     /**
+@@ -367,7 +388,8 @@ bool Worker::registerGenericPre(DelayedSubmissionCallbackType callback, uint64_t
+       callbackNotifier.set();
+     };
+ 
+-    auto id = _delayedSubmissionCollection->registerGenericPre(notifiableCallback);
++    auto id = highPriority ? _delayedSubmissionCollection->registerControlPre(notifiableCallback)
++                           : _delayedSubmissionCollection->registerGenericPre(notifiableCallback);
+ 
+     /* Waking the progress event is needed here because the UCX request is
+      * not dispatched immediately. Thus we must signal the progress task so
+@@ -384,7 +406,12 @@ bool Worker::registerGenericPre(DelayedSubmissionCallbackType callback, uint64_t
+       auto ret = callbackNotifier.wait(period, signalWorkerFunction);
+ 
+       try {
+-        if (!ret) _delayedSubmissionCollection->cancelGenericPre(id);
++        if (!ret) {
++          if (highPriority)
++            _delayedSubmissionCollection->cancelControlPre(id);
++          else
++            _delayedSubmissionCollection->cancelGenericPre(id);
++        }
+         return ret;
+       } catch (const std::runtime_error& e) {
+         if (++retryCount % 10 == 0)
+@@ -397,6 +424,16 @@ bool Worker::registerGenericPre(DelayedSubmissionCallbackType callback, uint64_t
+   }
+ }
+ 
++bool Worker::registerControlPre(DelayedSubmissionCallbackType callback, uint64_t period)
++{
++  return registerPre(std::move(callback), period, true);
++}
++
++bool Worker::registerGenericPre(DelayedSubmissionCallbackType callback, uint64_t period)
++{
++  return registerPre(std::move(callback), period, false);
++}
++
+ bool Worker::registerGenericPost(DelayedSubmissionCallbackType callback, uint64_t period)
+ {
+   if (std::this_thread::get_id() == getProgressThreadId()) {
+@@ -485,11 +522,13 @@ void Worker::startProgressThread(const bool pollingMode, const int epollTimeout)
+   std::function<bool()> progressFunction;
+   std::function<void()> signalWorkerFunction;
+   if (pollingMode) {
+-    progressFunction     = [this]() { return this->progress(); };
++    progressFunction     = [this]() { return this->progressForThread(); };
+     signalWorkerFunction = []() {};
+   } else {
+     initBlockingProgressMode();
+-    progressFunction = [this, epollTimeout]() { return this->progressWorkerEvent(epollTimeout); };
++    progressFunction = [this, epollTimeout]() {
++      return this->progressWorkerEventForThread(epollTimeout);
++    };
+     signalWorkerFunction = [this]() { return this->signal(); };
+   }
+ 
+@@ -554,7 +593,7 @@ size_t Worker::cancelInflightRequests(uint64_t period, uint64_t maxAttempts)
+   if (std::this_thread::get_id() == getProgressThreadId()) {
+     canceled = inflightRequestsToCancel->cancelAll();
+     for (uint64_t i = 0; i < maxAttempts && inflightRequestsToCancel->getCancelingSize() > 0; ++i)
+-      progressPending();
++      progressPending(utils::kDefaultProgressDrainMaxIterations);
+   } else if (isProgressThreadRunning()) {
+     bool cancelSuccess = false;
+     for (uint64_t i = 0; i < maxAttempts && !cancelSuccess; ++i) {
+diff --git a/cpp/tests/CMakeLists.txt b/cpp/tests/CMakeLists.txt
+index e81ed97..5f44b2c 100644
+--- a/cpp/tests/CMakeLists.txt
++++ b/cpp/tests/CMakeLists.txt
+@@ -53,7 +53,7 @@ endfunction()
+ # ##################################################################################################
+ # * ucxx tests ------------------------------------------------------------------------------------
+ ConfigureTest(
+-  UCXX_TEST buffer.cpp component_builders.cpp config.cpp context.cpp endpoint.cpp header.cpp
++  UCXX_TEST buffer.cpp component_builders.cpp config.cpp context.cpp control_plane_fairness.cpp endpoint.cpp header.cpp
+   listener.cpp request.cpp request_builders.cpp rma.cpp utils.cpp worker.cpp
+ )
+ 
+diff --git a/cpp/tests/CONTROL_PLANE_FAIRNESS.md b/cpp/tests/CONTROL_PLANE_FAIRNESS.md
+new file mode 100644
+index 0000000..39022ba
+--- /dev/null
++++ b/cpp/tests/CONTROL_PLANE_FAIRNESS.md
+@@ -0,0 +1,167 @@
++# UCXX progress-thread control-plane fairness
++
++This branch tests and fixes starvation of delayed control-plane callbacks when
++`ucp_worker_progress()` remains continuously busy with data-plane completions.
++The observed production symptom is three consecutive 3-second
++`ucp_ep_create()` callback timeouts while established endpoints continue
++transferring data.
++
++The fix limits each dedicated progress-thread drain to 256 UCP progress calls.
++It then returns to the outer worker loop, where delayed request submissions and
++generic pre/post callbacks are serviced. Public `Worker::progress()` retains its
++existing drain-until-idle behavior.
++
++The remaining starvation path was an entire delayed-request snapshot ahead of
++endpoint creation. Endpoint creation now uses a separate control-pre queue.
++Delayed requests are submitted in chunks of 64, with control-pre serviced
++between chunks. Generic-pre remains behind the complete original request
++snapshot, preserving its request-submission barrier semantics.
++
++## Build
++
++Create the normal UCXX development environment, then:
++
++```bash
++./build.sh clean libucxx libucxx_tests -n
++```
++
++The test executable is:
++
++```text
++cpp/build/gtests/UCXX_TEST
++```
++
++The commands below are also wrapped by:
++
++```bash
++cpp/tests/run_control_plane_fairness.sh fast
++cpp/tests/run_control_plane_fairness.sh backlog-repro
++cpp/tests/run_control_plane_fairness.sh endpoint-repro
++cpp/tests/run_control_plane_fairness.sh natural-backlog
++cpp/tests/run_control_plane_fairness.sh stress
++```
++
++## Fast regression gate
++
++```bash
++timeout 60s cpp/build/gtests/UCXX_TEST \
++  --gtest_filter='ProgressDrainTest.*:WorkerProgressThreadTest.GenericPreRunsWhileProgressRemainsContinuouslyBusy'
++```
++
++The generic-pre test is deterministic. It models a worker that never reports
++idle and fails on the unbounded implementation without requiring RDMA hardware.
++The delayed-submission characterization also records how many request callbacks
++are processed before a generic-pre callback. On the current implementation that
++is the entire request snapshot.
++
++## Delayed-request backlog reproduction
++
++The production run still timed out after the UCP progress drain was bounded.
++The next scheduling stage before endpoint creation is the delayed-request queue:
++
++```text
++delayed requests -> generic pre (ucp_ep_create) -> UCP progress -> generic post
++```
++
++Two disabled regression tests isolate that path. They are disabled so a normal
++UCXX test run remains usable while the bug is intentionally present.
++
++First, reproduce a shortened generic-pre deadline:
++
++```bash
++cpp/tests/run_control_plane_fairness.sh backlog-repro
++```
++
++This queues 128 delayed-request callbacks whose aggregate runtime exceeds a
++100 ms control-pre deadline. The test-only parent commit processes the entire
++request snapshot first and fails with:
++
++```text
++control-pre callback timed out behind the delayed-request snapshot
++```
++
++With the priority control queue, the callback executes before the first request
++chunk and the test passes. A separate deterministic test confirms generic-pre
++still observes the complete original request snapshot.
++
++Second, exercise the real endpoint creation path:
++
++```bash
++cpp/tests/run_control_plane_fairness.sh endpoint-repro
++```
++
++This creates a worker with delayed submission enabled, parks its progress
++thread inside the first callback of a four-second delayed-request snapshot, and
++then requests a real loopback endpoint. The test-only parent commit emits the
++same three-second `ucp_ep_create` retry warning seen in production and fails its
++two-second endpoint-latency requirement. The priority control queue should
++create the endpoint after the current 64-request chunk instead of the complete
++snapshot.
++
++The reproducers report the configured backlog, observed control-plane latency,
++and the number of delayed requests processed ahead of the control operation as
++GoogleTest properties. A scheduling fix should make both disabled tests pass
++without reducing or removing the backlog. Their settings can be overridden:
++
++```text
++UCXX_TEST_BACKLOG_REQUEST_COUNT
++UCXX_TEST_BACKLOG_CALLBACK_DELAY_US
++UCXX_TEST_BACKLOG_CONTROL_DEADLINE_MS
++UCXX_TEST_ENDPOINT_BACKLOG_REQUEST_COUNT
++UCXX_TEST_ENDPOINT_BACKLOG_CALLBACK_DELAY_US
++UCXX_TEST_ENDPOINT_BACKLOG_MAX_LATENCY_MS
++```
++
++Finally, measure the same path without artificial callback delays:
++
++```bash
++cpp/tests/run_control_plane_fairness.sh natural-backlog
++```
++
++This sweeps 8,192, 32,768, and 131,072 pairs of real delayed `tagRecv` and
++`tagSend` requests queued before a late endpoint. It validates every transfer
++and reports endpoint latency for each backlog size. Override the sweep with a
++space-separated list:
++
++```bash
++UCXX_TEST_NATURAL_BACKLOG_COUNTS='32768 65536 131072 262144' \
++  cpp/tests/run_control_plane_fairness.sh natural-backlog
++```
++
++If latency scales toward three seconds, aggregate request submission is enough
++to explain the production timeout. If it remains low even at large backlogs,
++the next target is a slow request callback or lock encountered by the progress
++thread rather than queue length alone.
++
++## Real UCXX delayed-submission stress
++
++```bash
++timeout 120s env \
++  UCXX_TEST_FAIRNESS_BATCH_SIZE=32768 \
++  UCXX_TEST_FAIRNESS_ENDPOINT_COUNT=256 \
++  UCXX_TEST_FAIRNESS_MAX_ENDPOINT_LATENCY_MS=2000 \
++  cpp/build/gtests/UCXX_TEST \
++    --gtest_filter='WorkerProgressThreadTest.LateEndpointsCompleteDuringDelayedTagTraffic' \
++    --gtest_repeat=10 \
++    --gtest_break_on_failure
++```
++
++The test:
++
++1. starts a polling progress thread with delayed request submission enabled;
++2. keeps a rolling window of tag requests outstanding on an established
++   endpoint, replenishing each completed slot;
++3. creates new endpoints after traffic is active;
++4. requires every endpoint creation to finish below the configured deadline;
++5. transfers data over every late endpoint; and
++6. verifies each request callback fires exactly once.
++
++The three environment variables are deliberately tunable. Start with the
++values above. `UCXX_TEST_FAIRNESS_BATCH_SIZE` is the number of traffic slots
++kept outstanding; increase it if the host drains the background work too
++quickly to reproduce the old failure. The test reports
++`background_transfers_completed`, `late_endpoints_created`, and
++`max_endpoint_latency_ms` as GoogleTest properties.
++
++These tests create only process-local UCX workers and endpoints. They do not
++modify NIC, firmware, routing, IBM Storage Scale, or Slurm state.
+diff --git a/cpp/tests/control_plane_fairness.cpp b/cpp/tests/control_plane_fairness.cpp
+new file mode 100644
+index 0000000..eacc817
+--- /dev/null
++++ b/cpp/tests/control_plane_fairness.cpp
+@@ -0,0 +1,759 @@
++/**
++ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdlib>
++#include <exception>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <tuple>
++#include <utility>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++#include <ucxx/api.h>
++#include <ucxx/address_builder.h>
++#include <ucxx/context_builder.h>
++#include <ucxx/endpoint_builder.h>
++#include <ucxx/request_tag_builder.h>
++#include <ucxx/worker_builder.h>
++#include <ucxx/delayed_submission.h>
++#include <ucxx/utils/progress.h>
++#include <ucxx/worker_progress_thread.h>
++
++namespace {
++
++using namespace std::chrono_literals;
++
++template <typename Predicate>
++bool waitUntil(std::chrono::milliseconds timeout, Predicate&& predicate)
++{
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
++  while (!predicate() && std::chrono::steady_clock::now() < deadline)
++    std::this_thread::sleep_for(1ms);
++  return predicate();
++}
++
++size_t readPositiveEnvironmentSize(const char* name, size_t defaultValue)
++{
++  const char* value = std::getenv(name);
++  if (value == nullptr || *value == '\0') return defaultValue;
++
++  try {
++    const auto parsed = std::stoull(value);
++    return parsed == 0 ? defaultValue : static_cast<size_t>(parsed);
++  } catch (const std::exception&) {
++    return defaultValue;
++  }
++}
++
++class ProgressThreadStartGate {
++ private:
++  std::mutex _mutex;
++  std::condition_variable _conditionVariable;
++  bool _entered{false};
++  bool _released{false};
++
++ public:
++  static void callback(void* argument)
++  {
++    auto* gate = static_cast<ProgressThreadStartGate*>(argument);
++    std::unique_lock<std::mutex> lock(gate->_mutex);
++    gate->_entered = true;
++    gate->_conditionVariable.notify_all();
++    gate->_conditionVariable.wait(lock, [&]() { return gate->_released; });
++  }
++
++  bool waitUntilEntered(std::chrono::milliseconds timeout)
++  {
++    std::unique_lock<std::mutex> lock(_mutex);
++    return _conditionVariable.wait_for(lock, timeout, [&]() { return _entered; });
++  }
++
++  void release()
++  {
++    {
++      std::lock_guard<std::mutex> lock(_mutex);
++      _released = true;
++    }
++    _conditionVariable.notify_all();
++  }
++};
++
++void enqueueDelayedRequestBacklog(const std::shared_ptr<ucxx::Worker>& worker,
++                                  size_t requestCount,
++                                  std::chrono::microseconds callbackDelay,
++                                  std::atomic<size_t>& requestsProcessed)
++{
++  for (size_t i = 0; i < requestCount; ++i) {
++    // The worker only needs the Request shared pointer to preserve its lifetime.
++    // An empty pointer is sufficient for this scheduling-only test, while the
++    // callback models the work performed by Request::populateDelayedSubmission().
++    worker->registerDelayedSubmission({}, [callbackDelay, &requestsProcessed]() {
++      if (callbackDelay.count() > 0) std::this_thread::sleep_for(callbackDelay);
++      requestsProcessed.fetch_add(1, std::memory_order_release);
++    });
++  }
++}
++
++TEST(ProgressDrainTest, StopsWhenWorkerReportsIdle)
++{
++  size_t calls{0};
++  auto result = ucxx::utils::progressUntilIdleOrBudget(
++    [&calls]() {
++      ++calls;
++      return calls < 4;
++    },
++    16);
++
++  EXPECT_TRUE(result.madeProgress);
++  EXPECT_TRUE(result.reachedIdle);
++  EXPECT_EQ(result.iterations, 4);
++  EXPECT_EQ(calls, 4);
++}
++
++TEST(ProgressDrainTest, YieldsAtFairnessBudgetWhenWorkerRemainsBusy)
++{
++  constexpr size_t budget{7};
++  size_t calls{0};
++  auto result = ucxx::utils::progressUntilIdleOrBudget(
++    [&calls]() {
++      ++calls;
++      return true;
++    },
++    budget);
++
++  EXPECT_TRUE(result.madeProgress);
++  EXPECT_FALSE(result.reachedIdle);
++  EXPECT_EQ(result.iterations, budget);
++  EXPECT_EQ(calls, budget);
++}
++
++TEST(DelayedSubmissionBacklogTest, GenericPreRunsAfterEntireRequestSnapshot)
++{
++  constexpr size_t requestCount{1024};
++  auto delayedSubmissions = std::make_shared<ucxx::DelayedSubmissionCollection>(true);
++
++  std::atomic<size_t> requestsProcessed{0};
++  size_t requestsSeenByGenericPre{0};
++
++  for (size_t i = 0; i < requestCount; ++i) {
++    delayedSubmissions->registerRequest(
++      {}, [&]() { requestsProcessed.fetch_add(1, std::memory_order_relaxed); });
++  }
++  std::ignore = delayedSubmissions->registerGenericPre(
++    [&]() { requestsSeenByGenericPre = requestsProcessed.load(std::memory_order_relaxed); });
++
++  delayedSubmissions->processPre();
++
++  EXPECT_EQ(requestsProcessed.load(std::memory_order_relaxed), requestCount);
++  EXPECT_EQ(requestsSeenByGenericPre, requestCount);
++  RecordProperty("delayed_requests_in_snapshot", std::to_string(requestCount));
++  RecordProperty("requests_processed_before_generic_pre", std::to_string(requestsSeenByGenericPre));
++}
++
++TEST(DelayedSubmissionBacklogTest, ControlPrePreemptsRequestSnapshotWithoutBreakingBarrier)
++{
++  constexpr size_t requestCount{ucxx::kDefaultDelayedRequestSubmissionBatchSize * 2 + 1};
++  auto delayedSubmissions = std::make_shared<ucxx::DelayedSubmissionCollection>(true);
++
++  size_t requestsProcessed{0};
++  size_t requestsSeenByControlPre{0};
++  size_t requestsSeenByGenericPre{0};
++
++  for (size_t i = 0; i < requestCount; ++i) {
++    delayedSubmissions->registerRequest({}, [&, i]() {
++      ++requestsProcessed;
++      if (i == 0) {
++        std::ignore = delayedSubmissions->registerControlPre(
++          [&]() { requestsSeenByControlPre = requestsProcessed; });
++      }
++    });
++  }
++  std::ignore =
++    delayedSubmissions->registerGenericPre([&]() { requestsSeenByGenericPre = requestsProcessed; });
++
++  delayedSubmissions->processPre();
++
++  EXPECT_EQ(requestsProcessed, requestCount);
++  EXPECT_EQ(requestsSeenByControlPre, ucxx::kDefaultDelayedRequestSubmissionBatchSize);
++  EXPECT_EQ(requestsSeenByGenericPre, requestCount);
++  RecordProperty("delayed_requests_in_snapshot", std::to_string(requestCount));
++  RecordProperty("requests_processed_before_control_pre", std::to_string(requestsSeenByControlPre));
++  RecordProperty("requests_processed_before_generic_pre", std::to_string(requestsSeenByGenericPre));
++}
++
++TEST(DelayedSubmissionBacklogTest, GenericPreBarrierExcludesRequestsAddedDuringSnapshot)
++{
++  constexpr size_t originalRequestCount{ucxx::kDefaultDelayedRequestSubmissionBatchSize + 1};
++  auto delayedSubmissions = std::make_shared<ucxx::DelayedSubmissionCollection>(true);
++
++  size_t originalRequestsProcessed{0};
++  size_t lateRequestsProcessed{0};
++  size_t originalRequestsSeenByGenericPre{0};
++  size_t lateRequestsSeenByGenericPre{0};
++
++  for (size_t i = 0; i < originalRequestCount; ++i) {
++    delayedSubmissions->registerRequest({}, [&, i]() {
++      ++originalRequestsProcessed;
++      if (i == 0) {
++        delayedSubmissions->registerRequest({}, [&]() { ++lateRequestsProcessed; });
++      }
++    });
++  }
++  std::ignore = delayedSubmissions->registerGenericPre([&]() {
++    originalRequestsSeenByGenericPre = originalRequestsProcessed;
++    lateRequestsSeenByGenericPre     = lateRequestsProcessed;
++  });
++
++  delayedSubmissions->processPre();
++
++  EXPECT_EQ(originalRequestsProcessed, originalRequestCount);
++  EXPECT_EQ(lateRequestsProcessed, 0);
++  EXPECT_EQ(originalRequestsSeenByGenericPre, originalRequestCount);
++  EXPECT_EQ(lateRequestsSeenByGenericPre, 0);
++
++  delayedSubmissions->processPre();
++  EXPECT_EQ(lateRequestsProcessed, 1);
++}
++
++TEST(WorkerProgressThreadTest, GenericPreRunsWhileProgressRemainsContinuouslyBusy)
++{
++  constexpr auto callbackDeadline = 500ms;
++  auto delayedSubmissions         = std::make_shared<ucxx::DelayedSubmissionCollection>(false);
++
++  std::atomic<bool> keepProgressBusy{true};
++  std::atomic<size_t> progressCalls{0};
++  std::mutex mutex;
++  std::condition_variable conditionVariable;
++  bool callbackRan{false};
++
++  ucxx::WorkerProgressThread progressThread(
++    true,
++    [&]() {
++      return ucxx::utils::progressUntilIdleOrBudget([&]() {
++               const auto calls = progressCalls.fetch_add(1, std::memory_order_relaxed) + 1;
++               if (calls == ucxx::utils::kDefaultProgressDrainMaxIterations)
++                 conditionVariable.notify_all();
++               return keepProgressBusy.load(std::memory_order_acquire);
++             })
++        .madeProgress;
++    },
++    []() {},
++    []() {},
++    nullptr,
++    nullptr,
++    delayedSubmissions);
++
++  bool progressBecameBusy{false};
++  {
++    std::unique_lock<std::mutex> lock(mutex);
++    progressBecameBusy = conditionVariable.wait_for(lock, 1s, [&]() {
++      return progressCalls.load(std::memory_order_relaxed) >=
++             ucxx::utils::kDefaultProgressDrainMaxIterations;
++    });
++  }
++
++  if (progressBecameBusy) {
++    std::ignore = delayedSubmissions->registerGenericPre([&]() {
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        callbackRan = true;
++      }
++      conditionVariable.notify_all();
++    });
++  }
++
++  bool callbackRanWithinDeadline{false};
++  {
++    std::unique_lock<std::mutex> lock(mutex);
++    callbackRanWithinDeadline =
++      conditionVariable.wait_for(lock, callbackDeadline, [&]() { return callbackRan; });
++  }
++
++  // Always release a deliberately unbounded implementation before joining the
++  // progress thread. This makes the regression fail instead of hanging the test.
++  keepProgressBusy.store(false, std::memory_order_release);
++  conditionVariable.notify_all();
++  progressThread.stop();
++
++  EXPECT_TRUE(progressBecameBusy);
++  EXPECT_TRUE(callbackRanWithinDeadline);
++  EXPECT_GT(progressCalls.load(std::memory_order_relaxed),
++            ucxx::utils::kDefaultProgressDrainMaxIterations);
++}
++
++TEST(WorkerProgressThreadTest, DISABLED_ControlPreMeetsDeadlineUnderDelayedRequestBacklog)
++{
++  const size_t requestCount = readPositiveEnvironmentSize("UCXX_TEST_BACKLOG_REQUEST_COUNT", 128);
++  const auto callbackDelay  = std::chrono::microseconds{
++    readPositiveEnvironmentSize("UCXX_TEST_BACKLOG_CALLBACK_DELAY_US", 2000)};
++  const auto callbackDeadline = std::chrono::milliseconds{
++    readPositiveEnvironmentSize("UCXX_TEST_BACKLOG_CONTROL_DEADLINE_MS", 100)};
++
++  auto context = ucxx::contextBuilder(UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP).build();
++  auto worker  = ucxx::workerBuilder(context).delayedSubmission(true).build();
++
++  std::atomic<size_t> requestsProcessed{0};
++  std::atomic<size_t> requestsSeenByControlPre{0};
++  std::atomic<bool> controlPreRan{false};
++  enqueueDelayedRequestBacklog(worker, requestCount, callbackDelay, requestsProcessed);
++
++  ProgressThreadStartGate startGate;
++  worker->setProgressThreadStartCallback(ProgressThreadStartGate::callback, &startGate);
++  worker->startProgressThread(true);
++
++  const bool progressThreadParked = startGate.waitUntilEntered(2s);
++  if (!progressThreadParked) {
++    startGate.release();
++    worker->stopProgressThread();
++    FAIL() << "progress thread did not enter its start gate";
++    return;
++  }
++
++  // Give registerControlPre() time to enqueue its callback before allowing the
++  // progress thread to take its first delayed-request snapshot.
++  std::thread gateReleaser([&]() {
++    std::this_thread::sleep_for(25ms);
++    startGate.release();
++  });
++
++  const auto callbackStart     = std::chrono::steady_clock::now();
++  const bool callbackCompleted = worker->registerControlPre(
++    [&]() {
++      requestsSeenByControlPre.store(requestsProcessed.load(std::memory_order_acquire),
++                                     std::memory_order_release);
++      controlPreRan.store(true, std::memory_order_release);
++    },
++    std::chrono::duration_cast<std::chrono::nanoseconds>(callbackDeadline).count());
++  const auto callbackLatency                  = std::chrono::steady_clock::now() - callbackStart;
++  const auto requestsProcessedAtControlReturn = requestsProcessed.load(std::memory_order_acquire);
++  gateReleaser.join();
++
++  const auto backlogDrainTimeout =
++    std::chrono::duration_cast<std::chrono::milliseconds>(callbackDelay * requestCount) + 5s;
++  const bool backlogDrained = waitUntil(backlogDrainTimeout, [&]() {
++    return requestsProcessed.load(std::memory_order_acquire) == requestCount;
++  });
++  worker->stopProgressThread();
++
++  const auto callbackLatencyMs =
++    std::chrono::duration_cast<std::chrono::milliseconds>(callbackLatency).count();
++  RecordProperty("delayed_request_count", std::to_string(requestCount));
++  RecordProperty("delayed_request_callback_us", std::to_string(callbackDelay.count()));
++  RecordProperty("control_deadline_ms", std::to_string(callbackDeadline.count()));
++  RecordProperty("control_callback_latency_ms", std::to_string(callbackLatencyMs));
++  RecordProperty("requests_processed_at_control_return",
++                 std::to_string(requestsProcessedAtControlReturn));
++  RecordProperty("requests_processed_before_control_pre",
++                 std::to_string(requestsSeenByControlPre.load(std::memory_order_acquire)));
++
++  EXPECT_TRUE(backlogDrained);
++  EXPECT_TRUE(callbackCompleted)
++    << "control-pre callback timed out behind the delayed-request snapshot";
++  EXPECT_TRUE(controlPreRan.load(std::memory_order_acquire));
++  EXPECT_LT(callbackLatency, callbackDeadline);
++}
++
++TEST(WorkerProgressThreadTest, DISABLED_LateEndpointMeetsDeadlineUnderDelayedRequestBacklog)
++{
++  const size_t requestCount =
++    readPositiveEnvironmentSize("UCXX_TEST_ENDPOINT_BACKLOG_REQUEST_COUNT", 400);
++  const auto callbackDelay = std::chrono::microseconds{
++    readPositiveEnvironmentSize("UCXX_TEST_ENDPOINT_BACKLOG_CALLBACK_DELAY_US", 10000)};
++  const auto maxEndpointLatency = std::chrono::milliseconds{
++    readPositiveEnvironmentSize("UCXX_TEST_ENDPOINT_BACKLOG_MAX_LATENCY_MS", 2000)};
++
++  auto context = ucxx::contextBuilder(UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP).build();
++  auto worker  = ucxx::workerBuilder(context).delayedSubmission(true).build();
++  auto address = worker->addressBuilder().build();
++
++  std::atomic<size_t> requestsProcessed{0};
++  std::mutex firstRequestMutex;
++  std::condition_variable firstRequestConditionVariable;
++  bool firstRequestStarted{false};
++  bool releaseFirstRequest{false};
++  for (size_t i = 0; i < requestCount; ++i) {
++    worker->registerDelayedSubmission({}, [&, i]() {
++      if (i == 0) {
++        std::unique_lock<std::mutex> lock(firstRequestMutex);
++        firstRequestStarted = true;
++        firstRequestConditionVariable.notify_all();
++        firstRequestConditionVariable.wait(lock, [&]() { return releaseFirstRequest; });
++      }
++      if (callbackDelay.count() > 0) std::this_thread::sleep_for(callbackDelay);
++      requestsProcessed.fetch_add(1, std::memory_order_release);
++    });
++  }
++
++  worker->startProgressThread(true);
++
++  bool requestProcessingStarted{false};
++  {
++    std::unique_lock<std::mutex> lock(firstRequestMutex);
++    requestProcessingStarted =
++      firstRequestConditionVariable.wait_for(lock, 2s, [&]() { return firstRequestStarted; });
++  }
++  if (!requestProcessingStarted) {
++    {
++      std::lock_guard<std::mutex> lock(firstRequestMutex);
++      releaseFirstRequest = true;
++    }
++    firstRequestConditionVariable.notify_all();
++    worker->stopProgressThread();
++    FAIL() << "progress thread did not begin processing the request snapshot";
++    return;
++  }
++
++  // Endpoint creation is queued while the progress thread is inside the first
++  // request chunk, matching the production arrival pattern rather than placing
++  // control work ahead of the snapshot.
++  std::thread firstRequestReleaser([&]() {
++    std::this_thread::sleep_for(25ms);
++    {
++      std::lock_guard<std::mutex> lock(firstRequestMutex);
++      releaseFirstRequest = true;
++    }
++    firstRequestConditionVariable.notify_all();
++  });
++
++  std::shared_ptr<ucxx::Endpoint> endpoint;
++  std::string endpointFailure;
++  const auto endpointStart = std::chrono::steady_clock::now();
++  try {
++    endpoint = worker->endpointBuilder(address).endpointErrorHandling(false).build();
++  } catch (const std::exception& error) {
++    endpointFailure = error.what();
++  }
++  const auto endpointLatency = std::chrono::steady_clock::now() - endpointStart;
++  const auto requestsProcessedWhenEndpointCompleted =
++    requestsProcessed.load(std::memory_order_acquire);
++  firstRequestReleaser.join();
++
++  const auto backlogDrainTimeout =
++    std::chrono::duration_cast<std::chrono::milliseconds>(callbackDelay * requestCount) + 5s;
++  const bool backlogDrained = waitUntil(backlogDrainTimeout, [&]() {
++    return requestsProcessed.load(std::memory_order_acquire) == requestCount;
++  });
++
++  const bool endpointCreated = endpoint != nullptr;
++  endpoint.reset();
++  worker->stopProgressThread();
++
++  const auto endpointLatencyMs =
++    std::chrono::duration_cast<std::chrono::milliseconds>(endpointLatency).count();
++  RecordProperty("delayed_request_count", std::to_string(requestCount));
++  RecordProperty("delayed_request_callback_us", std::to_string(callbackDelay.count()));
++  RecordProperty("endpoint_max_latency_ms", std::to_string(maxEndpointLatency.count()));
++  RecordProperty("endpoint_latency_ms", std::to_string(endpointLatencyMs));
++  RecordProperty("requests_processed_when_endpoint_completed",
++                 std::to_string(requestsProcessedWhenEndpointCompleted));
++
++  EXPECT_TRUE(backlogDrained);
++  EXPECT_TRUE(endpointFailure.empty()) << endpointFailure;
++  EXPECT_TRUE(endpointCreated);
++  EXPECT_LT(endpointLatency, maxEndpointLatency)
++    << "ucp_ep_create was delayed behind the delayed-request snapshot";
++}
++
++TEST(WorkerProgressThreadTest, DISABLED_ReportsLateEndpointLatencyUnderNaturalTagBacklog)
++{
++  const size_t requestPairCount =
++    readPositiveEnvironmentSize("UCXX_TEST_NATURAL_BACKLOG_REQUEST_PAIRS", 32768);
++  const auto drainTimeout = std::chrono::milliseconds{
++    readPositiveEnvironmentSize("UCXX_TEST_NATURAL_BACKLOG_DRAIN_TIMEOUT_MS", 60000)};
++  const size_t maxEndpointLatencyMs =
++    readPositiveEnvironmentSize("UCXX_TEST_NATURAL_BACKLOG_MAX_ENDPOINT_LATENCY_MS", 0);
++
++  auto context             = ucxx::contextBuilder(UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP).build();
++  auto worker              = ucxx::workerBuilder(context).delayedSubmission(true).build();
++  auto address             = worker->addressBuilder().build();
++  auto establishedEndpoint = worker->endpointBuilder(address).endpointErrorHandling(false).build();
++
++  std::vector<uint64_t> send(requestPairCount);
++  std::vector<uint64_t> receive(requestPairCount, 0);
++  std::vector<std::shared_ptr<ucxx::Request>> requests;
++  requests.reserve(requestPairCount * 2);
++
++  constexpr uint64_t firstTag{0x7000000000000000ULL};
++  for (size_t i = 0; i < requestPairCount; ++i) {
++    send[i] = firstTag + i;
++    const ucxx::Tag tag{send[i]};
++    requests.push_back(worker->tagRecvBuilder(&receive[i], sizeof(receive[i]), tag, ucxx::TagMaskFull).build());
++    requests.push_back(establishedEndpoint->tagSendBuilder(&send[i], sizeof(send[i]), tag).build());
++  }
++
++  ProgressThreadStartGate startGate;
++  worker->setProgressThreadStartCallback(ProgressThreadStartGate::callback, &startGate);
++  worker->startProgressThread(true);
++
++  const bool progressThreadParked = startGate.waitUntilEntered(2s);
++  if (!progressThreadParked) {
++    startGate.release();
++    worker->stopProgressThread();
++    FAIL() << "progress thread did not enter its start gate";
++    return;
++  }
++
++  std::thread gateReleaser([&]() {
++    std::this_thread::sleep_for(25ms);
++    startGate.release();
++  });
++
++  std::shared_ptr<ucxx::Endpoint> lateEndpoint;
++  std::string endpointFailure;
++  const auto endpointStart = std::chrono::steady_clock::now();
++  try {
++    lateEndpoint = worker->endpointBuilder(address).endpointErrorHandling(false).build();
++  } catch (const std::exception& error) {
++    endpointFailure = error.what();
++  }
++  const auto endpointLatency = std::chrono::steady_clock::now() - endpointStart;
++  gateReleaser.join();
++
++  const size_t requestsCompletedWhenEndpointCompleted = std::count_if(
++    requests.begin(), requests.end(), [](const auto& request) { return request->isCompleted(); });
++  const bool backlogCompleted = waitUntil(drainTimeout, [&]() {
++    return std::all_of(
++      requests.begin(), requests.end(), [](const auto& request) { return request->isCompleted(); });
++  });
++
++  std::string transferFailure;
++  if (backlogCompleted) {
++    try {
++      for (const auto& request : requests)
++        request->checkError();
++      if (receive != send) transferFailure = "natural-backlog tag data did not match";
++    } catch (const std::exception& error) {
++      transferFailure = error.what();
++    }
++  }
++
++  const bool endpointCreated = lateEndpoint != nullptr;
++  lateEndpoint.reset();
++  establishedEndpoint.reset();
++  worker->stopProgressThread();
++
++  const auto endpointLatencyMs =
++    std::chrono::duration_cast<std::chrono::milliseconds>(endpointLatency).count();
++  RecordProperty("natural_request_pairs", std::to_string(requestPairCount));
++  RecordProperty("natural_delayed_requests", std::to_string(requestPairCount * 2));
++  RecordProperty("endpoint_latency_ms", std::to_string(endpointLatencyMs));
++  RecordProperty("requests_completed_when_endpoint_completed",
++                 std::to_string(requestsCompletedWhenEndpointCompleted));
++
++  EXPECT_TRUE(backlogCompleted);
++  EXPECT_TRUE(transferFailure.empty()) << transferFailure;
++  EXPECT_TRUE(endpointFailure.empty()) << endpointFailure;
++  EXPECT_TRUE(endpointCreated);
++  if (maxEndpointLatencyMs > 0)
++    EXPECT_LT(endpointLatencyMs, static_cast<int64_t>(maxEndpointLatencyMs));
++}
++
++TEST(WorkerProgressThreadTest, LateEndpointsCompleteDuringDelayedTagTraffic)
++{
++  const size_t batchSize     = readPositiveEnvironmentSize("UCXX_TEST_FAIRNESS_BATCH_SIZE", 512);
++  const size_t endpointCount = readPositiveEnvironmentSize("UCXX_TEST_FAIRNESS_ENDPOINT_COUNT", 32);
++  const size_t maxEndpointLatencyMs =
++    readPositiveEnvironmentSize("UCXX_TEST_FAIRNESS_MAX_ENDPOINT_LATENCY_MS", 2000);
++
++  auto context             = ucxx::contextBuilder(UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP).build();
++  auto worker              = ucxx::workerBuilder(context).delayedSubmission(true).build();
++  auto address             = worker->addressBuilder().build();
++  auto establishedEndpoint = worker->endpointBuilder(address).endpointErrorHandling(false).build();
++
++  worker->startProgressThread(true);
++
++  std::atomic<bool> stopProducer{false};
++  std::atomic<bool> trafficWindowPublished{false};
++  std::atomic<size_t> transfersCompleted{0};
++  std::mutex failureMutex;
++  std::string producerFailure;
++
++  auto setProducerFailure = [&](std::string message) {
++    std::lock_guard<std::mutex> lock(failureMutex);
++    if (producerFailure.empty()) producerFailure = std::move(message);
++  };
++
++  std::thread producer([&]() {
++    struct TrafficSlot {
++      uint64_t send{0};
++      uint64_t receive{0};
++      std::shared_ptr<ucxx::Request> receiveRequest;
++      std::shared_ptr<ucxx::Request> sendRequest;
++    };
++
++    uint64_t nextTag{1};
++    try {
++      auto submit = [&](TrafficSlot& slot) {
++        slot.send    = nextTag++;
++        slot.receive = 0;
++        const ucxx::Tag tag{slot.send};
++        slot.receiveRequest =
++          worker->tagRecvBuilder(&slot.receive, sizeof(slot.receive), tag, ucxx::TagMaskFull).build();
++        slot.sendRequest = establishedEndpoint->tagSendBuilder(&slot.send, sizeof(slot.send), tag).build();
++      };
++
++      std::vector<TrafficSlot> slots(batchSize);
++      for (auto& slot : slots)
++        submit(slot);
++      trafficWindowPublished.store(true, std::memory_order_release);
++
++      while (!stopProducer.load(std::memory_order_acquire)) {
++        bool progressedSlot{false};
++        for (auto& slot : slots) {
++          if (!slot.receiveRequest->isCompleted() || !slot.sendRequest->isCompleted()) continue;
++
++          slot.receiveRequest->checkError();
++          slot.sendRequest->checkError();
++          if (slot.receive != slot.send)
++            throw std::runtime_error("background tag data did not match");
++
++          transfersCompleted.fetch_add(1, std::memory_order_release);
++          submit(slot);
++          progressedSlot = true;
++        }
++        if (!progressedSlot) std::this_thread::yield();
++      }
++
++      if (!waitUntil(20s, [&]() {
++            return std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
++              return slot.receiveRequest->isCompleted() && slot.sendRequest->isCompleted();
++            });
++          }))
++        throw std::runtime_error("timed out draining the background traffic window");
++
++      for (const auto& slot : slots) {
++        slot.receiveRequest->checkError();
++        slot.sendRequest->checkError();
++        if (slot.receive != slot.send)
++          throw std::runtime_error("background tag data did not match while draining");
++      }
++      transfersCompleted.fetch_add(slots.size(), std::memory_order_release);
++    } catch (const std::exception& error) {
++      setProducerFailure(error.what());
++    } catch (...) {
++      setProducerFailure("unknown exception in background traffic producer");
++    }
++  });
++
++  const bool trafficStarted =
++    waitUntil(10s, [&]() { return trafficWindowPublished.load(std::memory_order_acquire); });
++
++  std::vector<std::shared_ptr<ucxx::Endpoint>> lateEndpoints;
++  lateEndpoints.reserve(endpointCount);
++  std::chrono::steady_clock::duration maxEndpointLatency{};
++  std::string endpointFailure;
++
++  if (trafficStarted) {
++    try {
++      for (size_t i = 0; i < endpointCount; ++i) {
++        const auto start   = std::chrono::steady_clock::now();
++        auto endpoint      = worker->endpointBuilder(address).endpointErrorHandling(false).build();
++        maxEndpointLatency = std::max(maxEndpointLatency, std::chrono::steady_clock::now() - start);
++        if (endpoint == nullptr) {
++          endpointFailure = "endpoint creation returned null";
++          break;
++        }
++        lateEndpoints.push_back(std::move(endpoint));
++      }
++    } catch (const std::exception& error) {
++      endpointFailure = error.what();
++    }
++  }
++
++  stopProducer.store(true, std::memory_order_release);
++  producer.join();
++
++  std::string transferFailure;
++  const size_t createdEndpointCount = lateEndpoints.size();
++  std::vector<std::shared_ptr<std::atomic<size_t>>> completionCounts;
++  if (endpointFailure.empty() && lateEndpoints.size() == endpointCount) {
++    try {
++      std::vector<uint64_t> send(endpointCount);
++      std::vector<uint64_t> receive(endpointCount, 0);
++      std::vector<std::shared_ptr<ucxx::Request>> requests;
++      requests.reserve(endpointCount * 2);
++      completionCounts.reserve(endpointCount * 2);
++
++      auto countCompletion = [](ucs_status_t, std::shared_ptr<void> data) {
++        std::static_pointer_cast<std::atomic<size_t>>(data)->fetch_add(1,
++                                                                       std::memory_order_relaxed);
++      };
++
++      for (size_t i = 0; i < endpointCount; ++i) {
++        send[i] = 0xf000000000000000ULL + i;
++        const ucxx::Tag tag{send[i]};
++        auto receiveCompletions = std::make_shared<std::atomic<size_t>>(0);
++        auto sendCompletions    = std::make_shared<std::atomic<size_t>>(0);
++        completionCounts.push_back(receiveCompletions);
++        completionCounts.push_back(sendCompletions);
++        requests.push_back(worker->tagRecvBuilder(&receive[i], sizeof(receive[i]), tag, ucxx::TagMaskFull)
++                             .pythonFuture(false)
++                             .callbackFunction(countCompletion)
++                             .callbackData(receiveCompletions)
++                             .build());
++        requests.push_back(lateEndpoints[i]->tagSendBuilder(&send[i], sizeof(send[i]), tag)
++                             .pythonFuture(false)
++                             .callbackFunction(countCompletion)
++                             .callbackData(sendCompletions)
++                             .build());
++      }
++
++      if (!waitUntil(10s, [&]() {
++            return std::all_of(requests.begin(), requests.end(), [](const auto& request) {
++              return request->isCompleted();
++            });
++          })) {
++        transferFailure = "timed out validating late endpoints";
++      } else {
++        for (const auto& request : requests)
++          request->checkError();
++        if (receive != send) transferFailure = "late-endpoint tag data did not match";
++        if (std::any_of(completionCounts.begin(), completionCounts.end(), [](const auto& count) {
++              return count->load(std::memory_order_relaxed) != 1;
++            }))
++          transferFailure = "a late-endpoint request callback did not run exactly once";
++      }
++    } catch (const std::exception& error) {
++      transferFailure = error.what();
++    }
++  }
++
++  lateEndpoints.clear();
++  establishedEndpoint.reset();
++  worker->stopProgressThread();
++
++  std::string producerFailureCopy;
++  {
++    std::lock_guard<std::mutex> lock(failureMutex);
++    producerFailureCopy = producerFailure;
++  }
++
++  EXPECT_TRUE(trafficStarted);
++  EXPECT_TRUE(endpointFailure.empty()) << endpointFailure;
++  EXPECT_EQ(createdEndpointCount, endpointCount);
++  EXPECT_TRUE(producerFailureCopy.empty()) << producerFailureCopy;
++  EXPECT_TRUE(transferFailure.empty()) << transferFailure;
++  EXPECT_GT(transfersCompleted.load(std::memory_order_acquire), 0);
++  const auto maxEndpointLatencyMilliseconds =
++    std::chrono::duration_cast<std::chrono::milliseconds>(maxEndpointLatency).count();
++  RecordProperty("background_transfers_completed",
++                 std::to_string(transfersCompleted.load(std::memory_order_acquire)));
++  RecordProperty("late_endpoints_created", std::to_string(createdEndpointCount));
++  RecordProperty("max_endpoint_latency_ms", std::to_string(maxEndpointLatencyMilliseconds));
++  if (createdEndpointCount > 0)
++    EXPECT_LT(maxEndpointLatencyMilliseconds, static_cast<int64_t>(maxEndpointLatencyMs));
++}
++
++}  // namespace
+diff --git a/cpp/tests/run_control_plane_fairness.sh b/cpp/tests/run_control_plane_fairness.sh
+new file mode 100755
+index 0000000..9e23f2d
+--- /dev/null
++++ b/cpp/tests/run_control_plane_fairness.sh
+@@ -0,0 +1,74 @@
++#!/usr/bin/env bash
++# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
++# SPDX-License-Identifier: BSD-3-Clause
++
++set -euo pipefail
++
++script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++repo_root="$(cd -- "${script_dir}/../.." && pwd)"
++
++mode="${1:-fast}"
++test_binary="${2:-${repo_root}/cpp/build/gtests/UCXX_TEST}"
++timeout_command="${TIMEOUT_COMMAND:-timeout}"
++
++if [[ ! -x "${test_binary}" ]]; then
++  echo "UCXX test binary is missing or not executable: ${test_binary}" >&2
++  echo "Build it first with: ./build.sh clean libucxx libucxx_tests -n" >&2
++  exit 2
++fi
++
++case "${mode}" in
++  fast)
++    exec "${timeout_command}" 90s "${test_binary}" \
++      --gtest_filter='ProgressDrainTest.*:DelayedSubmissionBacklogTest.*:WorkerProgressThreadTest.GenericPreRunsWhileProgressRemainsContinuouslyBusy:WorkerProgressThreadTest.LateEndpointsCompleteDuringDelayedTagTraffic' \
++      --gtest_break_on_failure
++    ;;
++
++  backlog-repro)
++    export UCXX_TEST_BACKLOG_REQUEST_COUNT="${UCXX_TEST_BACKLOG_REQUEST_COUNT:-128}"
++    export UCXX_TEST_BACKLOG_CALLBACK_DELAY_US="${UCXX_TEST_BACKLOG_CALLBACK_DELAY_US:-2000}"
++    export UCXX_TEST_BACKLOG_CONTROL_DEADLINE_MS="${UCXX_TEST_BACKLOG_CONTROL_DEADLINE_MS:-100}"
++
++    exec "${timeout_command}" 30s "${test_binary}" \
++      --gtest_filter='WorkerProgressThreadTest.DISABLED_ControlPreMeetsDeadlineUnderDelayedRequestBacklog' \
++      --gtest_also_run_disabled_tests
++    ;;
++
++  endpoint-repro)
++    export UCXX_TEST_ENDPOINT_BACKLOG_REQUEST_COUNT="${UCXX_TEST_ENDPOINT_BACKLOG_REQUEST_COUNT:-400}"
++    export UCXX_TEST_ENDPOINT_BACKLOG_CALLBACK_DELAY_US="${UCXX_TEST_ENDPOINT_BACKLOG_CALLBACK_DELAY_US:-10000}"
++    export UCXX_TEST_ENDPOINT_BACKLOG_MAX_LATENCY_MS="${UCXX_TEST_ENDPOINT_BACKLOG_MAX_LATENCY_MS:-2000}"
++
++    exec "${timeout_command}" 30s "${test_binary}" \
++      --gtest_filter='WorkerProgressThreadTest.DISABLED_LateEndpointMeetsDeadlineUnderDelayedRequestBacklog' \
++      --gtest_also_run_disabled_tests
++    ;;
++
++  natural-backlog)
++    natural_backlog_counts="${UCXX_TEST_NATURAL_BACKLOG_COUNTS:-8192 32768 131072}"
++    for request_pairs in ${natural_backlog_counts}; do
++      echo "Natural delayed-request backlog: ${request_pairs} tag request pairs"
++      UCXX_TEST_NATURAL_BACKLOG_REQUEST_PAIRS="${request_pairs}" \
++        "${timeout_command}" 120s "${test_binary}" \
++          --gtest_filter='WorkerProgressThreadTest.DISABLED_ReportsLateEndpointLatencyUnderNaturalTagBacklog' \
++          --gtest_also_run_disabled_tests
++    done
++    ;;
++
++  stress)
++    export UCXX_TEST_FAIRNESS_BATCH_SIZE="${UCXX_TEST_FAIRNESS_BATCH_SIZE:-32768}"
++    export UCXX_TEST_FAIRNESS_ENDPOINT_COUNT="${UCXX_TEST_FAIRNESS_ENDPOINT_COUNT:-256}"
++    export UCXX_TEST_FAIRNESS_MAX_ENDPOINT_LATENCY_MS="${UCXX_TEST_FAIRNESS_MAX_ENDPOINT_LATENCY_MS:-2000}"
++    gtest_repeat="${GTEST_REPEAT:-10}"
++
++    exec "${timeout_command}" 300s "${test_binary}" \
++      --gtest_filter='WorkerProgressThreadTest.LateEndpointsCompleteDuringDelayedTagTraffic' \
++      "--gtest_repeat=${gtest_repeat}" \
++      --gtest_break_on_failure
++    ;;
++
++  *)
++    echo "Usage: $0 [fast|backlog-repro|endpoint-repro|natural-backlog|stress] [path/to/UCXX_TEST]" >&2
++    exit 2
++    ;;
++esac

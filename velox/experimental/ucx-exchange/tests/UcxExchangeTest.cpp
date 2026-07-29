@@ -1528,7 +1528,7 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
         false,
         std::move(partitionFunctionSpec),
         rowType);
-    queueManager_->initializeTask(
+    queueManager()->initializeTask(
         srcTask,
         core::PartitionedOutputNode::Kind::kPartitioned,
         numPartitions,
@@ -1565,7 +1565,7 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
     for (const auto& sinkDriver : sinkDrivers) {
       EXPECT_EQ(sinkDriver->numRows(), expectedRows / numPartitions);
     }
-    queueManager_->removeTask(srcTaskId);
+    queueManager()->removeTask(srcTaskId);
   };
 
   // Q9's exact shape: project a non-empty source row to ROW({}) and send it

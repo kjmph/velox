@@ -1608,6 +1608,10 @@ CudfGroupby::CudfGroupby(
           !hasFinalAggs(aggregationNode->aggregates())),
       isSingleStep_(
           aggregationNode->step() == core::AggregationNode::Step::kSingle),
+      flushGroupIdPartialInput_(
+          isPartialOutput_ &&
+          !hasCompanionAggregates(aggregationNode->aggregates()) &&
+          aggregationNode->sources()[0]->is<core::GroupIdNode>()),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
@@ -1948,6 +1952,12 @@ void CudfGroupby::computePartialGroupbyIncrementally(CudfVectorPtr tbl) {
       inputTableStream,
       get_output_mr());
 
+  if (flushGroupIdPartialInput_) {
+    VELOX_CHECK_NULL(bufferedResult_);
+    bufferedResult_ = std::move(groupbyOnInput);
+    return;
+  }
+
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
     auto partialOutputStream = bufferedResult_->stream();
@@ -2278,6 +2288,9 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
 RowVectorPtr CudfGroupby::doGetOutput() {
   // Handle partial streaming groupby.
   if (isPartialOutput_ && incrementalAggregationEnabled_) {
+    if (flushGroupIdPartialInput_ && bufferedResult_) {
+      return releaseAndResetBufferedResult();
+    }
     if (bufferedResult_ &&
         bufferedResult_->estimateFlatSize() >
             partialAggregationFlushThresholdBytes_) {

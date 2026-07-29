@@ -15,17 +15,47 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfGroupId.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <cuda_runtime_api.h>
+#include <folly/ScopeGuard.h>
 
 using namespace facebook::velox;
 using namespace facebook::velox::test;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
+
+namespace {
+
+template <typename T>
+std::vector<T> copyColumnData(
+    cudf::column_view column,
+    cuda::stream_ref stream) {
+  std::vector<T> values(column.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      values.data(),
+      column.data<T>(),
+      values.size() * sizeof(T),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  return values;
+}
+
+} // namespace
 
 class CudfGroupIdTest : public HiveConnectorTestBase {
  protected:
@@ -319,6 +349,108 @@ TEST_F(CudfGroupIdTest, multipleBatches) {
       "SELECT k1, k2, sum(a) FROM tmp GROUP BY GROUPING SETS ((k1), (k2))");
 }
 
+TEST_F(CudfGroupIdTest, intermediateAggregationReducesEachGroupingSet) {
+  auto batch1 = makeRowVector(
+      {"k1", "k2", "a"},
+      {
+          makeFlatVector<std::string>({"a", "a", "b", "b"}),
+          makeFlatVector<int64_t>({10, 20, 10, 20}),
+          makeFlatVector<int64_t>({100, 200, 300, 400}),
+      });
+  auto batch2 = makeRowVector(
+      {"k1", "k2", "a"},
+      {
+          makeFlatVector<std::string>({"a", "a", "c", "c"}),
+          makeFlatVector<int64_t>({10, 30, 10, 30}),
+          makeFlatVector<int64_t>({500, 600, 700, 800}),
+      });
+
+  createDuckDbTable({batch1, batch2});
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedConcatOptimizationEnabled =
+      config.concatOptimizationEnabled;
+  const auto savedBatchSizeMinThreshold = config.batchSizeMinThreshold;
+  SCOPE_EXIT {
+    config.concatOptimizationEnabled = savedConcatOptimizationEnabled;
+    config.batchSizeMinThreshold = savedBatchSizeMinThreshold;
+  };
+  config.concatOptimizationEnabled = true;
+  config.batchSizeMinThreshold = 1'000'000;
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  std::vector<core::PlanNodePtr> sources{
+      PlanBuilder(generator)
+          .values({batch1})
+          .partialAggregation({"k1", "k2"}, {"sum(a) as sum_a"})
+          .planNode(),
+      PlanBuilder(generator)
+          .values({batch2})
+          .partialAggregation({"k1", "k2"}, {"sum(a) as sum_a"})
+          .planNode()};
+
+  core::PlanNodeId intermediateAggregationNodeId;
+  auto plan =
+      PlanBuilder(generator)
+          .localPartitionRoundRobin(sources)
+          .groupId({"k1", "k2"}, {{"k1"}, {"k2"}}, {"sum_a"})
+          .addNode([](auto nodeId, auto source) -> core::PlanNodePtr {
+            auto k1 = std::make_shared<core::FieldAccessTypedExpr>(
+                VARCHAR(), "k1");
+            auto k2 =
+                std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "k2");
+            auto groupId = std::make_shared<core::FieldAccessTypedExpr>(
+                BIGINT(), "group_id");
+            auto sumState = std::make_shared<core::FieldAccessTypedExpr>(
+                BIGINT(), "sum_a");
+
+            core::AggregationNode::Aggregate aggregate;
+            aggregate.call =
+                std::make_shared<core::CallTypedExpr>(
+                    BIGINT(), "sum", sumState);
+            aggregate.rawInputTypes = {BIGINT()};
+
+            return std::make_shared<core::AggregationNode>(
+                nodeId,
+                core::AggregationNode::Step::kIntermediate,
+                std::vector<core::FieldAccessTypedExprPtr>{k1, k2, groupId},
+                std::vector<core::FieldAccessTypedExprPtr>{},
+                std::vector<std::string>{"sum_a"},
+                std::vector<core::AggregationNode::Aggregate>{aggregate},
+                /*ignoreNullKeys=*/false,
+                /*noGroupsSpanBatches=*/false,
+                std::move(source));
+          })
+          .capturePlanNodeId(intermediateAggregationNodeId)
+          .singleAggregation(
+              {"k1", "k2", "group_id"}, {"sum(sum_a) as sum_a"})
+          .project({"k1", "k2", "sum_a"})
+          .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(plan)
+          .maxDrivers(1)
+          .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "1")
+          .assertResults(
+              "SELECT k1, k2, sum(a) FROM tmp "
+              "GROUP BY GROUPING SETS ((k1), (k2))");
+
+  auto planStats = toPlanStats(task->taskStats());
+  const auto& intermediateStats =
+      planStats.at(intermediateAggregationNodeId);
+  EXPECT_EQ(intermediateStats.operatorStats.count("CudfBatchConcat"), 0);
+
+  const auto groupbyIt =
+      intermediateStats.operatorStats.find("CudfGroupbyINTERMEDIATE");
+  ASSERT_NE(groupbyIt, intermediateStats.operatorStats.end());
+  EXPECT_EQ(groupbyIt->second->inputVectors, 4);
+  EXPECT_EQ(
+      groupbyIt->second->outputVectors, groupbyIt->second->inputVectors);
+  EXPECT_EQ(groupbyIt->second->inputRows, 16);
+  EXPECT_EQ(groupbyIt->second->outputRows, 8);
+}
+
 // Test: String type in grouping keys
 TEST_F(CudfGroupIdTest, stringKeys) {
   auto input = makeRowVector(
@@ -504,4 +636,117 @@ TEST_F(CudfGroupIdTest, columnUsedAsKeyAndAggregationInput) {
       "SELECT k1_key, sum(k1) as sum_k1, sum(k2) as sum_k2 FROM ("
       "  SELECT k1 as k1_key, k1, k2 FROM tmp"
       ") GROUP BY GROUPING SETS ((k1_key), ())");
+}
+
+TEST_F(CudfGroupIdTest, outputViewsRetainInputStorage) {
+  auto input = makeRowVector(
+      {"k", "s", "a"},
+      {
+          makeNullableFlatVector<int32_t>({1, std::nullopt, 3}),
+          makeFlatVector<std::string>({"aa", "b", "ccc"}),
+          makeFlatVector<int64_t>({10, 20, 30}),
+      });
+
+  core::PlanNodePtr groupIdPlanNode;
+  auto plan =
+      PlanBuilder()
+          .values({input})
+          .groupId(
+              {"k", "k as k_copy", "s"}, {{"k", "k_copy", "s"}, {"s"}}, {"a"})
+          .capturePlanNode(groupIdPlanNode)
+          .planNode();
+  auto groupIdNode =
+      std::dynamic_pointer_cast<const core::GroupIdNode>(groupIdPlanNode);
+  ASSERT_NE(groupIdNode, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = plan;
+  auto task = Task::create(
+      "CudfGroupIdTest.outputViewsRetainInputStorage",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  cudf_velox::CudfGroupId groupId(0, &driverCtx, groupIdNode);
+
+  auto inputTable = cudf_velox::with_arrow::toCudfTable(
+      input, pool(), stream, cudf::get_current_device_resource_ref());
+  auto cudfInput = std::make_shared<cudf_velox::CudfVector>(
+      pool(), input->type(), input->size(), std::move(inputTable), stream);
+  const auto sourceView = cudfInput->getTableView();
+  const auto* sourceKData = sourceView.column(0).data<int32_t>();
+  const auto* sourceKNullMask = sourceView.column(0).null_mask();
+  const auto* sourceStringOffsets =
+      sourceView.column(1).child(0).data<cudf::size_type>();
+  const auto* sourceStringChars = sourceView.column(1).data<char>();
+  const auto* sourceAData = sourceView.column(2).data<int64_t>();
+
+  groupId.addInput(cudfInput);
+  auto first =
+      std::dynamic_pointer_cast<cudf_velox::CudfVector>(groupId.getOutput());
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->getTableView().column(2).num_children(), 1);
+  auto second =
+      std::dynamic_pointer_cast<cudf_velox::CudfVector>(groupId.getOutput());
+  ASSERT_NE(second, nullptr);
+  EXPECT_TRUE(groupId.needsInput());
+
+  const auto firstView = first->getTableView();
+  ASSERT_EQ(firstView.num_columns(), 5);
+  EXPECT_EQ(firstView.column(0).data<int32_t>(), sourceKData);
+  EXPECT_EQ(firstView.column(1).data<int32_t>(), sourceKData);
+  EXPECT_EQ(firstView.column(0).null_mask(), sourceKNullMask);
+  EXPECT_EQ(firstView.column(1).null_mask(), sourceKNullMask);
+  EXPECT_EQ(
+      firstView.column(2).child(0).data<cudf::size_type>(),
+      sourceStringOffsets);
+  EXPECT_EQ(firstView.column(2).data<char>(), sourceStringChars);
+  EXPECT_EQ(firstView.column(3).data<int64_t>(), sourceAData);
+
+  const auto secondView = second->getTableView();
+  ASSERT_EQ(secondView.num_columns(), 5);
+  EXPECT_TRUE(secondView.column(0).nullable());
+  EXPECT_TRUE(secondView.column(1).nullable());
+  EXPECT_EQ(secondView.column(0).null_count(), input->size());
+  EXPECT_EQ(secondView.column(1).null_count(), input->size());
+  EXPECT_NE(secondView.column(0).data<int32_t>(), sourceKData);
+  EXPECT_NE(secondView.column(1).data<int32_t>(), sourceKData);
+  EXPECT_EQ(
+      secondView.column(2).child(0).data<cudf::size_type>(),
+      sourceStringOffsets);
+  EXPECT_EQ(secondView.column(2).data<char>(), sourceStringChars);
+  EXPECT_EQ(secondView.column(3).data<int64_t>(), sourceAData);
+
+  EXPECT_GT(first->estimateFlatSize(), cudfInput->estimateFlatSize());
+  EXPECT_EQ(first->estimateFlatSize(), second->estimateFlatSize());
+  EXPECT_EQ(
+      copyColumnData<int64_t>(firstView.column(4), stream),
+      (std::vector<int64_t>{0, 0, 0}));
+  EXPECT_EQ(
+      copyColumnData<int64_t>(secondView.column(4), stream),
+      (std::vector<int64_t>{1, 1, 1}));
+
+  // GroupId has released its operator-level input state. The output owners
+  // must now be sufficient to retain all borrowed source and null columns.
+  cudfInput.reset();
+  auto materializedFirst = first->release();
+  first.reset();
+  EXPECT_NE(materializedFirst->view().column(0).data<int32_t>(), sourceKData);
+  EXPECT_EQ(materializedFirst->view().column(0).null_count(), 1);
+  const auto firstK =
+      copyColumnData<int32_t>(materializedFirst->view().column(0), stream);
+  EXPECT_EQ(firstK[0], 1);
+  EXPECT_EQ(firstK[2], 3);
+
+  // Releasing one sibling must not invalidate another output which still
+  // borrows the same input storage.
+  EXPECT_EQ(second->getTableView().column(3).data<int64_t>(), sourceAData);
+  auto materializedSecond = second->release();
+  second.reset();
+  EXPECT_EQ(materializedSecond->view().column(0).null_count(), input->size());
+  EXPECT_EQ(
+      copyColumnData<int64_t>(materializedSecond->view().column(3), stream),
+      (std::vector<int64_t>{10, 20, 30}));
 }

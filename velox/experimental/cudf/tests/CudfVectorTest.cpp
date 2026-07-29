@@ -204,22 +204,6 @@ std::unique_ptr<cudf::packed_table> makePackedTable(
       cudf::packed_table{tableView, std::move(packedColumns)});
 }
 
-std::unique_ptr<cudf::packed_table> makePackedTable(
-    cuda::stream_ref stream,
-    RecordingAsyncDeviceResource& resource) {
-  auto table = makeTable(stream, cudf::get_current_device_resource_ref());
-  auto packedColumns = cudf::pack(
-      table->view(),
-      stream,
-      rmm::to_device_async_resource_ref_checked(&resource));
-  // CudfVector does not join producer streams. Synchronize the packing stream
-  // before handing the packed table to CudfVector.
-  stream.sync();
-  auto tableView = cudf::unpack(packedColumns);
-  return std::make_unique<cudf::packed_table>(
-      cudf::packed_table{tableView, std::move(packedColumns)});
-}
-
 class CudfVectorTest : public ::testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {

@@ -412,10 +412,17 @@ class AggregationAdapter : public OperatorAdapter {
 
     bool isGlobal = aggregationPlanNode->groupingKeys().empty();
     bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
+    const bool flushesGroupIdPartialInput =
+        !isGlobal && !isDistinct &&
+        exec::isPartialOutput(aggregationPlanNode->step()) &&
+        !hasFinalAggs(aggregationPlanNode->aggregates()) &&
+        !hasCompanionAggregates(aggregationPlanNode->aggregates()) &&
+        aggregationPlanNode->sources()[0]->is<core::GroupIdNode>();
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     const auto& cudfConfig = CudfConfig::getInstance();
-    if (cudfConfig.concatOptimizationEnabled) {
+    if (cudfConfig.concatOptimizationEnabled &&
+        !flushesGroupIdPartialInput) {
       VELOX_CHECK_GT(cudfConfig.batchSizeMinThreshold, 0);
       auto targetRows = static_cast<size_t>(cudfConfig.batchSizeMinThreshold);
       if (!isGlobal && !isDistinct &&

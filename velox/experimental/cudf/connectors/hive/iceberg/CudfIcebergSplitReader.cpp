@@ -123,6 +123,7 @@ void CudfIcebergSplitReader::resetSplit() {
   noColumnsToRead_ = false;
   syntheticTableProduced_ = false;
   deferSubfieldFilter_ = false;
+  transformedPushdownFilter_.reset();
   baseReadOffset_ = 0;
   deleteBitmap_ = nullptr;
   deviceBitmap_.reset();
@@ -136,6 +137,13 @@ void CudfIcebergSplitReader::setupReader() {
 }
 
 cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
+  if (transformedPushdownFilter_.has_value()) {
+    if (transformedPushdownFilter_->requiresSplitSpecificDecimalTypes() and
+        not hasSplitSpecificPushdownFilter()) {
+      return nullptr;
+    }
+    return transformedPushdownFilter_->expr();
+  }
   return deferSubfieldFilter_ ? nullptr : CudfSplitReader::pushdownFilter();
 }
 
@@ -163,18 +171,14 @@ void CudfIcebergSplitReader::prepareSplitInternal(
   // Determine if there are no columns to read.
   noColumnsToRead_ = readColumnNames_.empty();
 
-  // Defer subfield filter when we have injected columns as filter may be
-  // referencing them.
-  deferSubfieldFilter_ = CudfSplitReader::subfieldFilter() != nullptr and
-      (noColumnsToRead_ or injectedColumns_.size());
+  prepareSubfieldFilter();
 
-  // Evaluate if cuDF reader should prepend row index column. Must compute after
-  // `deferSubfieldFilter_` is set.
+  // Evaluate after the pushed subfield filter is prepared.
   prependRowIndex_ = needPrependedRowIndex();
 
   if (deferSubfieldFilter_) {
-    VLOG(1)
-        << "Subfield filter is deferred to post table read due to missing column references.";
+    VLOG(1) << "Subfield filter is deferred to post table read due to injected "
+               "columns or unavailable split-specific decimal types.";
   }
 
   setupReader();
@@ -203,6 +207,43 @@ bool CudfIcebergSplitReader::needPrependedRowIndex() const {
 
   // Needed if a filter is pushed into the data-file reader.
   return pushdownFilter() != nullptr;
+}
+
+void CudfIcebergSplitReader::prepareSubfieldFilter() {
+  auto* originalFilter = CudfSplitReader::pushdownFilter();
+  if (originalFilter == nullptr) {
+    return;
+  }
+
+  // Defer the original filter to the very end if there are no columns to read
+  if (noColumnsToRead_) {
+    deferSubfieldFilter_ = true;
+    return;
+  }
+
+  // No injected columns, push the original filter as is
+  if (injectedColumns_.empty()) {
+    return;
+  }
+
+  // Gather injected column indices
+  std::vector<cudf::size_type> injectedColumnIndices;
+  injectedColumnIndices.reserve(injectedColumns_.size());
+  for (const auto& column : injectedColumns_) {
+    injectedColumnIndices.push_back(
+        static_cast<cudf::size_type>(column.outputIndex));
+  }
+
+  // Compute the transformed filter to push, if any
+  transformedPushdownFilter_ =
+      transformFilterForInjectedColumns(*originalFilter, injectedColumnIndices);
+
+  // Defer the logical filter if it references an injected column, or if a
+  // transformed decimal predicate has no split-specific physical expression.
+  deferSubfieldFilter_ =
+      transformedPushdownFilter_->referencesInjectedColumn() or
+      (transformedPushdownFilter_->requiresSplitSpecificDecimalTypes() and
+       not hasSplitSpecificPushdownFilter());
 }
 
 std::unique_ptr<cudf::column> CudfIcebergSplitReader::extractRowIndex(
@@ -610,7 +651,7 @@ void CudfIcebergSplitReader::readPositionalDeleteBitmap(
       deviceBitmap_->data(),
       deleteBitmap_->as<uint8_t>(),
       numBitmaskBytes,
-      cudaMemcpyHostToDevice,
+      cudaMemcpyDefault,
       stream_.value()));
 }
 

@@ -3005,6 +3005,81 @@ TEST_P(MultiThreadedHashJoinTest, rightJoin) {
       .run();
 }
 
+// CudfBatchConcat and CudfHashJoinProbe share the hash join plan-node ID.
+// Verify right-join finalization locates peer probes by operator ID and merges
+// disjoint build-row match flags from every probe driver.
+TEST_F(HashJoinTest, rightJoinWithBatchConcat) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedConcatOptimizationEnabled = config.concatOptimizationEnabled;
+  SCOPE_EXIT {
+    config.concatOptimizationEnabled = savedConcatOptimizationEnabled;
+  };
+  config.concatOptimizationEnabled = true;
+
+  constexpr int32_t kNumDrivers = 3;
+  constexpr int32_t kNumBatches = 12;
+  constexpr int32_t kRowsPerBatch = 16;
+  constexpr int32_t kNumRows = kNumBatches * kRowsPerBatch;
+  auto probeVectors = makeBatches(kNumBatches, [&](int32_t batch) {
+    return makeRowVector({
+        makeFlatVector<int32_t>(
+            kRowsPerBatch,
+            [batch](auto row) { return batch * kRowsPerBatch + row; }),
+        makeFlatVector<int32_t>(
+            kRowsPerBatch,
+            [batch](auto row) { return 1'000 + batch * kRowsPerBatch + row; }),
+    });
+  });
+  auto build = makeRowVector(
+      {"u_c0", "u_c1"},
+      {makeFlatVector<int32_t>(kNumRows, [](auto row) { return row; }),
+       makeFlatVector<int32_t>(
+           kNumRows, [](auto row) { return 2'000 + row; })});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId joinNodeId;
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values(probeVectors)
+          .localPartitionRoundRobinRow()
+          .hashJoin(
+              {"c0"},
+              {"u_c0"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "",
+              {"c0", "c1", "u_c0", "u_c1"},
+              core::JoinType::kRight)
+          .capturePlanNodeId(joinNodeId)
+          .planNode();
+
+  auto expected = makeRowVector(
+      {"c0", "c1", "u_c0", "u_c1"},
+      {makeFlatVector<int32_t>(kNumRows, [](auto row) { return row; }),
+       makeFlatVector<int32_t>(kNumRows, [](auto row) { return 1'000 + row; }),
+       makeFlatVector<int32_t>(kNumRows, [](auto row) { return row; }),
+       makeFlatVector<int32_t>(
+           kNumRows, [](auto row) { return 2'000 + row; })});
+
+  auto task = AssertQueryBuilder(plan)
+                  .maxDrivers(kNumDrivers)
+                  .config(
+                      core::QueryConfig::kMaxLocalExchangePartitionCount,
+                      std::to_string(kNumDrivers))
+                  .assertResults(expected);
+
+  auto planStats = toPlanStats(task->taskStats());
+  const auto& joinStats = planStats.at(joinNodeId).operatorStats;
+  const auto& concatStats = *joinStats.at("CudfBatchConcat");
+  EXPECT_EQ(concatStats.numDrivers, kNumDrivers);
+  EXPECT_EQ(concatStats.inputRows, kNumRows);
+  EXPECT_EQ(concatStats.inputVectors, kNumBatches * kNumDrivers);
+  EXPECT_EQ(concatStats.outputVectors, kNumDrivers);
+  const auto& probeStats = *joinStats.at("CudfHashJoinProbe");
+  EXPECT_EQ(probeStats.numDrivers, kNumDrivers);
+  EXPECT_EQ(probeStats.inputRows, kNumRows);
+  EXPECT_EQ(probeStats.inputVectors, kNumDrivers);
+}
+
 TEST_P(MultiThreadedHashJoinTest, rightJoinWithEmptyBuild) {
   const std::vector<bool> finishOnEmptys = {false, true};
   for (const auto finishOnEmpty : finishOnEmptys) {

@@ -136,7 +136,7 @@ void CudfIcebergSplitReader::setupReader() {
 }
 
 cudf::ast::expression const* CudfIcebergSplitReader::pushdownFilter() const {
-  return deferSubfieldFilter_ ? nullptr : subfieldFilter();
+  return deferSubfieldFilter_ ? nullptr : CudfSplitReader::pushdownFilter();
 }
 
 void CudfIcebergSplitReader::prepareSplitInternal(

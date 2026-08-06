@@ -90,6 +90,54 @@ TEST_F(PlanNodeTest, findFirstNode) {
   EXPECT_EQ(nullptr, PlanNode::findFirstNode<ValuesNode>(project0.get()));
 }
 
+TEST_F(PlanNodeTest, filteredSemiProjectSpillRequiresNonNullKeys) {
+  const auto probeType =
+      ROW({"probe_key", "probe_value"}, {BIGINT(), BIGINT()});
+  const auto buildType =
+      ROW({"build_key", "build_value"}, {BIGINT(), BIGINT()});
+  const auto probe = std::make_shared<ValuesNode>(
+      "probe", std::vector<RowVectorPtr>{makeRowVector(probeType, 0)});
+  const auto build = std::make_shared<ValuesNode>(
+      "build", std::vector<RowVectorPtr>{makeRowVector(buildType, 0)});
+  const auto filter = std::make_shared<ConstantTypedExpr>(BOOLEAN(), true);
+  const auto join = std::make_shared<HashJoinNode>(
+      "join",
+      JoinType::kLeftSemiProject,
+      true,
+      std::vector<FieldAccessTypedExprPtr>{
+          std::make_shared<FieldAccessTypedExpr>(BIGINT(), "probe_key")},
+      std::vector<FieldAccessTypedExprPtr>{
+          std::make_shared<FieldAccessTypedExpr>(BIGINT(), "build_key")},
+      filter,
+      probe,
+      build,
+      ROW({"probe_key", "probe_value", "match"},
+          {BIGINT(), BIGINT(), BOOLEAN()}));
+  const QueryConfig spillConfig(
+      {{QueryConfig::kSpillEnabled, "true"},
+       {QueryConfig::kJoinSpillEnabled, "true"}});
+
+  EXPECT_FALSE(join->canSpill(spillConfig));
+  EXPECT_FALSE(
+      HashJoinNode::Builder(*join).leftKeysNonNull(true).build()->canSpill(
+          spillConfig));
+  EXPECT_FALSE(
+      HashJoinNode::Builder(*join).rightKeysNonNull(true).build()->canSpill(
+          spillConfig));
+  EXPECT_TRUE(
+      HashJoinNode::Builder(*join)
+          .leftKeysNonNull(true)
+          .rightKeysNonNull(true)
+          .build()
+          ->canSpill(spillConfig));
+  EXPECT_TRUE(
+      HashJoinNode::Builder(*join).nullAware(false).build()->canSpill(
+          spillConfig));
+  EXPECT_TRUE(
+      HashJoinNode::Builder(*join).filter(nullptr).build()->canSpill(
+          spillConfig));
+}
+
 TEST_F(PlanNodeTest, findNodeById) {
   auto values = std::make_shared<ValuesNode>("1", std::vector<RowVectorPtr>{});
   auto project = std::make_shared<ProjectNode>(

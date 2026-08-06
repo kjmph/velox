@@ -3996,9 +3996,15 @@ class HashJoinNode : public AbstractJoinNode {
     // NOTE: as for now, we don't allow spilling for null-aware anti-join with
     // filter set. It requires to cross join the null-key probe rows with all
     // the build-side rows for filter evaluation which is not supported under
-    // spilling.
-    return !(isAntiJoin() && nullAware_ && filter() != nullptr) &&
-        queryConfig.joinSpillEnabled();
+    // spilling. A filtered left semi project has the same requirement when
+    // either equality key can be null. Spill partitions a probe row only once,
+    // so it cannot evaluate the marker against null-key rows or all build rows
+    // held by other partitions.
+    const bool unsupportedNullAwareFilterSpill = nullAware_ && filter() &&
+        (isAntiJoin() ||
+         (isLeftSemiProjectJoin() &&
+          (!leftKeysNonNull_ || !rightKeysNonNull_)));
+    return !unsupportedNullAwareFilterSpill && queryConfig.joinSpillEnabled();
   }
 
   bool requiresSingleThread() const override {
@@ -4036,12 +4042,14 @@ class HashJoinNode : public AbstractJoinNode {
     return rightKeysUnique_;
   }
 
-  /// Returns true when the planner has proven the left/probe join keys non-null.
+  /// Returns true when the planner has proven the left/probe join keys
+  /// non-null.
   bool leftKeysNonNull() const {
     return leftKeysNonNull_;
   }
 
-  /// Returns true when the planner has proven the right/build join keys non-null.
+  /// Returns true when the planner has proven the right/build join keys
+  /// non-null.
   bool rightKeysNonNull() const {
     return rightKeysNonNull_;
   }

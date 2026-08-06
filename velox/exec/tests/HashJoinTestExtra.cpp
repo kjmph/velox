@@ -7849,6 +7849,42 @@ TEST_P(HashJoinTest, semiProjectWithFilter) {
   }
 }
 
+TEST_P(HashJoinTest, leftSemiProjectClearsReusedMatchNulls) {
+  auto probe = makeRowVector(
+      {"t0", "t1"},
+      {makeFlatVector<int64_t>({1, 2}), makeFlatVector<int64_t>({10, 10})});
+  auto build = makeRowVector(
+      {"u0", "u1"},
+      {makeNullableFlatVector<int64_t>({1, 2, std::nullopt}),
+       makeFlatVector<int64_t>({10, 20, 20})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin(
+              {"t0"},
+              {"u0"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "t1 < u1",
+              {"t0", "t1", "match"},
+              core::JoinType::kLeftSemiProject,
+              true)
+          .planNode();
+
+  // The first output marker is NULL and the second is TRUE. One-row output
+  // batches force both markers to reuse index zero in the output vector.
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .planNode(plan)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "1")
+      .referenceQuery(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE t1 < u1) FROM t")
+      .injectSpill(false)
+      .run();
+}
+
 TEST_P(HashJoinTest, nullAwareRightSemiProjectWithFilterNotAllowed) {
   auto probe = makeRowVector(ROW({"t0", "t1"}, {INTEGER(), BIGINT()}), 10);
   auto build = makeRowVector(ROW({"u0", "u1"}, {INTEGER(), BIGINT()}), 10);

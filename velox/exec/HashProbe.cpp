@@ -946,6 +946,9 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
   } else {
     auto flatMatch = matchColumn()->as<FlatVector<bool>>();
     flatMatch->resize(size);
+    // The output vector is reused across batches. Clear NULLs left by a
+    // previous null-aware semi-project batch before writing non-null markers.
+    flatMatch->clearAllNulls();
     auto rawValues = flatMatch->mutableRawValues<uint64_t>();
     auto* outputTableRows = outputTableRows_->as<char*>();
     for (auto i = 0; i < size; ++i) {
@@ -1860,7 +1863,9 @@ int32_t HashProbe::evalFilter(int32_t numRows) {
     static const char* kPassed = "passed";
 
     if (nullAware_) {
-      leftSemiProjectIsNull_.resize(numRows);
+      // The tracker can flush one probe row carried over from the previous
+      // result batch in addition to the rows in this batch.
+      leftSemiProjectIsNull_.resize(outputTableRowsCapacity_);
       leftSemiProjectIsNull_.clearAll();
 
       auto addLast = [&](auto row, std::optional<bool> passed) {

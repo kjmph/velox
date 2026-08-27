@@ -336,6 +336,137 @@ function install_aws_deps {
   cmake_install_dir aws-sdk-cpp -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DBUILD_SHARED_LIBS:BOOL=OFF -DMINIMIZE_SIZE:BOOL=ON -DENABLE_TESTING:BOOL=OFF -DBUILD_ONLY:STRING="s3;identity-management"
 }
 
+# Installs the exact curl and AWS SDK revisions required by
+# VELOX_ENABLE_S3_DIRECT_RECEIVE. This is intentionally separate from
+# install_aws_deps so ordinary S3 builds retain their upstream dependencies.
+# Both shared libraries are installed into one isolated prefix to guarantee
+# that the AWS SDK, Velox, and GPU KvikIO path resolve the same curl ABI.
+function checkout_s3_direct_receive_dependency {
+  local REPO=$1
+  local COMMIT=$2
+  local SOURCE_DIR=$3
+  local WITH_SUBMODULES=${4:-false}
+  local SOURCE_PATH="${DEPENDENCY_DIR}/${SOURCE_DIR}"
+
+  if [[ -e ${SOURCE_PATH} || -L ${SOURCE_PATH} ]]; then
+    local EXISTING_COMMIT
+    local STATUS_ENTRY
+    local STATUS_CODE
+    local STATUS_PATH
+    local INVALID_STATUS=""
+    EXISTING_COMMIT=$(git -C "${SOURCE_PATH}" rev-parse HEAD 2>/dev/null || true)
+    if [[ ${EXISTING_COMMIT} != "${COMMIT}" ]]; then
+      echo "${SOURCE_PATH} exists at ${EXISTING_COMMIT:-an unknown revision}; expected ${COMMIT}." >&2
+      return 1
+    fi
+    if ! git -C "${SOURCE_PATH}" diff --quiet HEAD --ignore-submodules=none; then
+      echo "${SOURCE_PATH} contains tracked source or submodule changes." >&2
+      return 1
+    fi
+    if ! git -C "${SOURCE_PATH}" status \
+      --porcelain=v1 \
+      -z \
+      --untracked-files=all \
+      --ignored=matching \
+      --ignore-submodules=none >/dev/null; then
+      echo "Unable to inspect ${SOURCE_PATH}." >&2
+      return 1
+    fi
+    while IFS= read -r -d '' STATUS_ENTRY; do
+      STATUS_CODE=${STATUS_ENTRY:0:2}
+      STATUS_PATH=${STATUS_ENTRY:3}
+      if [[ (${STATUS_CODE} == "??" || ${STATUS_CODE} == "!!") &&
+        (${STATUS_PATH} == "_build" || ${STATUS_PATH} == _build/*) ]]; then
+        continue
+      fi
+      printf -v INVALID_STATUS '%s [%s %q]' \
+        "${INVALID_STATUS}" \
+        "${STATUS_CODE}" \
+        "${STATUS_PATH}"
+    done < <(
+      git -C "${SOURCE_PATH}" status \
+        --porcelain=v1 \
+        -z \
+        --untracked-files=all \
+        --ignored=matching \
+        --ignore-submodules=none
+    )
+    if [[ -n ${INVALID_STATUS} ]]; then
+      echo "${SOURCE_PATH} contains files outside its installer-owned _build directory:${INVALID_STATUS}" >&2
+      return 1
+    fi
+    return
+  fi
+
+  mkdir -p "${DEPENDENCY_DIR}"
+  local TEMP_PATH
+  TEMP_PATH=$(mktemp -d "${DEPENDENCY_DIR}/.${SOURCE_DIR}.checkout.XXXXXX") || return 1
+  if ! (
+    git init -q "${TEMP_PATH}" &&
+      git -C "${TEMP_PATH}" remote add origin "https://github.com/${REPO}.git" &&
+      git -C "${TEMP_PATH}" fetch -q --depth 1 origin "${COMMIT}" &&
+      git -C "${TEMP_PATH}" checkout -q --detach FETCH_HEAD &&
+      [[ $(git -C "${TEMP_PATH}" rev-parse HEAD) == "${COMMIT}" ]] &&
+      {
+        [[ ${WITH_SUBMODULES} != true ]] ||
+          git -C "${TEMP_PATH}" submodule update --init --recursive --depth 1
+      }
+  ); then
+    rm -rf -- "${TEMP_PATH}"
+    return 1
+  fi
+  if [[ -e ${SOURCE_PATH} || -L ${SOURCE_PATH} ]]; then
+    echo "${SOURCE_PATH} appeared while its atomic checkout was being prepared." >&2
+    rm -rf -- "${TEMP_PATH}"
+    return 1
+  fi
+  if ! mv -- "${TEMP_PATH}" "${SOURCE_PATH}"; then
+    rm -rf -- "${TEMP_PATH}"
+    return 1
+  fi
+}
+
+function install_s3_direct_receive_deps {
+  local CURL_REPO="kjmph/curl"
+  local AWS_REPO="kjmph/aws-sdk-cpp"
+  local CURL_SOURCE_DIR="s3-direct-receive-curl"
+  local AWS_SOURCE_DIR="s3-direct-receive-aws-sdk-cpp"
+  local BASE_INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+  local DIRECT_INSTALL_PREFIX="${S3_DIRECT_RECEIVE_INSTALL_PREFIX:-${BASE_INSTALL_PREFIX}/s3-direct-receive}"
+
+  checkout_s3_direct_receive_dependency \
+    "${CURL_REPO}" "${S3_DIRECT_RECEIVE_CURL_COMMIT}" "${CURL_SOURCE_DIR}" || return 1
+  checkout_s3_direct_receive_dependency \
+    "${AWS_REPO}" "${S3_DIRECT_RECEIVE_AWS_SDK_COMMIT}" "${AWS_SOURCE_DIR}" true || return 1
+
+  INSTALL_PREFIX="${DIRECT_INSTALL_PREFIX}" cmake_install_dir "${CURL_SOURCE_DIR}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_CURL_EXE=OFF \
+    -DCURL_USE_OPENSSL=ON \
+    -DCURL_HIDDEN_SYMBOLS=ON \
+    -DCURL_USE_LIBPSL=OFF \
+    -DCURL_DISABLE_LDAP=ON \
+    -DCMAKE_INSTALL_LIBDIR=lib
+
+  INSTALL_PREFIX="${DIRECT_INSTALL_PREFIX}" cmake_install_dir "${AWS_SOURCE_DIR}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DMINIMIZE_SIZE=ON \
+    -DENABLE_TESTING=OFF \
+    -DENABLE_RTTI=ON \
+    -DFORCE_CURL=ON \
+    -DBUILD_ONLY="s3;identity-management" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCURL_DIR="${DIRECT_INSTALL_PREFIX}/lib/cmake/CURL"
+
+  echo "S3 direct-receive dependencies installed in ${DIRECT_INSTALL_PREFIX}"
+  echo "Configure Velox with:"
+  echo "  -DCMAKE_PREFIX_PATH=${DIRECT_INSTALL_PREFIX}"
+  echo "  -DAWSSDK_ROOT_DIR=${DIRECT_INSTALL_PREFIX}"
+  echo "  -DAWSSDK_DIR=${DIRECT_INSTALL_PREFIX}/lib/cmake/AWSSDK"
+  echo "  -DCURL_DIR=${DIRECT_INSTALL_PREFIX}/lib/cmake/CURL"
+}
+
 function install_minio {
   local MINIO_OS=${1:-darwin}
   local MINIO_ARCH

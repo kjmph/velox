@@ -223,6 +223,10 @@ else()
   endif()
 endif()
 
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE AND NOT VELOX_ENABLE_S3)
+  message(FATAL_ERROR "VELOX_ENABLE_S3_DIRECT_RECEIVE requires VELOX_ENABLE_S3")
+endif()
+
 if(${VELOX_ENABLE_BENCHMARKS})
   set(VELOX_ENABLE_BENCHMARKS_BASIC ON)
 endif()
@@ -246,6 +250,16 @@ if(VELOX_ENABLE_CUDF)
   elseif(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13.3)
     message(FATAL_ERROR "cuDF requires GCC >= 13.3. Found GCC ${CMAKE_CXX_COMPILER_VERSION}.")
   endif()
+endif()
+
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+  # The patched AWS SDK and KvikIO must share one exact curl ABI. Resolve the
+  # package installed by install_s3_direct_receive_deps before either consumer
+  # is configured, rather than allowing cuDF to create a second curl target.
+  message(STATUS "Using the S3 direct-receive curl package")
+  set(CURL_SOURCE SYSTEM)
+  velox_resolve_dependency(CURL CONFIG)
+elseif(VELOX_ENABLE_CUDF)
   message(STATUS "Building curl from source to satisfy cuDF curl version requirement")
   set(CURL_SOURCE BUNDLED)
   velox_resolve_dependency(CURL)
@@ -254,7 +268,7 @@ endif()
 if(VELOX_BUILD_TESTING OR VELOX_BUILD_TEST_UTILS)
   # cuDF bundles curl since it needs a specific version.
   # Use bundled or system curl otherwise.
-  if(NOT VELOX_ENABLE_CUDF)
+  if(NOT VELOX_ENABLE_CUDF AND NOT VELOX_ENABLE_S3_DIRECT_RECEIVE)
     velox_set_source(CURL)
     velox_resolve_dependency(CURL)
   endif()
@@ -338,10 +352,6 @@ if(${VELOX_FORCE_COLORED_OUTPUT})
   endif()
 endif()
 
-if(VELOX_ENABLE_S3_DIRECT_RECEIVE AND NOT VELOX_ENABLE_S3)
-  message(FATAL_ERROR "VELOX_ENABLE_S3_DIRECT_RECEIVE requires VELOX_ENABLE_S3")
-endif()
-
 if(VELOX_ENABLE_S3)
   # Set AWS_ROOT_DIR if you have a custom install location of AWS SDK CPP.
   if(AWSSDK_ROOT_DIR)
@@ -351,9 +361,8 @@ if(VELOX_ENABLE_S3)
     # Direct receive extends libcurl's public API. Require the patched curl
     # CMake package so module-mode discovery cannot combine custom headers or
     # a custom library path with the system libcurl pkg-config dependencies.
-    find_package(CURL CONFIG REQUIRED)
     if(NOT TARGET CURL::libcurl)
-      message(FATAL_ERROR "The patched curl package must export CURL::libcurl")
+      message(FATAL_ERROR "The S3 direct-receive curl package must export CURL::libcurl")
     endif()
   endif()
   find_package(AWSSDK 1.11.654 REQUIRED COMPONENTS s3;identity-management)
@@ -646,7 +655,7 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
     velox_set_source(cudf)
     velox_resolve_dependency(cudf)
     add_compile_definitions(VELOX_ENABLE_CUDF)
-    if(TARGET aws-cpp-sdk-core)
+    if(TARGET aws-cpp-sdk-core AND NOT VELOX_ENABLE_S3_DIRECT_RECEIVE)
       # Fix for AWS SDK CPP using hardcoded system curl instead of soft link to curl
       get_target_property(override_curl_lib aws-cpp-sdk-core INTERFACE_LINK_LIBRARIES)
       list(REMOVE_ITEM override_curl_lib "/usr/lib64/libcurl.so")

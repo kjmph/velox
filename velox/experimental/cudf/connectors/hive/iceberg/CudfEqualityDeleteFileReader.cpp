@@ -171,7 +171,7 @@ void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
           std::make_shared<BufferedInputDataSource>(std::move(bufferedInput));
       return cudf::io::source_info{dataSource.get()};
     }
-    return cudf::io::source_info{deleteFile.filePath};
+    return cudf::io::source_info{normalizeKvikioUri(deleteFile.filePath)};
   }();
 
   // Read the equality delete file

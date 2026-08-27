@@ -108,6 +108,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_split_reader_helpers_test
+  SOURCES Main.cpp CudfSplitReaderHelpersTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_hive_connector
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_decimal_aggregation_test
   SOURCES Main.cpp DecimalAggregationTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib

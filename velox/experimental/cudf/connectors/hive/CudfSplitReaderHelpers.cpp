@@ -17,7 +17,6 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 
-#include "velox/common/Casts.h"
 #include "velox/dwio/common/BufferedInput.h"
 
 #include <cudf/detail/utilities/integer_utils.hpp>
@@ -26,13 +25,15 @@
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/types.hpp>
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda/iterator>
 #include <cuda/std/tuple>
 
-#include <folly/futures/Future.h>
-
+#include <exception>
 #include <future>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -48,21 +49,115 @@ std::mutex& ioBatchMutex() {
   return mutex;
 }
 
-template <typename T>
-std::future<T> toStdFuture(folly::Future<T> follyFuture) {
-  auto promise = std::make_shared<std::promise<T>>();
-  auto stdFuture = promise->get_future();
-
-  std::move(follyFuture).thenTry([promise](folly::Try<T>&& result) mutable {
-    if (result.hasValue()) {
-      promise->set_value(std::move(result.value()));
-    } else {
-      promise->set_exception(result.exception().to_exception_ptr());
-    }
-  });
-
-  return stdFuture;
+int getStreamDevice(rmm::cuda_stream_view stream) {
+  int device{};
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  CUDF_CUDA_TRY(cudaStreamGetDevice(stream.value(), &device));
+#else
+  // CUDA versions before 12.8 cannot query a stream's device. Retain the
+  // historical requirement that the stream belongs to the current device.
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+#endif
+  return device;
 }
+
+void synchronizeStream(rmm::cuda_stream_view stream, int device) {
+  auto const deviceScope =
+      rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+  try {
+    stream.synchronize();
+  } catch (...) {
+    const auto primaryError = std::current_exception();
+    // Returning while a host buffer may still be in use would be unsafe. A
+    // device-wide fence is the last recoverable fallback.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      std::terminate();
+    }
+    std::rethrow_exception(primaryError);
+  }
+}
+
+// Keeps the datasource alive while cuDF drains its completion future. The
+// explicit destructor is important when the outer deferred future is discarded:
+// lambda-capture destruction order alone cannot provide this lifetime rule.
+class RetainedReadCompletion {
+ public:
+  RetainedReadCompletion(
+      std::shared_ptr<cudf::io::datasource> dataSource,
+      std::future<void> completion)
+      : dataSource_(std::move(dataSource)),
+        completion_(std::move(completion)) {}
+
+  RetainedReadCompletion(RetainedReadCompletion&& other) noexcept
+      : dataSource_(std::move(other.dataSource_)),
+        completion_(std::move(other.completion_)) {}
+
+  RetainedReadCompletion(const RetainedReadCompletion&) = delete;
+  RetainedReadCompletion& operator=(const RetainedReadCompletion&) = delete;
+  RetainedReadCompletion& operator=(RetainedReadCompletion&&) = delete;
+
+  ~RetainedReadCompletion() noexcept {
+    if (completion_.valid()) {
+      try {
+        completion_.get();
+      } catch (...) {
+      }
+    }
+  }
+
+  void get() {
+    completion_.get();
+  }
+
+ private:
+  std::shared_ptr<cudf::io::datasource> dataSource_;
+  std::future<void> completion_;
+};
+
+class BufferedReadCompletion {
+ public:
+  BufferedReadCompletion(
+      std::shared_ptr<cudf::io::datasource> dataSource,
+      size_t pendingCount,
+      rmm::cuda_stream_view stream)
+      : dataSource_(std::move(dataSource)),
+        pendingCount_(pendingCount),
+        stream_(stream) {}
+
+  BufferedReadCompletion(BufferedReadCompletion&& other) noexcept
+      : dataSource_(std::move(other.dataSource_)),
+        pendingCount_(other.pendingCount_),
+        stream_(other.stream_),
+        consumed_(other.consumed_) {
+    other.consumed_ = true;
+  }
+
+  BufferedReadCompletion(const BufferedReadCompletion&) = delete;
+  BufferedReadCompletion& operator=(const BufferedReadCompletion&) = delete;
+  BufferedReadCompletion& operator=(BufferedReadCompletion&&) = delete;
+
+  ~BufferedReadCompletion() noexcept {
+    if (!consumed_ && dataSource_ != nullptr) {
+      static_cast<facebook::velox::cudf_velox::connector::hive::
+                      BufferedInputDataSource*>(dataSource_.get())
+          ->rollbackPendingDeviceLoads(pendingCount_);
+    }
+  }
+
+  void get() {
+    consumed_ = true;
+    static_cast<
+        facebook::velox::cudf_velox::connector::hive::BufferedInputDataSource*>(
+        dataSource_.get())
+        ->load(stream_);
+  }
+
+ private:
+  std::shared_ptr<cudf::io::datasource> dataSource_;
+  size_t pendingCount_;
+  rmm::cuda_stream_view stream_;
+  bool consumed_{false};
+};
 } // namespace
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -81,20 +176,70 @@ void BufferedInputDataSource::enqueueForDevice(
     uint8_t* dst) {
   auto inputStream = input_->enqueue({offset, size});
   std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back(
-      [dst, size, sharedStream](rmm::cuda_stream_view stream) {
-        std::vector<uint8_t> buffer(size);
-        sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst, buffer.data(), size, cudaMemcpyHostToDevice, stream.value()));
-      });
+  pendingDeviceLoads_.push_back([dst, size, sharedStream]() {
+    std::vector<uint8_t> buffer(size);
+    sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
+    return std::pair{dst, std::move(buffer)};
+  });
+}
+
+size_t BufferedInputDataSource::pendingDeviceLoadCount() const noexcept {
+  return pendingDeviceLoads_.size();
+}
+
+void BufferedInputDataSource::rollbackPendingDeviceLoads(
+    size_t count) noexcept {
+  if (count < pendingDeviceLoads_.size()) {
+    pendingDeviceLoads_.resize(count);
+  }
 }
 
 void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
+  auto deviceLoads = std::exchange(pendingDeviceLoads_, {});
+  if (deviceLoads.empty()) {
+    return;
+  }
+  // Clear queued destination pointers before loading. If loading fails, the
+  // discarded callbacks cannot be retried after their device buffers die.
   input_->load(velox::dwio::common::LogType::FILE);
-  std::lock_guard<std::mutex> lock(ioBatchMutex());
-  for (auto& deviceLoad : pendingDeviceLoads_) {
-    deviceLoad(stream);
+
+  const auto device = getStreamDevice(stream);
+  auto const deviceScope =
+      rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+
+  std::vector<std::vector<uint8_t>> hostBuffers;
+  hostBuffers.reserve(deviceLoads.size());
+  std::exception_ptr scheduleError;
+  {
+    std::lock_guard<std::mutex> lock(ioBatchMutex());
+    try {
+      for (auto& deviceLoad : deviceLoads) {
+        auto [dst, buffer] = deviceLoad();
+        hostBuffers.push_back(std::move(buffer));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            dst,
+            hostBuffers.back().data(),
+            hostBuffers.back().size(),
+            cudaMemcpyHostToDevice,
+            stream.value()));
+      }
+    } catch (...) {
+      scheduleError = std::current_exception();
+    }
+  }
+
+  // The pageable host buffers must remain alive until every copy is complete.
+  // synchronizeStream establishes completion even when stream synchronization
+  // itself fails, or terminates if a safe completion fence cannot be obtained.
+  try {
+    synchronizeStream(stream, device);
+  } catch (...) {
+    if (scheduleError == nullptr) {
+      throw;
+    }
+  }
+  if (scheduleError != nullptr) {
+    std::rethrow_exception(scheduleError);
   }
 }
 
@@ -141,18 +286,46 @@ std::future<size_t> BufferedInputDataSource::device_read_async(
     uint8_t* dst,
     rmm::cuda_stream_view stream) {
   VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
-  auto future = folly::via(input_->executor())
-                    .thenValue([this, offset, size, dst, stream](auto&&) {
-                      auto hostBuffer = this->host_read(offset, size);
-                      CUDF_CUDA_TRY(cudaMemcpyAsync(
-                          dst,
-                          hostBuffer->data(),
-                          hostBuffer->size(),
-                          cudaMemcpyHostToDevice,
-                          stream.value()));
-                      return hostBuffer->size();
-                    });
-  return toStdFuture(std::move(future));
+  const auto device = getStreamDevice(stream);
+  auto promise = std::make_shared<std::promise<size_t>>();
+  auto future = promise->get_future();
+  try {
+    input_->executor()->add(
+        [this, offset, size, dst, stream, device, promise]() {
+          try {
+            auto const deviceScope =
+                rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+            auto hostBuffer = this->host_read(offset, size);
+            if (hostBuffer->size() != 0) {
+              try {
+                CUDF_CUDA_TRY(cudaMemcpyAsync(
+                    dst,
+                    hostBuffer->data(),
+                    hostBuffer->size(),
+                    cudaMemcpyHostToDevice,
+                    stream.value()));
+              } catch (...) {
+                auto const copyError = std::current_exception();
+                try {
+                  synchronizeStream(stream, device);
+                } catch (...) {
+                  // synchronizeStream either establishes completion before it
+                  // throws or terminates when completion cannot be proven.
+                }
+                std::rethrow_exception(copyError);
+              }
+              synchronizeStream(stream, device);
+            }
+            promise->set_value(hostBuffer->size());
+          } catch (...) {
+            promise->set_exception(std::current_exception());
+          }
+        });
+  } catch (...) {
+    // Executor rejection is synchronous and no task owns the destination.
+    promise->set_exception(std::current_exception());
+  }
+  return future;
 }
 
 bool BufferedInputDataSource::supports_device_read() const {
@@ -179,6 +352,25 @@ fetchByteRangesAsync(
     cudf::host_span<const cudf::io::text::byte_range_info> byteRanges,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
+  auto bufferedInput = dynamic_cast<BufferedInputDataSource*>(dataSource.get());
+  if (bufferedInput == nullptr) {
+    // cuDF owns the generic KvikIO/host implementation. Delegating avoids a
+    // second copy of its coalescing, short-read validation, failure draining,
+    // and host-buffer lifetime rules at the Velox boundary.
+    auto [buffers, spans, completion] =
+        cudf::io::parquet::fetch_byte_ranges_to_device_async(
+            *dataSource, byteRanges, stream, mr);
+    auto completionState =
+        RetainedReadCompletion{std::move(dataSource), std::move(completion)};
+    auto retainedCompletion = std::async(
+        std::launch::deferred,
+        [completionState = std::move(completionState)]() mutable {
+          completionState.get();
+        });
+    return {
+        std::move(buffers), std::move(spans), std::move(retainedCompletion)};
+  }
+
   // Pad buffer sizes to be a multiple of 8 bytes. Required by
   // `decode_page_data_kernel` in cuDF Parquet reader.
   constexpr auto kBufferPaddingMultiple = 8;
@@ -215,8 +407,8 @@ fetchByteRangesAsync(
 
   // For BufferedInputDataSource, enqueue reads into the buffer and launch the
   // actual load asynchronously.
-  if (auto bufferedInput =
-          dynamic_cast<BufferedInputDataSource*>(dataSource.get())) {
+  auto const pendingCount = bufferedInput->pendingDeviceLoadCount();
+  try {
     auto iter =
         cuda::make_zip_iterator(byteRanges.begin(), columnChunkData.begin());
     std::for_each(
@@ -229,119 +421,21 @@ fetchByteRangesAsync(
               const_cast<uint8_t*>(destination.data()));
         });
 
-    // load buffered input data source
-    auto syncFunction = [](std::shared_ptr<cudf::io::datasource> dataSource,
-                           rmm::cuda_stream_view stream) {
-      auto buffer =
-          checkedPointerCast<BufferedInputDataSource>(dataSource.get());
-      buffer->load(stream);
-    };
-
+    auto completionState =
+        BufferedReadCompletion{dataSource, pendingCount, stream};
+    auto completion = std::async(
+        std::launch::deferred,
+        [completionState = std::move(completionState)]() mutable {
+          completionState.get();
+        });
     return {
         std::move(columnChunkBuffers),
         std::move(columnChunkData),
-        std::async(std::launch::deferred, syncFunction, dataSource, stream)};
+        std::move(completion)};
+  } catch (...) {
+    bufferedInput->rollbackPendingDeviceLoads(pendingCount);
+    throw;
   }
-
-  // KvikIO dataSource: Impl borrowed from `fetch_byte_ranges_to_device_async()`
-  // in `parquet_io_utils.cpp` in cuDF.
-  std::vector<size_t> ioOffsets;
-  std::vector<size_t> ioSizes;
-  std::vector<uint8_t*> destinations;
-
-  for (size_t chunk = 0; chunk < byteRanges.size();) {
-    const auto ioOffset = static_cast<size_t>(byteRanges[chunk].offset());
-    auto ioSize = static_cast<size_t>(byteRanges[chunk].size());
-    size_t nextChunk = chunk + 1;
-    while (nextChunk < byteRanges.size()) {
-      const size_t nextOffset = byteRanges[nextChunk].offset();
-      if (nextOffset != ioOffset + ioSize) {
-        break;
-      }
-      ioSize += byteRanges[nextChunk].size();
-      nextChunk++;
-    }
-    if (ioSize != 0) {
-      ioOffsets.push_back(ioOffset);
-      ioSizes.push_back(ioSize);
-      destinations.push_back(
-          const_cast<uint8_t*>(columnChunkData[chunk].data()));
-    }
-    chunk = nextChunk;
-  }
-  VELOX_CHECK_EQ(
-      ioOffsets.size(),
-      ioSizes.size(),
-      "Number of IO offsets and sizes must be equal");
-  VELOX_CHECK_EQ(
-      ioSizes.size(),
-      destinations.size(),
-      "Number of IO sizes and destinations must be equal");
-
-  auto iter = cuda::make_zip_iterator(
-      ioOffsets.begin(), ioSizes.begin(), destinations.begin());
-
-  std::vector<std::future<size_t>> deviceReadTasks;
-  std::vector<std::future<size_t>> hostReadTasks;
-  deviceReadTasks.reserve(ioOffsets.size());
-  hostReadTasks.reserve(ioOffsets.size());
-
-  // device_read_async is not guaranteed to follow stream-ordering (see
-  // datasource API docs)
-  stream.synchronize();
-
-  {
-    std::lock_guard<std::mutex> lock(ioBatchMutex());
-
-    std::for_each(iter, iter + ioOffsets.size(), [&](const auto& tuple) {
-      const auto ioOffset = cuda::std::get<0>(tuple);
-      const auto ioSize = cuda::std::get<1>(tuple);
-      const auto dest = cuda::std::get<2>(tuple);
-
-      if (dataSource->supports_device_read() and
-          dataSource->is_device_read_preferred(ioSize)) {
-        deviceReadTasks.emplace_back(
-            dataSource->device_read_async(ioOffset, ioSize, dest, stream));
-      } else {
-        // TODO(mh): We can't yet guarantee (without a safe thread pool) that
-        // all `cudaMemcpyAsync`s will be launched by the time we release the
-        // mutex. That said, this is a rare usecase as host-buffer data should
-        // prefer using a `BufferedInputDataSource` datasource.
-        hostReadTasks.emplace_back(
-            std::async(
-                std::launch::async,
-                [dataSource, ioOffset, ioSize, dest, stream]() {
-                  auto hostBuffer = dataSource->host_read(ioOffset, ioSize);
-                  CUDF_CUDA_TRY(cudaMemcpyAsync(
-                      dest,
-                      hostBuffer->data(),
-                      hostBuffer->size(),
-                      cudaMemcpyHostToDevice,
-                      stream.value()));
-                  return ioSize;
-                }));
-      }
-    });
-  }
-
-  auto syncFunction = [](decltype(hostReadTasks)&& hostReadTasks,
-                         decltype(deviceReadTasks)&& deviceReadTasks) {
-    for (auto& task : hostReadTasks) {
-      task.get();
-    }
-    for (auto& task : deviceReadTasks) {
-      task.get();
-    }
-  };
-
-  return {
-      std::move(columnChunkBuffers),
-      std::move(columnChunkData),
-      std::async(
-          std::launch::deferred,
-          std::move(syncFunction),
-          std::move(hostReadTasks),
-          std::move(deviceReadTasks))};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

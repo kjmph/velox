@@ -31,6 +31,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -72,12 +73,17 @@ class BufferedInputDataSource : public cudf::io::datasource {
   // loads and copies to device.
   void load(rmm::cuda_stream_view stream);
 
+  // Transaction support for callers that enqueue multiple destination ranges
+  // before a completion future has been constructed.
+  [[nodiscard]] size_t pendingDeviceLoadCount() const noexcept;
+  void rollbackPendingDeviceLoads(size_t count) noexcept;
+
  private:
   void readContiguous(size_t offset, size_t size, uint8_t* dst);
 
   std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
   const size_t fileSize_;
-  std::vector<std::function<void(rmm::cuda_stream_view stream)>>
+  std::vector<std::function<std::pair<uint8_t*, std::vector<uint8_t>>()>>
       pendingDeviceLoads_;
 };
 

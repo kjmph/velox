@@ -66,6 +66,20 @@ bool isAbfsPath([[maybe_unused]] const std::string_view path) {
 #endif
 }
 
+class ScopedNvtxRange {
+ public:
+  explicit ScopedNvtxRange(const char* name) {
+    nvtxRangePush(name);
+  }
+
+  ~ScopedNvtxRange() {
+    nvtxRangePop();
+  }
+
+  ScopedNvtxRange(const ScopedNvtxRange&) = delete;
+  ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
+};
+
 // Rebuilds a struct/list column in-place after possibly transforming (e.g.,
 // decimal-casting) its children.
 template <typename TransformChildrenFn>
@@ -285,18 +299,18 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
         exptSplitReader_->all_column_chunks_byte_ranges(
             rowGroupIndices, readerOptions_);
 
-    // Fetch column chunk byte ranges
-    nvtxRangePush("fetchByteRanges");
-
-    // Tuple containing a vector of device buffers, a vector of device spans
-    // for each input byte range, and a future to wait for all reads to
-    // complete
-    auto ioData = fetchByteRangesAsync(
-        dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
-
-    // Wait for all pending reads to complete
-    std::get<2>(ioData).wait();
-    nvtxRangePop();
+    auto ioData = [&]() {
+      ScopedNvtxRange range{"fetchByteRanges"};
+      // Tuple containing a vector of device buffers, a vector of device spans
+      // for each input byte range, and a future to wait for all reads to
+      // complete.
+      auto result = fetchByteRangesAsync(
+          dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
+      // Propagate remote receive or CUDA-copy failures before publishing the
+      // device spans to the hybrid reader. wait() alone suppresses exceptions.
+      std::get<2>(result).get();
+      return result;
+    }();
 
     // Save state for hybrid scan reader for future calls to `next()`
     hybridScanState_->columnChunkBuffers_ = std::move(std::get<0>(ioData));
@@ -555,11 +569,11 @@ void CudfSplitReader::createExperimentalReader() {
       1,
       "cuDF experimental reader requires exactly one parquet metadata");
 
-  // Create a hybrid scan reader
-  nvtxRangePush("hybridScanReader");
-  auto reader = std::make_unique<CudfHybridScanReader>(
-      std::move(fileMetaData_.front()), readerOptions_);
-  nvtxRangePop();
+  auto reader = [&]() {
+    ScopedNvtxRange range{"hybridScanReader"};
+    return std::make_unique<CudfHybridScanReader>(
+        std::move(fileMetaData_.front()), readerOptions_);
+  }();
 
   exptSplitReader_ = std::move(reader);
   hybridScanState_ = std::make_unique<HybridScanState>();

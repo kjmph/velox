@@ -1184,6 +1184,21 @@ Nimble Options (prefix ``hive.nimble.``)
 
 ``Amazon S3 Configuration``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The experimental direct-receive build uses exact patched curl and AWS SDK
+revisions. Install them into a shared isolated prefix before configuring either
+a CPU-only or cuDF-enabled Velox build::
+
+  export DEPENDENCY_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/velox/s3-direct-receive"
+  export S3_DIRECT_RECEIVE_INSTALL_PREFIX="${DEPENDENCY_DIR}/prefix"
+  source scripts/setup-common.sh
+  install_s3_direct_receive_deps
+
+Then enable ``VELOX_ENABLE_S3_DIRECT_RECEIVE`` and pass the prefix printed by
+the installer as ``CMAKE_PREFIX_PATH``, ``AWSSDK_ROOT_DIR``, ``AWSSDK_DIR``,
+and ``CURL_DIR``. Ordinary S3 builds continue to use ``install_aws_deps`` and
+do not resolve these patched dependencies.
+
 .. list-table::
    :widths: 30 10 10 70
    :header-rows: 1

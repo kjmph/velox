@@ -17,6 +17,7 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/config/Config.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/S3DirectReceive.h"
 
 #include <gtest/gtest.h>
 
@@ -36,10 +37,12 @@ TEST(S3ConfigTest, defaultConfig) {
   ASSERT_EQ(s3Config.iamRole(), std::nullopt);
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox-session");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Never");
-  ASSERT_EQ(s3Config.cacheKey("foo", config), "foo");
+  ASSERT_EQ(
+      s3Config.cacheKey("foo", config), "s3:v1:0::3:foo:8:disabled:4:true");
   ASSERT_EQ(s3Config.bucket(), "");
   ASSERT_EQ(s3Config.useIMDS(), true);
   ASSERT_EQ(s3Config.minPartSize(), 10485760);
+  ASSERT_EQ(s3Config.directReceiveMode(), S3DirectReceiveMode::DISABLED);
 }
 
 TEST(S3ConfigTest, overrideConfig) {
@@ -58,7 +61,9 @@ TEST(S3ConfigTest, overrideConfig) {
       {S3Config::baseConfigKey(S3Config::Keys::kCredentialsProvider),
        "my-credentials-provider"},
       {S3Config::baseConfigKey(S3Config::Keys::kIMDSEnabled), "false"},
-      {S3Config::baseConfigKey(S3Config::Keys::kMultipartMinPartSize), "20MB"}};
+      {S3Config::baseConfigKey(S3Config::Keys::kMultipartMinPartSize), "20MB"},
+      {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+       "preferred"}};
   auto configBase =
       std::make_shared<config::ConfigBase>(std::move(configFromFile));
   auto s3Config = S3Config("bucket", configBase);
@@ -72,12 +77,96 @@ TEST(S3ConfigTest, overrideConfig) {
   ASSERT_EQ(s3Config.iamRole(), std::optional("iam"));
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "RequestDependent");
-  ASSERT_EQ(s3Config.cacheKey("foo", configBase), "endpoint-foo");
-  ASSERT_EQ(s3Config.cacheKey("bar", configBase), "endpoint-bar");
+  ASSERT_EQ(
+      s3Config.cacheKey("foo", configBase),
+      "s3:v1:8:endpoint:3:foo:9:preferred:5:false");
+  ASSERT_EQ(
+      s3Config.cacheKey("bar", configBase),
+      "s3:v1:8:endpoint:3:bar:9:preferred:5:false");
   ASSERT_EQ(s3Config.bucket(), "bucket");
   ASSERT_EQ(s3Config.credentialsProvider(), "my-credentials-provider");
   ASSERT_EQ(s3Config.useIMDS(), false);
   ASSERT_EQ(s3Config.minPartSize(), 20971520);
+  ASSERT_EQ(s3Config.directReceiveMode(), S3DirectReceiveMode::PREFERRED);
+  ASSERT_EQ(
+      s3Config.effectiveDirectReceiveMode(),
+      S3DirectReceiveMode::CALLER_BUFFER);
+}
+
+TEST(S3ConfigTest, directReceiveModeValidation) {
+  for (const auto& [value, expected] :
+       std::vector<std::pair<std::string, S3DirectReceiveMode>>{
+           {"disabled", S3DirectReceiveMode::DISABLED},
+           {"CALLER-BUFFER", S3DirectReceiveMode::CALLER_BUFFER},
+           {"preferred", S3DirectReceiveMode::PREFERRED},
+           {"required", S3DirectReceiveMode::REQUIRED},
+       }) {
+    auto properties = std::make_shared<config::ConfigBase>(
+        std::unordered_map<std::string, std::string>{
+            {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+             value}});
+    EXPECT_EQ(S3Config("bucket", properties).directReceiveMode(), expected);
+  }
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+           "sometimes"}});
+  VELOX_ASSERT_USER_THROW(
+      S3Config("bucket", properties),
+      "Expected disabled, caller-buffer, preferred, or required");
+}
+
+TEST(S3ConfigTest, directReceiveTransportValidation) {
+  auto requiredWithoutTls = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {S3Config::baseConfigKey(S3Config::Keys::kSSLEnabled), "false"},
+          {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+           "required"}});
+  VELOX_ASSERT_USER_THROW(
+      S3Config("bucket", requiredWithoutTls),
+      "direct-receive-mode=required requires hive.s3.ssl.enabled=true");
+
+  auto preferredWithTls = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+           "preferred"}});
+  EXPECT_EQ(
+      S3Config("bucket", preferredWithTls).effectiveDirectReceiveMode(),
+      S3DirectReceiveMode::PREFERRED);
+}
+
+TEST(S3ConfigTest, directReceivePolicyIsPartOfFileSystemCacheIdentity) {
+  auto makeProperties = [](std::string mode, std::string ssl) {
+    return std::make_shared<config::ConfigBase>(
+        std::unordered_map<std::string, std::string>{
+            {S3Config::baseConfigKey(S3Config::Keys::kEndpoint), "endpoint"},
+            {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+             std::move(mode)},
+            {S3Config::baseConfigKey(S3Config::Keys::kSSLEnabled),
+             std::move(ssl)}});
+  };
+
+  EXPECT_EQ(
+      "s3:v1:8:endpoint:6:bucket:8:disabled:4:true",
+      S3Config::cacheKey("bucket", makeProperties("disabled", "true")));
+  EXPECT_EQ(
+      "s3:v1:8:endpoint:6:bucket:13:caller-buffer:4:true",
+      S3Config::cacheKey("bucket", makeProperties("caller-buffer", "true")));
+  EXPECT_EQ(
+      "s3:v1:8:endpoint:6:bucket:9:preferred:4:true",
+      S3Config::cacheKey("bucket", makeProperties("PREFERRED", "TRUE")));
+  EXPECT_EQ(
+      "s3:v1:8:endpoint:6:bucket:9:preferred:5:false",
+      S3Config::cacheKey("bucket", makeProperties("preferred", "false")));
+
+  auto disabledProperties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{});
+  EXPECT_NE(
+      S3Config::cacheKey("bucket", makeProperties("preferred", "true")),
+      S3Config::cacheKey(
+          "endpoint-bucket-direct-receive-preferred-ssl-true",
+          disabledProperties));
 }
 
 TEST(S3ConfigTest, overrideBucketConfig) {
@@ -121,8 +210,10 @@ TEST(S3ConfigTest, overrideBucketConfig) {
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Always");
   ASSERT_EQ(
       s3Config.cacheKey(bucket, configBase),
-      "bucket.s3-region.amazonaws.com-bucket");
-  ASSERT_EQ(s3Config.cacheKey("foo", configBase), "endpoint-foo");
+      "s3:v1:30:bucket.s3-region.amazonaws.com:6:bucket:8:disabled:5:false");
+  ASSERT_EQ(
+      s3Config.cacheKey("foo", configBase),
+      "s3:v1:8:endpoint:3:foo:8:disabled:5:false");
   ASSERT_EQ(s3Config.credentialsProvider(), "override-credentials-provider");
   ASSERT_EQ(s3Config.useIMDS(), false);
   ASSERT_EQ(s3Config.minPartSize(), 20971520);

@@ -22,6 +22,9 @@
 
 #include "boost/process.hpp"
 
+#include <algorithm>
+#include <thread>
+
 using namespace facebook::velox;
 
 using TempDirectoryPath = common::testutil::TempDirectoryPath;
@@ -88,6 +91,11 @@ void MinioServer::start() {
   boost::process::environment env = boost::this_process::environment();
   env["MINIO_ACCESS_KEY"] = accessKey_;
   env["MINIO_SECRET_KEY"] = secretKey_;
+  // This pinned MinIO release defaults to 100 transition workers, but
+  // rejects values below half of GOMAXPROCS. Configure only the child process
+  // so high-core test hosts remain supported without leaking test state.
+  env["MINIO_API_TRANSITION_WORKERS"] =
+      std::to_string(std::max(1u, std::thread::hardware_concurrency()));
 
   auto exePath = boost::process::search_path(kMinioExecutableName);
   if (exePath.empty()) {

@@ -1306,6 +1306,16 @@ do not resolve these patched dependencies.
        Otherwise, the file is split into multiple equal sized chunks of this part size excluding the last chunk.
        The `AWS specification <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html> `_ limits the part size between 5MB and 5GB.
        Some S3 backend providers enforce these limits strictly.
+   * - hive.s3.direct-receive-mode
+     - string
+     - disabled
+     - **Allowed values:** "disabled", "caller-buffer", "preferred", "required".
+       Experimental. "caller-buffer" receives accepted response data into caller-owned CPU-addressable host buffers without requiring kTLS.
+       "preferred" attempts strict RX kTLS over HTTPS and retries on a fresh connection with caller-buffer receive only after a zero-body capability rejection; with plain HTTP it resolves directly to "caller-buffer".
+       "required" requires HTTPS and fails unless strict RX kTLS is active.
+       The caller-buffer mode requires ``VELOX_ENABLE_S3_DIRECT_RECEIVE`` and the patched AWS SDK/curl receive-buffer ABI.
+       The HTTPS "preferred" and "required" modes additionally require strict RX kTLS build support.
+       This property controls standard Velox S3 reads, including CPU scans and cuDF scans using buffered input.
 
 Bucket Level Configuration
 """"""""""""""""""""""""""

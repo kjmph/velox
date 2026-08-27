@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "velox/common/file/File.h"
 
 namespace Aws::S3 {
@@ -24,10 +26,19 @@ class S3Client;
 
 namespace facebook::velox::filesystems {
 
+enum class S3DirectReceiveMode;
+class S3DirectReceiveCapabilityCache;
+
 /// Implementation of s3 read file.
 class S3ReadFile : public ReadFile {
  public:
   S3ReadFile(std::string_view path, Aws::S3::S3Client* client);
+
+  S3ReadFile(
+      std::string_view path,
+      Aws::S3::S3Client* client,
+      S3DirectReceiveMode directReceiveMode,
+      std::shared_ptr<S3DirectReceiveCapabilityCache> capabilityCache);
 
   ~S3ReadFile() override;
 
@@ -62,8 +73,6 @@ class S3ReadFile : public ReadFile {
   void initialize(const filesystems::FileOptions& options);
 
  private:
-  void preadInternal(uint64_t offset, uint64_t length, char* position) const;
-
   class Impl;
   std::shared_ptr<Impl> impl_;
 };

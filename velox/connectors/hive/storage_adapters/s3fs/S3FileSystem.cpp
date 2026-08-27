@@ -20,6 +20,7 @@
 #include "velox/common/file/File.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Counters.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/S3DirectReceiveCapabilityCache.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3ReadFile.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
@@ -230,7 +231,9 @@ void registerCredentialsProvider(
 class S3FileSystem::Impl {
  public:
   explicit Impl(std::shared_ptr<S3Config> s3Config)
-      : s3Config_(std::move(s3Config)) {
+      : s3Config_(std::move(s3Config)),
+        directReceiveCapabilityCache_(
+            std::make_shared<S3DirectReceiveCapabilityCache>()) {
     VELOX_CHECK(getAwsInstance()->isInitialized(), "S3 is not initialized");
     Aws::Client::ClientConfigurationInitValues initValues;
     initValues.shouldDisableIMDS = !s3Config_->useIMDS();
@@ -452,9 +455,15 @@ class S3FileSystem::Impl {
     return s3Config_;
   }
 
+  std::shared_ptr<S3DirectReceiveCapabilityCache> directReceiveCapabilityCache()
+      const {
+    return directReceiveCapabilityCache_;
+  }
+
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
   std::shared_ptr<S3Config> s3Config_;
+  std::shared_ptr<S3DirectReceiveCapabilityCache> directReceiveCapabilityCache_;
 };
 
 S3FileSystem::S3FileSystem(
@@ -477,7 +486,11 @@ std::unique_ptr<ReadFile> S3FileSystem::openFileForRead(
     std::string_view s3Path,
     const FileOptions& options) {
   const auto path = getPath(s3Path);
-  auto s3file = std::make_unique<S3ReadFile>(path, impl_->s3Client());
+  auto s3file = std::make_unique<S3ReadFile>(
+      path,
+      impl_->s3Client(),
+      impl_->getS3Config()->effectiveDirectReceiveMode(),
+      impl_->directReceiveCapabilityCache());
   s3file->initialize(options);
   return s3file;
 }

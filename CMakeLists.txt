@@ -165,6 +165,11 @@ option(
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
+option(
+  VELOX_ENABLE_S3_DIRECT_RECEIVE
+  "Build experimental caller-owned S3 receive buffers; strict RX kTLS is optional"
+  OFF
+)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
 option(VELOX_ENABLE_ABFS "Build Abfs Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
@@ -348,13 +353,117 @@ if(${VELOX_FORCE_COLORED_OUTPUT})
   endif()
 endif()
 
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE AND NOT VELOX_ENABLE_S3)
+  message(FATAL_ERROR "VELOX_ENABLE_S3_DIRECT_RECEIVE requires VELOX_ENABLE_S3")
+endif()
+
 if(VELOX_ENABLE_S3)
   # Set AWS_ROOT_DIR if you have a custom install location of AWS SDK CPP.
   if(AWSSDK_ROOT_DIR)
     list(APPEND CMAKE_PREFIX_PATH ${AWSSDK_ROOT_DIR})
   endif()
+  if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+    # Direct receive extends libcurl's public API. Require the patched curl
+    # CMake package so module-mode discovery cannot combine custom headers or
+    # a custom library path with the system libcurl pkg-config dependencies.
+    find_package(CURL CONFIG REQUIRED)
+    if(NOT TARGET CURL::libcurl)
+      message(FATAL_ERROR "The patched curl package must export CURL::libcurl")
+    endif()
+  endif()
   find_package(AWSSDK 1.11.654 REQUIRED COMPONENTS s3;identity-management)
   add_definitions(-DVELOX_ENABLE_S3)
+endif()
+
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+  if(NOT TARGET aws-cpp-sdk-core)
+    message(FATAL_ERROR "The patched AWS SDK must export aws-cpp-sdk-core")
+  endif()
+
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+
+  # These probes compile and link but do not execute. The versioned function
+  # names force the selected libraries, rather than only their headers, to
+  # provide the experimental ABI.
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_LIBRARIES aws-cpp-sdk-core CURL::libcurl)
+  unset(VELOX_S3_DIRECT_RECEIVE_DEPENDENCIES_SUPPORTED CACHE)
+  check_cxx_source_compiles(
+    "
+      #include <aws/core/http/DirectResponseReceiveStream.h>
+      #include <curl/curl.h>
+      #ifndef CURL_HAS_RECV_BUFFER_CALLBACKS
+      #error curl lacks caller-owned receive buffers
+      #endif
+      extern \"C\" unsigned int
+      curl_recv_buffer_build_version_v1(void);
+      int main() {
+        CURL* easy = curl_easy_init();
+        if (!easy) {
+          return 1;
+        }
+        const CURLcode result = curl_easy_setopt(
+            easy,
+            CURLOPT_RECVBUFFERFUNCTION,
+            static_cast<curl_recv_buffer_acquire_callback>(nullptr));
+        curl_easy_cleanup(easy);
+        return result == CURLE_OK &&
+                curl_recv_buffer_build_version_v1() == 1 &&
+                Aws::Http::GetDirectResponseReceiveApiVersionV2() == 2
+            ? 0
+            : 1;
+      }
+    "
+    VELOX_S3_DIRECT_RECEIVE_DEPENDENCIES_SUPPORTED
+  )
+  cmake_pop_check_state()
+  if(NOT VELOX_S3_DIRECT_RECEIVE_DEPENDENCIES_SUPPORTED)
+    message(
+      FATAL_ERROR
+      "S3 direct receive requires the patched AWS SDK ABI and curl "
+      "caller-owned receive-buffer API"
+    )
+  endif()
+
+  # Caller-buffer support is mandatory. Probe strict RX kTLS separately so
+  # CPU host-buffer placement can be built without kernel TLS support.
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_LIBRARIES aws-cpp-sdk-core CURL::libcurl)
+  unset(VELOX_S3_DIRECT_RECEIVE_KTLS_SUPPORTED CACHE)
+  check_cxx_source_compiles(
+    "
+      #include <aws/core/http/DirectResponseReceiveStream.h>
+      #include <curl/curl.h>
+      #ifndef CURL_HAS_KTLS_DIRECT_RX
+      #error curl lacks strict direct RX kTLS
+      #endif
+      extern \"C\" unsigned int
+      curl_ktls_direct_rx_build_version_v1(void);
+      int main() {
+        CURL* easy = curl_easy_init();
+        if (!easy) {
+          return 1;
+        }
+        const CURLcode result =
+            curl_easy_setopt(easy, CURLOPT_SSL_KTLS_DIRECT_RX, 1L);
+        curl_easy_cleanup(easy);
+        return result == CURLE_OK &&
+                curl_ktls_direct_rx_build_version_v1() == 1 &&
+                Aws::Http::
+                    GetDirectResponseReceiveStrictKernelTlsApiVersionV1() == 1
+            ? 0
+            : 1;
+      }
+    "
+    VELOX_S3_DIRECT_RECEIVE_KTLS_SUPPORTED
+  )
+  cmake_pop_check_state()
+  message(
+    STATUS
+    "S3 direct receive optional strict RX kTLS build/API support: "
+    "${VELOX_S3_DIRECT_RECEIVE_KTLS_SUPPORTED}"
+  )
 endif()
 
 if(VELOX_ENABLE_CXL AND NOT (UNIX AND NOT APPLE))

@@ -22,6 +22,44 @@ target_link_libraries(
   GTest::gtest_main
 )
 
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+  add_executable(
+    velox_s3direct_receive_capability_cache_test
+    S3DirectReceiveCapabilityCacheTest.cpp
+  )
+  add_test(
+    velox_s3direct_receive_capability_cache_test
+    velox_s3direct_receive_capability_cache_test
+  )
+  target_link_libraries(
+    velox_s3direct_receive_capability_cache_test
+    velox_s3fs
+    GTest::gtest
+    GTest::gtest_main
+  )
+
+  add_executable(velox_s3direct_receive_test S3DirectReceiveTest.cpp)
+  add_test(velox_s3direct_receive_test velox_s3direct_receive_test)
+  target_link_libraries(velox_s3direct_receive_test velox_s3fs GTest::gtest GTest::gtest_main)
+
+  add_executable(
+    velox_s3caller_buffer_e2e_test
+    S3CallerBufferE2ETest.cpp
+    ${PROJECT_SOURCE_DIR}/velox/exec/tests/utils/PortUtil.cpp
+  )
+  velox_add_test_headers(velox_s3caller_buffer_e2e_test MinioServer.h)
+  add_test(velox_s3caller_buffer_e2e_test velox_s3caller_buffer_e2e_test)
+  target_link_libraries(
+    velox_s3caller_buffer_e2e_test
+    velox_s3fs
+    velox_test_util
+    velox_memory
+    Boost::filesystem
+    Boost::system
+    GTest::gtest
+  )
+endif()
+
 add_executable(velox_s3file_test S3FileSystemTest.cpp S3UtilTest.cpp)
 velox_add_test_headers(velox_s3file_test MinioServer.h S3Test.h)
 add_test(velox_s3file_test velox_s3file_test)

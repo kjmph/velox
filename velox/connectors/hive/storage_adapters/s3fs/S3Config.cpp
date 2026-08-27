@@ -17,6 +17,7 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
 
 #include "velox/common/config/Config.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/S3DirectReceive.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 
 namespace facebook::velox::filesystems {
@@ -27,17 +28,46 @@ static constexpr size_t kMaximumMultipartMinPartSize = 5U << 30; // 5GB
 std::string S3Config::cacheKey(
     std::string_view bucket,
     std::shared_ptr<const config::ConfigBase> config) {
+  std::string endpoint;
   auto bucketEndpoint = bucketConfigKey(Keys::kEndpoint, bucket);
   if (config->valueExists(bucketEndpoint)) {
-    return fmt::format(
-        "{}-{}", config->get<std::string>(bucketEndpoint).value(), bucket);
+    endpoint = config->get<std::string>(bucketEndpoint).value();
+  } else {
+    auto baseEndpoint = baseConfigKey(Keys::kEndpoint);
+    if (config->valueExists(baseEndpoint)) {
+      endpoint = config->get<std::string>(baseEndpoint).value();
+    }
   }
-  auto baseEndpoint = baseConfigKey(Keys::kEndpoint);
-  if (config->valueExists(baseEndpoint)) {
-    return fmt::format(
-        "{}-{}", config->get<std::string>(baseEndpoint).value(), bucket);
-  }
-  return std::string(bucket);
+
+  auto configuredValue = [&](Keys configKey) {
+    const auto bucketKey = bucketConfigKey(configKey, bucket);
+    if (const auto value = config->get<std::string>(bucketKey)) {
+      return value.value();
+    }
+    const auto baseKey = baseConfigKey(configKey);
+    if (const auto value = config->get<std::string>(baseKey)) {
+      return value.value();
+    }
+    return std::string(configTraits().at(configKey).second.value());
+  };
+  auto directReceiveMode = configuredValue(Keys::kDirectReceiveMode);
+  folly::toLowerAscii(directReceiveMode);
+  auto sslEnabled = configuredValue(Keys::kSSLEnabled);
+  folly::toLowerAscii(sslEnabled);
+
+  // The filesystem registry accepts only a string cache key. Length-prefix
+  // every field so endpoint and bucket text cannot collide with policy
+  // delimiters or with each other.
+  std::string key{"s3:v1"};
+  auto appendField = [&](std::string_view value) {
+    key.append(fmt::format(":{}:", value.size()));
+    key.append(value.data(), value.size());
+  };
+  appendField(endpoint);
+  appendField(bucket);
+  appendField(directReceiveMode);
+  appendField(sslEnabled);
+  return key;
 }
 
 S3Config::S3Config(
@@ -84,6 +114,9 @@ S3Config::S3Config(
       minPartSize(),
       kMaximumMultipartMinPartSize,
       "The min-part-size S3 configuration must not exceed 5GB.");
+  // Validate both the configured value and its transport requirements while
+  // constructing the filesystem configuration.
+  (void)effectiveDirectReceiveMode();
 }
 
 std::optional<std::string> S3Config::endpointRegion() const {
@@ -103,6 +136,40 @@ size_t S3Config::minPartSize() const {
   return config::toCapacity(
       config_.find(Keys::kMultipartMinPartSize)->second.value(),
       config::CapacityUnit::BYTE);
+}
+
+S3DirectReceiveMode S3Config::directReceiveMode() const {
+  auto mode = config_.find(Keys::kDirectReceiveMode)->second.value();
+  folly::toLowerAscii(mode);
+  if (mode == "disabled") {
+    return S3DirectReceiveMode::DISABLED;
+  }
+  if (mode == "caller-buffer") {
+    return S3DirectReceiveMode::CALLER_BUFFER;
+  }
+  if (mode == "preferred") {
+    return S3DirectReceiveMode::PREFERRED;
+  }
+  if (mode == "required") {
+    return S3DirectReceiveMode::REQUIRED;
+  }
+  VELOX_USER_FAIL(
+      "Invalid hive.s3.direct-receive-mode '{}'. Expected disabled, "
+      "caller-buffer, preferred, or required.",
+      mode);
+}
+
+S3DirectReceiveMode S3Config::effectiveDirectReceiveMode() const {
+  const auto mode = directReceiveMode();
+  if (useSSL()) {
+    return mode;
+  }
+  VELOX_USER_CHECK(
+      mode != S3DirectReceiveMode::REQUIRED,
+      "hive.s3.direct-receive-mode=required requires hive.s3.ssl.enabled=true");
+  return mode == S3DirectReceiveMode::PREFERRED
+      ? S3DirectReceiveMode::CALLER_BUFFER
+      : mode;
 }
 
 } // namespace facebook::velox::filesystems

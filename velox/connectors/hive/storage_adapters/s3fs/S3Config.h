@@ -25,6 +25,8 @@ class ConfigBase;
 
 namespace facebook::velox::filesystems {
 
+enum class S3DirectReceiveMode;
+
 /// Build config required to initialize an S3FileSystem instance.
 /// All hive.s3 options can be set on a per-bucket basis.
 /// The bucket-specific option is set by replacing the hive.s3. prefix on an
@@ -78,6 +80,7 @@ class S3Config {
     kCredentialsProvider,
     kIMDSEnabled,
     kMultipartMinPartSize,
+    kDirectReceiveMode,
     kEnd
   };
 
@@ -119,6 +122,8 @@ class S3Config {
             {Keys::kIMDSEnabled, std::make_pair("aws-imds-enabled", "true")},
             {Keys::kMultipartMinPartSize,
              std::make_pair("min-part-size", "10MB")},
+            {Keys::kDirectReceiveMode,
+             std::make_pair("direct-receive-mode", "disabled")},
         };
     return config;
   }
@@ -255,6 +260,13 @@ class S3Config {
   }
 
   size_t minPartSize() const;
+
+  /// Returns the configured direct-receive policy before transport resolution.
+  S3DirectReceiveMode directReceiveMode() const;
+
+  /// Resolves transport-dependent policy. Plain HTTP maps PREFERRED to
+  /// CALLER_BUFFER and rejects REQUIRED.
+  S3DirectReceiveMode effectiveDirectReceiveMode() const;
 
  private:
   std::unordered_map<Keys, std::optional<std::string>> config_;

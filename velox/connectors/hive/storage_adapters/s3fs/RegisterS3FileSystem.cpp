@@ -159,6 +159,32 @@ void registerS3Metrics() {
   DEFINE_METRIC(kMetricS3GetMetadataErrors, velox::StatType::COUNT);
   DEFINE_METRIC(kMetricS3GetObjectRetries, velox::StatType::COUNT);
   DEFINE_METRIC(kMetricS3GetMetadataRetries, velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveKernelTlsAttempts, velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveCallerBufferAttempts, velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveKernelTlsUnavailable, velox::StatType::COUNT);
+  DEFINE_METRIC(kMetricS3DirectReceiveFallbacks, velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveResponseRejections, velox::StatType::COUNT);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveMechanismFailures, velox::StatType::COUNT);
+  DEFINE_METRIC(kMetricS3DirectReceiveReceivedBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveReceivedDirectBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveReceivedCopiedBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveReceivedDiscardedBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveSuccessfulBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveSuccessfulDirectBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveSuccessfulCopiedBodyBytes, velox::StatType::SUM);
+  DEFINE_METRIC(
+      kMetricS3DirectReceiveSuccessfulDiscardedBodyBytes, velox::StatType::SUM);
 #endif
 }
 

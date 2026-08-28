@@ -31,10 +31,21 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
+
+/**
+ * @brief Converts Hive-compatible S3 URI schemes to the scheme KvikIO accepts
+ *
+ * Velox continues to use the original split path for filesystem and metadata
+ * operations. This conversion is only for constructing a cuDF/KvikIO data
+ * source.
+ */
+std::string normalizeKvikioUri(std::string_view path);
 
 // ---------------- Internal helper ----------------
 // A cudf::io::datasource that serves bytes via Velox BufferedInput so that

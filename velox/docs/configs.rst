@@ -1286,6 +1286,11 @@ do not resolve these patched dependencies.
        The caller-buffer mode requires ``VELOX_ENABLE_S3_DIRECT_RECEIVE`` and the patched AWS SDK/curl receive-buffer ABI.
        The HTTPS "preferred" and "required" modes additionally require strict RX kTLS build support.
        This property controls standard Velox S3 reads, including CPU scans and cuDF scans using buffered input.
+       Direct cuDF/KvikIO reads bypass the Velox S3 filesystem; build with the same option, set ``cudf.hive.use-buffered-input=false``, ``KVIKIO_REMOTE_IO_BACKEND=MULTI_POLL``, and ``KVIKIO_REMOTE_DIRECT_RECEIVE=PREFER`` or ``REQUIRE`` before process startup.
+       A cuDF build with this option currently requires a strict RX kTLS-capable curl build, even when ``PREFER`` selects copied fallback for a cleartext or otherwise ineligible endpoint; CPU-only caller-buffer builds do not.
+       This path does not consume ``hive.s3.*`` client settings: set ``AWS_REGION`` or ``AWS_DEFAULT_REGION``, ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, and the optional ``AWS_SESSION_TOKEN`` before startup; set ``AWS_ENDPOINT_URL`` for a custom or S3-compatible endpoint.
+       For eligible reads, KvikIO then receives into bounded CUDA-pinned host slots and publishes device buffers only after its asynchronous H2D completion fence.
+       ``REQUIRE`` is the benchmarking mode that rejects copied or ineligible fallback.
 
 Bucket Level Configuration
 """"""""""""""""""""""""""

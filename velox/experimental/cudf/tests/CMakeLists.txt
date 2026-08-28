@@ -231,6 +231,9 @@ if(VELOX_ENABLE_S3)
       velox_s3fs
       velox_test_util
   )
+  if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+    target_link_libraries(velox_cudf_s3_read_test kvikio::kvikio)
+  endif()
 endif()
 
 velox_add_cudf_test(

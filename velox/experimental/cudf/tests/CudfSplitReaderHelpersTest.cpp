@@ -172,6 +172,15 @@ class CudfSplitReaderHelpersTest : public testing::Test {
       memory::memoryManager()->addLeafPool();
 };
 
+TEST_F(CudfSplitReaderHelpersTest, normalizeKvikioS3Uri) {
+  EXPECT_EQ(normalizeKvikioUri("s3://bucket/key"), "s3://bucket/key");
+  EXPECT_EQ(normalizeKvikioUri("s3a://bucket/key"), "s3://bucket/key");
+  EXPECT_EQ(normalizeKvikioUri("s3n://bucket/key"), "s3://bucket/key");
+  EXPECT_EQ(normalizeKvikioUri("file:/tmp/input"), "file:/tmp/input");
+  EXPECT_EQ(
+      normalizeKvikioUri("https://example.test/a"), "https://example.test/a");
+}
+
 TEST_F(CudfSplitReaderHelpersTest, deviceReadFutureWaitsForDeviceCopy) {
   const std::string inputData = "buffered-input-device-read";
   folly::CPUThreadPoolExecutor executor(1);

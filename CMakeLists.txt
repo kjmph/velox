@@ -458,6 +458,15 @@ if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
     "S3 direct receive optional strict RX kTLS build/API support: "
     "${VELOX_S3_DIRECT_RECEIVE_KTLS_SUPPORTED}"
   )
+  if(VELOX_ENABLE_CUDF AND NOT VELOX_S3_DIRECT_RECEIVE_KTLS_SUPPORTED)
+    message(
+      FATAL_ERROR
+      "S3 direct receive with cuDF requires a curl build with strict RX kTLS "
+      "API support. Disable VELOX_ENABLE_S3_DIRECT_RECEIVE or use the "
+      "strict-capable patched curl. CPU-only direct-receive builds require "
+      "only the caller-buffer API."
+    )
+  endif()
 endif()
 
 if(VELOX_ENABLE_CXL AND NOT (UNIX AND NOT APPLE))

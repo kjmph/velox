@@ -162,6 +162,15 @@ class BufferedReadCompletion {
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
+std::string normalizeKvikioUri(std::string_view path) {
+  constexpr std::string_view kS3aPrefix = "s3a://";
+  constexpr std::string_view kS3nPrefix = "s3n://";
+  if (path.starts_with(kS3aPrefix) || path.starts_with(kS3nPrefix)) {
+    return "s3://" + std::string(path.substr(kS3aPrefix.size()));
+  }
+  return std::string(path);
+}
+
 BufferedInputDataSource::BufferedInputDataSource(
     std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
     : input_(std::move(input)), fileSize_(input_->getReadFile()->size()) {}

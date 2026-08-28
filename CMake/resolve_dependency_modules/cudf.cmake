@@ -40,27 +40,56 @@ set(
 set(VELOX_rmm_SOURCE_URL "https://github.com/rapidsai/rmm/archive/${VELOX_rmm_COMMIT}.tar.gz")
 velox_resolve_dependency_url(rmm)
 
-# kvikio commit bdb788f from 2026-06-16
-set(VELOX_kvikio_VERSION 26.08)
-set(VELOX_kvikio_COMMIT bdb788f45ef191384a294ecef3312ea2db35a2c7)
-set(
-  VELOX_kvikio_BUILD_SHA256_CHECKSUM
-  c8db1083756337a3b0dc1616f3960f53fea891763fd9e1645cd38d7e218c7a47
-)
-set(
-  VELOX_kvikio_SOURCE_URL
-  "https://github.com/rapidsai/kvikio/archive/${VELOX_kvikio_COMMIT}.tar.gz"
-)
+# Caller-owned S3 receive requires the KvikIO research implementation for
+# bounded pinned-host staging, event-fenced H2D copies, and strict path
+# accounting. Keep the output-transport pin unchanged for ordinary cuDF
+# builds.
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+  set(VELOX_kvikio_VERSION 26.10)
+  set(VELOX_kvikio_COMMIT e2739ec6d9d0fe636fae50f233ddea89de18bbe3)
+  set(
+    VELOX_kvikio_BUILD_SHA256_CHECKSUM
+    786418bc5c8e9678070b87227a73d8d89972ffe6bf6881901bca501e049a19f4
+  )
+  set(
+    VELOX_kvikio_SOURCE_URL
+    "https://github.com/kjmph/kvikio/archive/${VELOX_kvikio_COMMIT}.tar.gz"
+  )
+else()
+  # kvikio commit bdb788f from 2026-06-16
+  set(VELOX_kvikio_VERSION 26.08)
+  set(VELOX_kvikio_COMMIT bdb788f45ef191384a294ecef3312ea2db35a2c7)
+  set(
+    VELOX_kvikio_BUILD_SHA256_CHECKSUM
+    c8db1083756337a3b0dc1616f3960f53fea891763fd9e1645cd38d7e218c7a47
+  )
+  set(
+    VELOX_kvikio_SOURCE_URL
+    "https://github.com/rapidsai/kvikio/archive/${VELOX_kvikio_COMMIT}.tar.gz"
+  )
+endif()
 velox_resolve_dependency_url(kvikio)
 
-# kjmph/cudf commit based on 4302ee8 with hash-partition concurrency diagnostics
 set(VELOX_cudf_VERSION 26.08 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT 6229a9bc4775f60d555d6d43fdbebd37079b8704)
-set(
-  VELOX_cudf_BUILD_SHA256_CHECKSUM
-  d326ee7b2441db3fcd34c47c406ac81290ec6eb27deb74f4fb7e6f0ca94e47b8
-)
-set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+  # Direct S3 receive requires cuDF to drain every issued datasource future
+  # and fence asynchronous device I/O before source or destination storage can
+  # unwind. Keep the output-transport pin unchanged for ordinary cuDF builds.
+  set(VELOX_cudf_COMMIT cfa634eaee86ee8fb21fbeb6b5b2f8e7421be7f4)
+  set(
+    VELOX_cudf_BUILD_SHA256_CHECKSUM
+    8a7b19fb7d70a0b83dbee4fe71e17b4892a6dd7209e65dbad63047e808cf6bd1
+  )
+  set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+else()
+  # kjmph/cudf commit based on 4302ee8 with hash-partition concurrency diagnostics
+  set(VELOX_cudf_COMMIT 6229a9bc4775f60d555d6d43fdbebd37079b8704)
+  set(
+    VELOX_cudf_BUILD_SHA256_CHECKSUM
+    d326ee7b2441db3fcd34c47c406ac81290ec6eb27deb74f4fb7e6f0ca94e47b8
+  )
+  set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+endif()
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install. The variables are used only to gate ucxx
@@ -95,6 +124,11 @@ block(SCOPE_FOR VARIABLES)
   set(CUDF_BUILD_TESTUTIL OFF)
   set(CUDF_BUILD_STREAMS_TEST_UTIL OFF)
   set(BUILD_SHARED_LIBS ON)
+  if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
+    # KvikIO 26.10 enables its Nsight plugin by default. It is not part of the
+    # runtime data path and would add an unnecessary build/runtime dependency.
+    set(KvikIO_BUILD_NSYS_PLUGIN OFF)
+  endif()
 
   # TODO(mh,bd): Remove this once we have a permanent solution for the spdlog/fmt
   # incompatibility.

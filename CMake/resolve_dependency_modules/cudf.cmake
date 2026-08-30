@@ -46,10 +46,10 @@ velox_resolve_dependency_url(rmm)
 # builds.
 if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
   set(VELOX_kvikio_VERSION 26.10)
-  set(VELOX_kvikio_COMMIT e2739ec6d9d0fe636fae50f233ddea89de18bbe3)
+  set(VELOX_kvikio_COMMIT 6b854e45a46e9c6981497acd11e5ec35e388fb4a)
   set(
     VELOX_kvikio_BUILD_SHA256_CHECKSUM
-    786418bc5c8e9678070b87227a73d8d89972ffe6bf6881901bca501e049a19f4
+    6e74608a03cb0f0e11fa3f20d7fa6fb0725bbbcdd411adf572849c5637e33b82
   )
   set(
     VELOX_kvikio_SOURCE_URL

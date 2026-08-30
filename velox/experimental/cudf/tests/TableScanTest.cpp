@@ -29,6 +29,7 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/tests/utils/DataFiles.h"
@@ -51,6 +52,9 @@
 #include <cuda_runtime.h>
 
 #include <fmt/ranges.h>
+#include <folly/ScopeGuard.h>
+
+#include <atomic>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -65,6 +69,50 @@ using namespace facebook::velox::cudf_velox::exec;
 using namespace facebook::velox::cudf_velox::exec::test;
 
 namespace {
+class CacheabilityCapturingBufferedInputBuilder final
+    : public facebook::velox::connector::hive::BufferedInputBuilder {
+ public:
+  explicit CacheabilityCapturingBufferedInputBuilder(
+      std::shared_ptr<facebook::velox::connector::hive::BufferedInputBuilder>
+          delegate)
+      : delegate_(std::move(delegate)) {}
+
+  std::unique_ptr<dwio::common::BufferedInput> create(
+      const FileHandle& fileHandle,
+      const dwio::common::ReaderOptions& readerOpts,
+      const facebook::velox::connector::ConnectorQueryCtx* connectorQueryCtx,
+      std::shared_ptr<io::IoStatistics> ioStatistics,
+      std::shared_ptr<IoStats> ioStats,
+      folly::Executor* executor,
+      const folly::F14FastMap<std::string, std::string>& fileReadOps = {})
+      override {
+    (readerOpts.cacheable() ? cacheableCalls_ : nonCacheableCalls_)
+        .fetch_add(1, std::memory_order_relaxed);
+    return delegate_->create(
+        fileHandle,
+        readerOpts,
+        connectorQueryCtx,
+        std::move(ioStatistics),
+        std::move(ioStats),
+        executor,
+        fileReadOps);
+  }
+
+  uint64_t cacheableCalls() const {
+    return cacheableCalls_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t nonCacheableCalls() const {
+    return nonCacheableCalls_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  const std::shared_ptr<facebook::velox::connector::hive::BufferedInputBuilder>
+      delegate_;
+  std::atomic<uint64_t> cacheableCalls_{0};
+  std::atomic<uint64_t> nonCacheableCalls_{0};
+};
+
 struct StatsFilterMetrics {
   cudf::size_type inputRowGroups{0};
   std::optional<cudf::size_type> rowGroupsAfterStats;
@@ -267,6 +315,70 @@ class TableScanTest : public virtual CudfHiveConnectorTestBase {
 
 class TableScanTestParameterized : public TableScanTest,
                                    public testing::WithParamInterface<bool> {};
+
+TEST(CudfHiveConnectorSplitTest, cacheability) {
+  namespace cudfHive = facebook::velox::cudf_velox::connector::hive;
+
+  EXPECT_TRUE(
+      cudfHive::CudfHiveConnectorSplitBuilder("/tmp/default.parquet")
+          .connectorId("test")
+          .build()
+          ->cacheable);
+
+  auto split =
+      cudfHive::CudfHiveConnectorSplitBuilder("/tmp/non-cacheable.parquet")
+          .connectorId("test")
+          .cacheable(false)
+          .build();
+  EXPECT_FALSE(split->cacheable);
+
+  auto serialized = split->serialize();
+  ASSERT_TRUE(serialized.count("cacheable"));
+  EXPECT_FALSE(serialized["cacheable"].asBool());
+  EXPECT_FALSE(cudfHive::CudfHiveConnectorSplit::create(serialized)->cacheable);
+
+  serialized.erase("cacheable");
+  ASSERT_FALSE(serialized.count("cacheable"));
+  EXPECT_TRUE(cudfHive::CudfHiveConnectorSplit::create(serialized)->cacheable);
+}
+
+TEST_F(TableScanTest, nonCacheableSplitReachesBufferedInput) {
+  resetCudfHiveConnector(
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{
+              {cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput,
+               "true"}}));
+
+  auto vectors = makeVectors(1, 100);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+
+  // Copy the shared pointer. registerBuilder() mutates the static shared
+  // pointer returned by getInstance().
+  auto originalBuilder =
+      facebook::velox::connector::hive::BufferedInputBuilder::getInstance();
+  auto capturingBuilder =
+      std::make_shared<CacheabilityCapturingBufferedInputBuilder>(
+          originalBuilder);
+  facebook::velox::connector::hive::BufferedInputBuilder::registerBuilder(
+      capturingBuilder);
+  auto restoreBuilder = folly::makeGuard([originalBuilder]() {
+    facebook::velox::connector::hive::BufferedInputBuilder::registerBuilder(
+        originalBuilder);
+  });
+
+  auto split = facebook::velox::connector::hive::HiveConnectorSplitBuilder(
+                   filePath->getPath())
+                   .connectorId(kCudfHiveConnectorId)
+                   .fileFormat(dwio::common::FileFormat::PARQUET)
+                   .cacheable(false)
+                   .build();
+  assertQuery(tableScanNode(), split, "SELECT * FROM tmp");
+
+  EXPECT_GT(capturingBuilder->nonCacheableCalls(), 0);
+  EXPECT_EQ(capturingBuilder->cacheableCalls(), 0);
+}
 
 TEST_P(TableScanTestParameterized, allColumns) {
   auto vectors = makeVectors(10, 1'000);
@@ -899,15 +1011,15 @@ TEST_F(TableScanTest, decimalFilterUsesSplitPhysicalType) {
                      .build();
   auto tableHandle =
       makeTableHandle("parquet_table", rowType, std::move(filters), nullptr);
-  auto plan =
-      PlanBuilder()
-          .startTableScan()
-          .outputType(rowType)
-          .tableHandle(tableHandle)
-          .assignments(facebook::velox::exec::test::HiveConnectorTestBase::
-                           allRegularColumns(rowType))
-          .endTableScan()
-          .planNode();
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .outputType(rowType)
+                  .tableHandle(tableHandle)
+                  .assignments(
+                      facebook::velox::exec::test::HiveConnectorTestBase::
+                          allRegularColumns(rowType))
+                  .endTableScan()
+                  .planNode();
 
   const auto expected =
       "SELECT c0, c1 FROM tmp "

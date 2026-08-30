@@ -117,6 +117,7 @@ CudfSplitReader::CudfSplitReader(
       pushdownFilterExpr_(subfieldFilterExpr) {
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
+  baseReaderOpts_.setCacheable(split_->cacheable);
 }
 
 void CudfSplitReader::prepareSplit(

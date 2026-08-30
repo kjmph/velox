@@ -50,7 +50,8 @@ struct CudfHiveConnectorSplit
       uint64_t _start = 0,
       uint64_t _length = std::numeric_limits<uint64_t>::max(),
       int64_t _splitWeight = 0,
-      const std::unordered_map<std::string, std::string>& _infoColumns = {});
+      const std::unordered_map<std::string, std::string>& _infoColumns = {},
+      bool _cacheable = true);
 
   std::string toString() const override;
   std::string getFileName() const;
@@ -94,6 +95,11 @@ class CudfHiveConnectorSplitBuilder {
     return *this;
   }
 
+  CudfHiveConnectorSplitBuilder& cacheable(bool cacheable) {
+    cacheable_ = cacheable;
+    return *this;
+  }
+
   CudfHiveConnectorSplitBuilder& connectorId(const std::string& connectorId) {
     connectorId_ = connectorId;
     return *this;
@@ -101,7 +107,13 @@ class CudfHiveConnectorSplitBuilder {
 
   std::shared_ptr<CudfHiveConnectorSplit> build() const {
     return std::make_shared<CudfHiveConnectorSplit>(
-        connectorId_, filePath_, start_, length_, splitWeight_, infoColumns_);
+        connectorId_,
+        filePath_,
+        start_,
+        length_,
+        splitWeight_,
+        infoColumns_,
+        cacheable_);
   }
 
  private:
@@ -110,6 +122,7 @@ class CudfHiveConnectorSplitBuilder {
   uint64_t length_{std::numeric_limits<uint64_t>::max()};
   std::string connectorId_;
   int64_t splitWeight_{0};
+  bool cacheable_{true};
   std::unordered_map<std::string, std::string> infoColumns_ = {};
 };
 

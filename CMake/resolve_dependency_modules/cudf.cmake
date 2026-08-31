@@ -45,10 +45,10 @@ velox_resolve_dependency_url(rmm)
 # accounting. Keep the release pin unchanged for ordinary cuDF builds.
 if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
   set(VELOX_kvikio_VERSION 26.10)
-  set(VELOX_kvikio_COMMIT 27249f1fedf083855a76a16639ae334f338e6e90)
+  set(VELOX_kvikio_COMMIT 1db0457edde588e5d048d11b392802966913edce)
   set(
     VELOX_kvikio_BUILD_SHA256_CHECKSUM
-    bbb35bf31c081d89b290670035aa3b682df4cd74283ab60e01b84f45654edc6c
+    22ee39ee354b171c315796e6f715dc97f12e57d90fdfd20af387c806fa90b061
   )
   set(
     VELOX_kvikio_SOURCE_URL

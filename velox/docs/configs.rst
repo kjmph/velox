@@ -1564,6 +1564,18 @@ Note: These configurations are experimental and subject to change.
      - integer
      - 50
      - The initial percent of GPU memory to allocate for pool or arena memory resources.
+   * - cudf.host_to_device_staging_enabled
+     - bool
+     - true
+     - If true, use bounded pinned host staging for cache-backed and pageable host-to-device reads.
+   * - cudf.host_to_device_staging_window_bytes
+     - integer
+     - 134217728
+     - Size in bytes of each of the two process-wide pinned host staging windows.
+   * - cudf.host_to_device_staging_pack_threads
+     - integer
+     - 4
+     - Number of persistent host threads used to pack each pinned staging window.
    * - cudf.function_name_prefix
      - string
      - ""

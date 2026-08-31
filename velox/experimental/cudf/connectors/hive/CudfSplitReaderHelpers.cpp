@@ -16,9 +16,13 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedStagingArena.h"
 
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/CacheInputStream.h"
 
+#include <cudf/detail/utilities/cuda_memcpy.hpp>
+#include <cudf/detail/utilities/host_worker_pool.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
@@ -27,26 +31,67 @@
 
 #include <rmm/cuda_device.hpp>
 
-#include <cuda/iterator>
-#include <cuda/std/tuple>
-
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <exception>
 #include <future>
+#include <limits>
 #include <mutex>
+#include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace {
+using DeviceReadRequest = cudf::io::datasource::device_read_request;
+using facebook::velox::IoStats;
+using facebook::velox::RuntimeCounter;
+using facebook::velox::cudf_velox::connector::hive::PinnedStagingArena;
+using facebook::velox::dwio::common::BufferedInput;
+using facebook::velox::dwio::common::CachedRegion;
+using facebook::velox::dwio::common::CacheInputStream;
 
-/**
- * @brief Static mutex to serialize batches of IO operations across drivers
- *
- * Mutex to ensure no interleaving of IO operations across drivers to ensure
- * drivers can move ahead without waiting for other drivers to finish their IO.
- */
-std::mutex& ioBatchMutex() {
-  static std::mutex mutex;
-  return mutex;
+constexpr size_t kMaximumCopiesPerBatch = 32;
+constexpr size_t kMinimumPinnedStagingBytes = 1ULL << 20;
+
+const std::string kDeviceReadBatches = "cudfBufferedDeviceReadBatches";
+const std::string kDeviceReadRequests = "cudfBufferedDeviceReadRequests";
+const std::string kDeviceReadBytes = "cudfBufferedDeviceReadBytes";
+const std::string kDeviceReadFragments = "cudfBufferedDeviceReadFragments";
+const std::string kCacheBackedSourceBytes = "cudfCacheBackedSourceBytes";
+const std::string kCopiedSourceBytes = "cudfCopiedSourceBytes";
+const std::string kStagingAttempts = "cudfPinnedStagingAttempts";
+const std::string kStagingTransfers = "cudfPinnedStagingTransfers";
+const std::string kStagingBytes = "cudfPinnedStagingBytes";
+const std::string kStagingWindows = "cudfPinnedStagingWindows";
+const std::string kStagingAcquireNanos = "cudfPinnedStagingAcquireNanos";
+const std::string kStagingPackNanos = "cudfPinnedStagingPackNanos";
+const std::string kStagingH2DWaitNanos = "cudfPinnedStagingH2DWaitNanos";
+const std::string kStagingFallbacks = "cudfPinnedStagingFallbacks";
+const std::string kStagingDisabledBypasses =
+    "cudfPinnedStagingDisabledBypasses";
+const std::string kStagingSmallReadBypasses =
+    "cudfPinnedStagingSmallReadBypasses";
+const std::string kDirectH2DBytes = "cudfDirectHostToDeviceBytes";
+
+void addIoCounter(
+    const std::shared_ptr<IoStats>& ioStats,
+    const std::string& name,
+    uint64_t value,
+    RuntimeCounter::Unit unit = RuntimeCounter::Unit::kNone) {
+  if (ioStats == nullptr) {
+    return;
+  }
+  ioStats->addCounter(
+      name, RuntimeCounter(facebook::velox::saturateCast(value), unit));
+}
+
+uint64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
 }
 
 int getStreamDevice(rmm::cuda_stream_view stream) {
@@ -75,6 +120,614 @@ void synchronizeStream(rmm::cuda_stream_view stream, int device) {
     }
     std::rethrow_exception(primaryError);
   }
+}
+
+// std::future returned by an executor does not wait when discarded. Wrapping
+// it in a deferred future whose captured state drains in its destructor makes
+// discard obey the datasource contract: once the outer future is gone, no
+// destination or retained host source remains in use.
+template <typename T>
+class DrainingCompletion {
+ public:
+  explicit DrainingCompletion(std::future<T> completion)
+      : completion_(std::move(completion)) {}
+
+  DrainingCompletion(DrainingCompletion&& other) noexcept
+      : completion_(std::move(other.completion_)) {}
+
+  DrainingCompletion(const DrainingCompletion&) = delete;
+  DrainingCompletion& operator=(const DrainingCompletion&) = delete;
+  DrainingCompletion& operator=(DrainingCompletion&&) = delete;
+
+  ~DrainingCompletion() noexcept {
+    if (completion_.valid()) {
+      try {
+        std::ignore = completion_.get();
+      } catch (...) {
+      }
+    }
+  }
+
+  T get() {
+    return completion_.get();
+  }
+
+ private:
+  std::future<T> completion_;
+};
+
+template <typename T>
+std::future<T> makeDrainingFuture(std::future<T> completion) {
+  auto state = DrainingCompletion<T>{std::move(completion)};
+  return std::async(
+      std::launch::deferred,
+      [state = std::move(state)]() mutable { return state.get(); });
+}
+
+class CudaEvent {
+ public:
+  CudaEvent() {
+    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming));
+  }
+
+  ~CudaEvent() {
+    if (event_ != nullptr) {
+      // Event destruction releases bookkeeping only. Completion has already
+      // been established before this object leaves the transfer routine.
+      std::ignore = cudaEventDestroy(event_);
+    }
+  }
+
+  CudaEvent(const CudaEvent&) = delete;
+  CudaEvent& operator=(const CudaEvent&) = delete;
+
+  cudaEvent_t get() const {
+    return event_;
+  }
+
+  void record(rmm::cuda_stream_view stream) {
+    CUDF_CUDA_TRY(cudaEventRecord(event_, stream.value()));
+    recorded_ = true;
+  }
+
+  void synchronize() {
+    if (!recorded_) {
+      return;
+    }
+    CUDF_CUDA_TRY(cudaEventSynchronize(event_));
+    recorded_ = false;
+  }
+
+ private:
+  cudaEvent_t event_{nullptr};
+  bool recorded_{false};
+};
+
+// Owns every host source referenced by a batch of H2D descriptors. Cache hits
+// retain cache pins directly; the fallback owns copied pageable buffers. The
+// submission layer is intentionally independent of source ownership: the same
+// prepared plan can use bounded double-buffered pinned staging or safely fall
+// back to direct pageable copies without changing lifetime/completion rules.
+class HostToDeviceTransferPlan {
+ public:
+  explicit HostToDeviceTransferPlan(std::shared_ptr<IoStats> ioStats)
+      : ioStats_(std::move(ioStats)) {}
+
+  void addCachedRegion(CachedRegion region, uint8_t* destination) {
+    VELOX_CHECK_LE(
+        region.size(),
+        std::numeric_limits<size_t>::max() - cachedSourceBytes_,
+        "Cached source byte count overflows size_t");
+    cachedSourceBytes_ += region.size();
+    const auto ownerIndex = retainedRegions_.size();
+    retainedRegions_.emplace_back(std::move(region));
+    retainedDescriptorCounts_.push_back(0);
+    size_t destinationOffset = 0;
+    for (const auto range : retainedRegions_.back()->ranges()) {
+      addDescriptor(
+          destination + destinationOffset,
+          range.data(),
+          range.size(),
+          SourceOwner{SourceOwnerKind::kCached, ownerIndex});
+      ++retainedDescriptorCounts_.back();
+      destinationOffset += range.size();
+    }
+    VELOX_CHECK_EQ(
+        destinationOffset,
+        retainedRegions_.back()->size(),
+        "Cached region ranges do not cover the retained region");
+    VELOX_CHECK_GT(
+        retainedDescriptorCounts_.back(),
+        0,
+        "A nonempty cached region must contain at least one range");
+  }
+
+  void addCopiedRegion(std::vector<uint8_t> region, uint8_t* destination) {
+    if (region.empty()) {
+      return;
+    }
+    VELOX_CHECK_LE(
+        region.size(),
+        std::numeric_limits<size_t>::max() - copiedSourceBytes_,
+        "Copied source byte count overflows size_t");
+    copiedSourceBytes_ += region.size();
+    const auto ownerIndex = copiedRegions_.size();
+    copiedRegions_.push_back(std::move(region));
+    copiedDescriptorCounts_.push_back(1);
+    addDescriptor(
+        destination,
+        copiedRegions_.back().data(),
+        copiedRegions_.back().size(),
+        SourceOwner{SourceOwnerKind::kCopied, ownerIndex});
+  }
+
+  void submitAndWait(
+      rmm::cuda_stream_view stream,
+      int device,
+      std::optional<PinnedStagingArena::WindowSetLease> windows) {
+    if (destinations_.empty()) {
+      return;
+    }
+
+    auto const deviceScope =
+        rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+    addIoCounter(ioStats_, kDeviceReadFragments, destinations_.size());
+    if (cachedSourceBytes_ != 0) {
+      addIoCounter(
+          ioStats_,
+          kCacheBackedSourceBytes,
+          cachedSourceBytes_,
+          RuntimeCounter::Unit::kBytes);
+    }
+    if (copiedSourceBytes_ != 0) {
+      addIoCounter(
+          ioStats_,
+          kCopiedSourceBytes,
+          copiedSourceBytes_,
+          RuntimeCounter::Unit::kBytes);
+    }
+    if (windows.has_value()) {
+      addIoCounter(ioStats_, kStagingTransfers, 1);
+      addIoCounter(
+          ioStats_, kStagingBytes, totalBytes_, RuntimeCounter::Unit::kBytes);
+      submitStagedAndWait(*windows, stream, device);
+      return;
+    }
+
+    addIoCounter(
+        ioStats_, kDirectH2DBytes, totalBytes_, RuntimeCounter::Unit::kBytes);
+    submitDirectAndWait(stream, device);
+  }
+
+ private:
+  enum class SourceOwnerKind : uint8_t { kCached, kCopied };
+
+  struct SourceOwner {
+    SourceOwnerKind kind;
+    size_t index;
+  };
+
+  struct Cursor {
+    size_t descriptor{0};
+    size_t offset{0};
+  };
+
+  struct WindowBatch {
+    std::vector<PinnedStagingArena::Copy> packCopies;
+    std::vector<void*> destinations;
+    std::vector<const void*> sources;
+    std::vector<size_t> sizes;
+    std::vector<size_t> completedDescriptors;
+    size_t bytes{0};
+  };
+
+  void submitDirectAndWait(rmm::cuda_stream_view stream, int device) {
+    // Allocate the tail fence before submitting any copy. A failure here is
+    // therefore a synchronous scheduling failure with no source lifetime to
+    // drain.
+    CudaEvent tailEvent;
+    std::exception_ptr scheduleError;
+
+    for (size_t begin = 0; begin < destinations_.size();
+         begin += kMaximumCopiesPerBatch) {
+      const auto count =
+          std::min(kMaximumCopiesPerBatch, destinations_.size() - begin);
+      try {
+        CUDF_CUDA_TRY(
+            cudf::detail::memcpy_batch_async(
+                destinations_.data() + begin,
+                sources_.data() + begin,
+                sizes_.data() + begin,
+                count,
+                stream));
+      } catch (...) {
+        scheduleError = std::current_exception();
+        break;
+      }
+    }
+
+    // One event after the final successfully submitted group is sufficient to
+    // keep every retained pin/buffer alive until all preceding copies finish.
+    // Even after a scheduling error the CUDA call may have submitted a prefix,
+    // so always attempt the tail fence and conservatively drain on failure.
+    std::exception_ptr fenceError;
+    const auto recordStatus = cudaEventRecord(tailEvent.get(), stream.value());
+    if (recordStatus == cudaSuccess) {
+      const auto synchronizeStatus = cudaEventSynchronize(tailEvent.get());
+      if (synchronizeStatus != cudaSuccess) {
+        try {
+          CUDF_CUDA_TRY(synchronizeStatus);
+        } catch (...) {
+          fenceError = std::current_exception();
+        }
+      }
+    } else {
+      try {
+        CUDF_CUDA_TRY(recordStatus);
+      } catch (...) {
+        fenceError = std::current_exception();
+      }
+    }
+
+    if (fenceError != nullptr) {
+      try {
+        synchronizeStream(stream, device);
+      } catch (...) {
+        // synchronizeStream either established device completion before
+        // throwing or terminated because source lifetime could not be proven.
+      }
+    }
+    if (scheduleError != nullptr) {
+      std::rethrow_exception(scheduleError);
+    }
+    if (fenceError != nullptr) {
+      std::rethrow_exception(fenceError);
+    }
+  }
+
+  WindowBatch makeWindowBatch(Cursor& cursor, uint8_t* staging, size_t capacity)
+      const {
+    WindowBatch batch;
+    while (cursor.descriptor < sizes_.size() && batch.bytes < capacity) {
+      const auto descriptor = cursor.descriptor;
+      VELOX_DCHECK_LT(cursor.offset, sizes_[descriptor]);
+      const auto bytes =
+          std::min(sizes_[descriptor] - cursor.offset, capacity - batch.bytes);
+      VELOX_CHECK_GT(bytes, 0);
+
+      const auto* source =
+          static_cast<const uint8_t*>(sources_[descriptor]) + cursor.offset;
+      auto* destination =
+          static_cast<uint8_t*>(destinations_[descriptor]) + cursor.offset;
+      auto* stagedSource = staging + batch.bytes;
+      batch.packCopies.push_back(
+          PinnedStagingArena::Copy{source, batch.bytes, bytes});
+
+      const auto canCoalesce = !batch.sizes.empty() &&
+          static_cast<uint8_t*>(batch.destinations.back()) +
+                  batch.sizes.back() ==
+              destination &&
+          static_cast<const uint8_t*>(batch.sources.back()) +
+                  batch.sizes.back() ==
+              stagedSource;
+      if (canCoalesce) {
+        batch.sizes.back() += bytes;
+      } else {
+        batch.destinations.push_back(destination);
+        batch.sources.push_back(stagedSource);
+        batch.sizes.push_back(bytes);
+      }
+
+      batch.bytes += bytes;
+      cursor.offset += bytes;
+      if (cursor.offset == sizes_[descriptor]) {
+        batch.completedDescriptors.push_back(descriptor);
+        ++cursor.descriptor;
+        cursor.offset = 0;
+      }
+    }
+    VELOX_CHECK_GT(batch.bytes, 0, "Pinned staging made no transfer progress");
+    return batch;
+  }
+
+  void releasePackedSources(const std::vector<size_t>& descriptors) {
+    for (const auto descriptor : descriptors) {
+      VELOX_CHECK_LT(descriptor, owners_.size());
+      const auto owner = owners_[descriptor];
+      if (owner.kind == SourceOwnerKind::kCached) {
+        VELOX_CHECK_LT(owner.index, retainedDescriptorCounts_.size());
+        auto& remaining = retainedDescriptorCounts_[owner.index];
+        VELOX_CHECK_GT(remaining, 0);
+        if (--remaining == 0) {
+          retainedRegions_[owner.index].reset();
+        }
+      } else {
+        VELOX_CHECK_LT(owner.index, copiedDescriptorCounts_.size());
+        auto& remaining = copiedDescriptorCounts_[owner.index];
+        VELOX_CHECK_GT(remaining, 0);
+        if (--remaining == 0) {
+          std::vector<uint8_t>{}.swap(copiedRegions_[owner.index]);
+        }
+      }
+    }
+  }
+
+  static void submitWindow(
+      const WindowBatch& batch,
+      CudaEvent& event,
+      rmm::cuda_stream_view stream,
+      bool& cudaWorkMayBePending) {
+    VELOX_CHECK(!batch.destinations.empty());
+    cudaWorkMayBePending = true;
+    for (size_t begin = 0; begin < batch.destinations.size();
+         begin += kMaximumCopiesPerBatch) {
+      const auto count =
+          std::min(kMaximumCopiesPerBatch, batch.destinations.size() - begin);
+      CUDF_CUDA_TRY(
+          cudf::detail::memcpy_batch_async(
+              batch.destinations.data() + begin,
+              batch.sources.data() + begin,
+              batch.sizes.data() + begin,
+              count,
+              stream));
+    }
+    event.record(stream);
+  }
+
+  void submitStagedAndWait(
+      PinnedStagingArena::WindowSetLease& windows,
+      rmm::cuda_stream_view stream,
+      int device) {
+    std::array<CudaEvent, PinnedStagingArena::kWindowCount> completionEvents;
+    std::array<bool, PinnedStagingArena::kWindowCount> submitted{};
+    Cursor cursor;
+    bool cudaWorkMayBePending = false;
+
+    try {
+      size_t batchIndex = 0;
+      while (cursor.descriptor < sizes_.size()) {
+        const auto windowIndex = batchIndex % PinnedStagingArena::kWindowCount;
+        // Before rolling onto a window again, establish that its previous H2D
+        // copy is complete. The other window remains in flight while host pack
+        // threads fill this one.
+        if (submitted[windowIndex]) {
+          const auto waitStart = std::chrono::steady_clock::now();
+          completionEvents[windowIndex].synchronize();
+          addIoCounter(
+              ioStats_,
+              kStagingH2DWaitNanos,
+              elapsedNanos(waitStart),
+              RuntimeCounter::Unit::kNanos);
+          submitted[windowIndex] = false;
+        }
+
+        auto batch = makeWindowBatch(
+            cursor,
+            windows.data(windowIndex),
+            static_cast<size_t>(windows.capacity()));
+        const auto packStart = std::chrono::steady_clock::now();
+        windows.pack(windowIndex, batch.packCopies);
+        addIoCounter(
+            ioStats_,
+            kStagingPackNanos,
+            elapsedNanos(packStart),
+            RuntimeCounter::Unit::kNanos);
+        addIoCounter(ioStats_, kStagingWindows, 1);
+        // pack() is the source-lifetime boundary: cache pins and owned
+        // pageable fallbacks are no longer needed once their last fragment is
+        // resident in the leased pinned window.
+        releasePackedSources(batch.completedDescriptors);
+        submitWindow(
+            batch, completionEvents[windowIndex], stream, cudaWorkMayBePending);
+        submitted[windowIndex] = true;
+        ++batchIndex;
+      }
+
+      for (uint32_t windowIndex = 0;
+           windowIndex < PinnedStagingArena::kWindowCount;
+           ++windowIndex) {
+        if (submitted[windowIndex]) {
+          const auto waitStart = std::chrono::steady_clock::now();
+          completionEvents[windowIndex].synchronize();
+          addIoCounter(
+              ioStats_,
+              kStagingH2DWaitNanos,
+              elapsedNanos(waitStart),
+              RuntimeCounter::Unit::kNanos);
+        }
+      }
+      windows.release();
+    } catch (...) {
+      const auto primaryError = std::current_exception();
+      if (cudaWorkMayBePending) {
+        try {
+          synchronizeStream(stream, device);
+        } catch (...) {
+          // synchronizeStream establishes device completion before throwing,
+          // or terminates if safe window reuse cannot be proven.
+        }
+      }
+      windows.release();
+      std::rethrow_exception(primaryError);
+    }
+  }
+
+  void addDescriptor(
+      void* destination,
+      const void* source,
+      size_t size,
+      SourceOwner owner) {
+    if (size == 0) {
+      return;
+    }
+    VELOX_CHECK_NOT_NULL(destination);
+    VELOX_CHECK_NOT_NULL(source);
+    VELOX_CHECK_LE(
+        size,
+        std::numeric_limits<size_t>::max() - totalBytes_,
+        "Host-to-device transfer size overflows size_t");
+    destinations_.push_back(destination);
+    sources_.push_back(source);
+    sizes_.push_back(size);
+    owners_.push_back(owner);
+    totalBytes_ += size;
+  }
+
+  std::vector<std::optional<CachedRegion>> retainedRegions_;
+  std::vector<size_t> retainedDescriptorCounts_;
+  std::vector<std::vector<uint8_t>> copiedRegions_;
+  std::vector<size_t> copiedDescriptorCounts_;
+  std::vector<void*> destinations_;
+  std::vector<const void*> sources_;
+  std::vector<size_t> sizes_;
+  std::vector<SourceOwner> owners_;
+  std::shared_ptr<IoStats> ioStats_;
+  size_t cachedSourceBytes_{0};
+  size_t copiedSourceBytes_{0};
+  size_t totalBytes_{0};
+};
+
+std::vector<size_t> executeDeviceReadBatch(
+    const std::shared_ptr<BufferedInput>& input,
+    const std::shared_ptr<std::mutex>& inputMutex,
+    const std::vector<DeviceReadRequest>& requests,
+    size_t fileSize,
+    rmm::cuda_stream_view stream,
+    int device,
+    const std::shared_ptr<IoStats>& ioStats) {
+  addIoCounter(ioStats, kDeviceReadBatches, 1);
+  addIoCounter(ioStats, kDeviceReadRequests, requests.size());
+  std::vector<size_t> results(requests.size());
+  std::vector<
+      std::unique_ptr<facebook::velox::dwio::common::SeekableInputStream>>
+      inputStreams(requests.size());
+  HostToDeviceTransferPlan transfer(ioStats);
+  std::optional<PinnedStagingArena::WindowSetLease> stagingWindows;
+  size_t totalReadBytes = 0;
+
+  {
+    // BufferedInput stores enqueue/load bookkeeping in the input object. Keep
+    // batches for the same input atomic while allowing unrelated files and
+    // drivers to progress concurrently.
+    std::lock_guard<std::mutex> lock(*inputMutex);
+    bool hasReads = false;
+    for (size_t index = 0; index < requests.size(); ++index) {
+      const auto& request = requests[index];
+      // Deliberately avoid offset + size: the mathematical end can exceed
+      // size_t, while datasource semantics still allow a short (or empty)
+      // result. Subtract only after proving that offset is inside the file.
+      const auto readSize = request.offset < fileSize
+          ? std::min(request.size, fileSize - request.offset)
+          : 0;
+      results[index] = readSize;
+      if (readSize == 0) {
+        continue;
+      }
+      VELOX_CHECK_LE(
+          readSize,
+          std::numeric_limits<size_t>::max() - totalReadBytes,
+          "Total buffered device read size overflows size_t");
+      totalReadBytes += readSize;
+      hasReads = true;
+      inputStreams[index] = input->enqueue({request.offset, readSize});
+      VELOX_CHECK_NOT_NULL(
+          inputStreams[index], "BufferedInput::enqueue returned null stream");
+    }
+
+    if (hasReads) {
+      // CachedBufferedInput may schedule coalesced loads asynchronously, while
+      // a singleton demand region may not be scheduled at all. The Next()/
+      // readFully() materialization below is the authoritative completion
+      // barrier for both cases, and it still runs before staging is acquired.
+      input->load(facebook::velox::dwio::common::LogType::FILE);
+    }
+
+    addIoCounter(
+        ioStats,
+        kDeviceReadBytes,
+        totalReadBytes,
+        RuntimeCounter::Unit::kBytes);
+
+    for (size_t index = 0; index < requests.size(); ++index) {
+      const auto readSize = results[index];
+      if (readSize == 0) {
+        continue;
+      }
+
+      auto* cacheStream =
+          dynamic_cast<CacheInputStream*>(inputStreams[index].get());
+      if (cacheStream == nullptr) {
+        std::vector<uint8_t> copied(readSize);
+        inputStreams[index]->readFully(
+            reinterpret_cast<char*>(copied.data()), readSize);
+        transfer.addCopiedRegion(std::move(copied), requests[index].dst);
+        continue;
+      }
+
+      size_t copiedBytes = 0;
+      while (copiedBytes < readSize) {
+        const void* data = nullptr;
+        int runSize = 0;
+        VELOX_CHECK(
+            cacheStream->Next(&data, &runSize),
+            "Cached input ended after {} of {} bytes",
+            copiedBytes,
+            readSize);
+        VELOX_CHECK_GT(runSize, 0, "Cached input returned an empty run");
+        VELOX_CHECK_LE(
+            static_cast<size_t>(runSize),
+            readSize - copiedBytes,
+            "Cached input returned bytes beyond the requested region");
+
+        auto retained = cacheStream->retainedRegionForLastNext();
+        VELOX_CHECK_EQ(
+            retained.size(),
+            static_cast<size_t>(runSize),
+            "Retained cache region does not match Next() result");
+        VELOX_CHECK_EQ(
+            retained.ranges().front().data(),
+            data,
+            "Retained cache region does not begin at the Next() result");
+        transfer.addCachedRegion(
+            std::move(retained), requests[index].dst + copiedBytes);
+        copiedBytes += runSize;
+      }
+    }
+
+    // The transfer plan now owns an independent pin for every cache fragment
+    // (or an owned copy for non-cache input), so release the input streams and
+    // their original pins before H2D begins. Staged transfers release each
+    // owner after its last fragment is packed; the direct fallback retains the
+    // owners until its CUDA completion fence.
+    inputStreams.clear();
+  }
+
+  // Only reserve the bounded pinned arena after all storage work is complete
+  // and the transfer plan owns exact cache pins or private copied buffers.
+  // AsyncDataCache entries can be exclusive, stale-sized, cancelled, or
+  // evicted between a load barrier and Next(); preparing sources first closes
+  // that residency gap and guarantees no remote I/O can hold both windows.
+  if (totalReadBytes >= kMinimumPinnedStagingBytes &&
+      PinnedStagingArena::enabled()) {
+    addIoCounter(ioStats, kStagingAttempts, 1);
+    const auto acquireStart = std::chrono::steady_clock::now();
+    stagingWindows = PinnedStagingArena::acquirePair();
+    addIoCounter(
+        ioStats,
+        kStagingAcquireNanos,
+        elapsedNanos(acquireStart),
+        RuntimeCounter::Unit::kNanos);
+    if (!stagingWindows.has_value()) {
+      addIoCounter(ioStats, kStagingFallbacks, 1);
+    }
+  } else if (totalReadBytes >= kMinimumPinnedStagingBytes) {
+    addIoCounter(ioStats, kStagingDisabledBypasses, 1);
+  } else if (totalReadBytes != 0) {
+    addIoCounter(ioStats, kStagingSmallReadBypasses, 1);
+  }
+
+  transfer.submitAndWait(stream, device, std::move(stagingWindows));
+  return results;
 }
 
 // Keeps the datasource alive while cuDF drains its completion future. The
@@ -118,45 +771,48 @@ class BufferedReadCompletion {
  public:
   BufferedReadCompletion(
       std::shared_ptr<cudf::io::datasource> dataSource,
-      size_t pendingCount,
-      rmm::cuda_stream_view stream)
+      std::future<std::vector<size_t>> completion,
+      std::vector<size_t> expectedSizes)
       : dataSource_(std::move(dataSource)),
-        pendingCount_(pendingCount),
-        stream_(stream) {}
+        completion_(std::move(completion)),
+        expectedSizes_(std::move(expectedSizes)) {}
 
   BufferedReadCompletion(BufferedReadCompletion&& other) noexcept
       : dataSource_(std::move(other.dataSource_)),
-        pendingCount_(other.pendingCount_),
-        stream_(other.stream_),
-        consumed_(other.consumed_) {
-    other.consumed_ = true;
-  }
+        completion_(std::move(other.completion_)),
+        expectedSizes_(std::move(other.expectedSizes_)) {}
 
   BufferedReadCompletion(const BufferedReadCompletion&) = delete;
   BufferedReadCompletion& operator=(const BufferedReadCompletion&) = delete;
   BufferedReadCompletion& operator=(BufferedReadCompletion&&) = delete;
 
   ~BufferedReadCompletion() noexcept {
-    if (!consumed_ && dataSource_ != nullptr) {
-      static_cast<facebook::velox::cudf_velox::connector::hive::
-                      BufferedInputDataSource*>(dataSource_.get())
-          ->rollbackPendingDeviceLoads(pendingCount_);
+    if (completion_.valid()) {
+      try {
+        std::ignore = completion_.get();
+      } catch (...) {
+      }
     }
   }
 
   void get() {
-    consumed_ = true;
-    static_cast<
-        facebook::velox::cudf_velox::connector::hive::BufferedInputDataSource*>(
-        dataSource_.get())
-        ->load(stream_);
+    const auto actualSizes = completion_.get();
+    VELOX_CHECK_EQ(
+        actualSizes.size(),
+        expectedSizes_.size(),
+        "Buffered device batch returned the wrong number of results");
+    for (size_t index = 0; index < actualSizes.size(); ++index) {
+      VELOX_CHECK_EQ(
+          actualSizes[index],
+          expectedSizes_[index],
+          "Buffered device read was unexpectedly short");
+    }
   }
 
  private:
   std::shared_ptr<cudf::io::datasource> dataSource_;
-  size_t pendingCount_;
-  rmm::cuda_stream_view stream_;
-  bool consumed_{false};
+  std::future<std::vector<size_t>> completion_;
+  std::vector<size_t> expectedSizes_;
 };
 } // namespace
 
@@ -172,84 +828,14 @@ std::string normalizeKvikioUri(std::string_view path) {
 }
 
 BufferedInputDataSource::BufferedInputDataSource(
-    std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
-    : input_(std::move(input)), fileSize_(input_->getReadFile()->size()) {}
+    std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input,
+    std::shared_ptr<facebook::velox::IoStats> ioStats)
+    : input_(std::move(input)),
+      ioStats_(std::move(ioStats)),
+      fileSize_(input_->getReadFile()->size()) {}
 
 size_t BufferedInputDataSource::size() const {
   return fileSize_;
-}
-
-void BufferedInputDataSource::enqueueForDevice(
-    uint64_t offset,
-    uint64_t size,
-    uint8_t* dst) {
-  auto inputStream = input_->enqueue({offset, size});
-  std::shared_ptr sharedStream(std::move(inputStream));
-  pendingDeviceLoads_.push_back([dst, size, sharedStream]() {
-    std::vector<uint8_t> buffer(size);
-    sharedStream->readFully(reinterpret_cast<char*>(buffer.data()), size);
-    return std::pair{dst, std::move(buffer)};
-  });
-}
-
-size_t BufferedInputDataSource::pendingDeviceLoadCount() const noexcept {
-  return pendingDeviceLoads_.size();
-}
-
-void BufferedInputDataSource::rollbackPendingDeviceLoads(
-    size_t count) noexcept {
-  if (count < pendingDeviceLoads_.size()) {
-    pendingDeviceLoads_.resize(count);
-  }
-}
-
-void BufferedInputDataSource::load(rmm::cuda_stream_view stream) {
-  auto deviceLoads = std::exchange(pendingDeviceLoads_, {});
-  if (deviceLoads.empty()) {
-    return;
-  }
-  // Clear queued destination pointers before loading. If loading fails, the
-  // discarded callbacks cannot be retried after their device buffers die.
-  input_->load(velox::dwio::common::LogType::FILE);
-
-  const auto device = getStreamDevice(stream);
-  auto const deviceScope =
-      rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
-
-  std::vector<std::vector<uint8_t>> hostBuffers;
-  hostBuffers.reserve(deviceLoads.size());
-  std::exception_ptr scheduleError;
-  {
-    std::lock_guard<std::mutex> lock(ioBatchMutex());
-    try {
-      for (auto& deviceLoad : deviceLoads) {
-        auto [dst, buffer] = deviceLoad();
-        hostBuffers.push_back(std::move(buffer));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-            dst,
-            hostBuffers.back().data(),
-            hostBuffers.back().size(),
-            cudaMemcpyHostToDevice,
-            stream.value()));
-      }
-    } catch (...) {
-      scheduleError = std::current_exception();
-    }
-  }
-
-  // The pageable host buffers must remain alive until every copy is complete.
-  // synchronizeStream establishes completion even when stream synchronization
-  // itself fails, or terminates if a safe completion fence cannot be obtained.
-  try {
-    synchronizeStream(stream, device);
-  } catch (...) {
-    if (scheduleError == nullptr) {
-      throw;
-    }
-  }
-  if (scheduleError != nullptr) {
-    std::rethrow_exception(scheduleError);
-  }
 }
 
 std::unique_ptr<cudf::io::datasource::buffer>
@@ -289,52 +875,80 @@ std::future<size_t> BufferedInputDataSource::host_read_async(
   });
 }
 
+std::unique_ptr<cudf::io::datasource::buffer>
+BufferedInputDataSource::device_read(
+    size_t offset,
+    size_t size,
+    rmm::cuda_stream_view stream) {
+  const auto readSize =
+      offset < fileSize_ ? std::min(size, fileSize_ - offset) : 0;
+  rmm::device_buffer result(
+      readSize, stream, rmm::mr::get_current_device_resource_ref());
+  const auto bytesRead = device_read(
+      offset, readSize, static_cast<uint8_t*>(result.data()), stream);
+  result.resize(bytesRead, stream);
+  return datasource::buffer::create(std::move(result));
+}
+
+size_t BufferedInputDataSource::device_read(
+    size_t offset,
+    size_t size,
+    uint8_t* dst,
+    rmm::cuda_stream_view stream) {
+  return device_read_async(offset, size, dst, stream).get();
+}
+
 std::future<size_t> BufferedInputDataSource::device_read_async(
     size_t offset,
     size_t size,
     uint8_t* dst,
     rmm::cuda_stream_view stream) {
-  VELOX_CHECK(input_->executor() != nullptr, "IO executor is not initialized");
-  const auto device = getStreamDevice(stream);
-  auto promise = std::make_shared<std::promise<size_t>>();
-  auto future = promise->get_future();
-  try {
-    input_->executor()->add(
-        [this, offset, size, dst, stream, device, promise]() {
-          try {
-            auto const deviceScope =
-                rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
-            auto hostBuffer = this->host_read(offset, size);
-            if (hostBuffer->size() != 0) {
-              try {
-                CUDF_CUDA_TRY(cudaMemcpyAsync(
-                    dst,
-                    hostBuffer->data(),
-                    hostBuffer->size(),
-                    cudaMemcpyHostToDevice,
-                    stream.value()));
-              } catch (...) {
-                auto const copyError = std::current_exception();
-                try {
-                  synchronizeStream(stream, device);
-                } catch (...) {
-                  // synchronizeStream either establishes completion before it
-                  // throws or terminates when completion cannot be proven.
-                }
-                std::rethrow_exception(copyError);
-              }
-              synchronizeStream(stream, device);
-            }
-            promise->set_value(hostBuffer->size());
-          } catch (...) {
-            promise->set_exception(std::current_exception());
-          }
-        });
-  } catch (...) {
-    // Executor rejection is synchronous and no task owns the destination.
-    promise->set_exception(std::current_exception());
+  const DeviceReadRequest request{offset, size, dst};
+  auto completion = device_read_batch_async(
+      cudf::host_span<DeviceReadRequest const>{&request, 1}, stream);
+  return std::async(
+      std::launch::deferred, [completion = std::move(completion)]() mutable {
+        auto results = completion.get();
+        VELOX_CHECK_EQ(results.size(), 1);
+        return results.front();
+      });
+}
+
+std::future<std::vector<size_t>>
+BufferedInputDataSource::device_read_batch_async(
+    cudf::host_span<DeviceReadRequest const> requests,
+    rmm::cuda_stream_view stream) {
+  // Validate the complete descriptor list before scheduling any destination
+  // access, and copy it because the caller's span expires on return.
+  std::vector<DeviceReadRequest> copiedRequests(
+      requests.begin(), requests.end());
+  for (const auto& request : copiedRequests) {
+    VELOX_CHECK(
+        request.size == 0 || request.dst != nullptr,
+        "A nonempty device read requires a non-null destination");
   }
-  return future;
+  if (copiedRequests.empty()) {
+    return std::async(
+        std::launch::deferred, [] { return std::vector<size_t>{}; });
+  }
+
+  const auto device = getStreamDevice(stream);
+  auto const deviceScope =
+      rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+  auto completion = cudf::detail::host_worker_pool().submit_task(
+      [input = input_,
+       inputMutex = inputMutex_,
+       ioStats = ioStats_,
+       requests = std::move(copiedRequests),
+       fileSize = fileSize_,
+       stream,
+       device]() {
+        auto const taskDeviceScope =
+            rmm::cuda_set_device_raii{rmm::cuda_device_id{device}};
+        return executeDeviceReadBatch(
+            input, inputMutex, requests, fileSize, stream, device, ioStats);
+      });
+  return makeDrainingFuture(std::move(completion));
 }
 
 bool BufferedInputDataSource::supports_device_read() const {
@@ -346,6 +960,9 @@ void BufferedInputDataSource::readContiguous(
     size_t size,
     uint8_t* dst) {
   using namespace facebook::velox::dwio::common;
+  // read() consults BufferedInput's current merged-region state, which load()
+  // replaces. Serialize host/footer reads with device batches for this input.
+  std::lock_guard<std::mutex> lock(*inputMutex_);
   // BufferedInput::read gives us a stream over the exact region.
   auto stream = input_->read(offset, size, LogType::FILE);
   VELOX_CHECK(stream != nullptr, "read() returned null stream");
@@ -388,12 +1005,40 @@ fetchByteRangesAsync(
   std::vector<cudf::device_span<const uint8_t>> columnChunkData{};
   columnChunkData.reserve(byteRanges.size());
 
-  // Total IO size across all byte ranges
-  auto totalSize = std::accumulate(
-      byteRanges.begin(),
-      byteRanges.end(),
-      std::size_t{0},
-      [&](auto acc, const auto& byteRange) { return acc + byteRange.size(); });
+  // Validate before arithmetic or allocation. byte_range_info uses signed
+  // fields, so accumulating an invalid negative size into size_t would
+  // otherwise underflow before the request builder rejected it.
+  std::vector<size_t> rangeOffsets;
+  std::vector<size_t> rangeSizes;
+  rangeOffsets.reserve(byteRanges.size());
+  rangeSizes.reserve(byteRanges.size());
+  size_t totalSize = 0;
+  for (const auto& byteRange : byteRanges) {
+    const auto offset = byteRange.offset();
+    const auto size = byteRange.size();
+    VELOX_CHECK_GE(offset, 0, "Device read offset must be nonnegative");
+    VELOX_CHECK_GE(size, 0, "Device read size must be nonnegative");
+    VELOX_CHECK_LE(
+        static_cast<uint64_t>(offset),
+        std::numeric_limits<size_t>::max(),
+        "Device read offset does not fit size_t");
+    VELOX_CHECK_LE(
+        static_cast<uint64_t>(size),
+        std::numeric_limits<size_t>::max(),
+        "Device read size does not fit size_t");
+    const auto requestSize = static_cast<size_t>(size);
+    VELOX_CHECK_LE(
+        requestSize,
+        std::numeric_limits<size_t>::max() - totalSize,
+        "Total device read size overflows size_t");
+    rangeOffsets.push_back(static_cast<size_t>(offset));
+    rangeSizes.push_back(requestSize);
+    totalSize += requestSize;
+  }
+  VELOX_CHECK_LE(
+      totalSize,
+      std::numeric_limits<size_t>::max() - (kBufferPaddingMultiple - 1),
+      "Padded device read size overflows size_t");
 
   // Allocate single device buffer for all column chunks
   std::vector<rmm::device_buffer> columnChunkBuffers{};
@@ -405,46 +1050,50 @@ fetchByteRangesAsync(
   // Compute device spans for each column chunk
   auto bufferData = static_cast<uint8_t*>(columnChunkBuffers.back().data());
   std::ignore = std::accumulate(
-      byteRanges.begin(),
-      byteRanges.end(),
+      rangeSizes.begin(),
+      rangeSizes.end(),
       std::size_t{0},
-      [&](auto acc, const auto& byteRange) {
-        columnChunkData.emplace_back(
-            bufferData + acc, static_cast<size_t>(byteRange.size()));
-        return acc + byteRange.size();
+      [&](auto acc, const auto rangeSize) {
+        // A nonempty list of empty ranges has a zero-byte device allocation,
+        // whose data pointer is null. Even adding zero to null is undefined.
+        auto* rangeData = bufferData == nullptr ? nullptr : bufferData + acc;
+        columnChunkData.emplace_back(rangeData, static_cast<size_t>(rangeSize));
+        return acc + rangeSize;
       });
 
-  // For BufferedInputDataSource, enqueue reads into the buffer and launch the
-  // actual load asynchronously.
-  auto const pendingCount = bufferedInput->pendingDeviceLoadCount();
-  try {
-    auto iter =
-        cuda::make_zip_iterator(byteRanges.begin(), columnChunkData.begin());
-    std::for_each(
-        iter, iter + byteRanges.size(), [bufferedInput](const auto& tuple) {
-          const auto& byteRange = cuda::std::get<0>(tuple);
-          const auto& destination = cuda::std::get<1>(tuple);
-          bufferedInput->enqueueForDevice(
-              static_cast<uint64_t>(byteRange.offset()),
-              static_cast<uint64_t>(byteRange.size()),
-              const_cast<uint8_t*>(destination.data()));
-        });
-
-    auto completionState =
-        BufferedReadCompletion{dataSource, pendingCount, stream};
-    auto completion = std::async(
-        std::launch::deferred,
-        [completionState = std::move(completionState)]() mutable {
-          completionState.get();
-        });
-    return {
-        std::move(columnChunkBuffers),
-        std::move(columnChunkData),
-        std::move(completion)};
-  } catch (...) {
-    bufferedInput->rollbackPendingDeviceLoads(pendingCount);
-    throw;
+  // Submit one immutable batch. This shares the regular cuDF device-read path
+  // and avoids mutable cross-call enqueue/rollback state at the hybrid reader
+  // boundary.
+  std::vector<DeviceReadRequest> requests;
+  std::vector<size_t> expectedSizes;
+  requests.reserve(byteRanges.size());
+  expectedSizes.reserve(byteRanges.size());
+  for (size_t index = 0; index < byteRanges.size(); ++index) {
+    requests.push_back(
+        {rangeOffsets[index],
+         rangeSizes[index],
+         const_cast<uint8_t*>(columnChunkData[index].data())});
+    expectedSizes.push_back(rangeSizes[index]);
   }
+
+  auto batchCompletion = cudf::io::device_read_batch_async(
+      *bufferedInput,
+      cudf::host_span<DeviceReadRequest const>{
+          requests.data(), requests.size()},
+      stream);
+  auto completionState = BufferedReadCompletion{
+      std::move(dataSource),
+      std::move(batchCompletion),
+      std::move(expectedSizes)};
+  auto completion = std::async(
+      std::launch::deferred,
+      [completionState = std::move(completionState)]() mutable {
+        completionState.get();
+      });
+  return {
+      std::move(columnChunkBuffers),
+      std::move(columnChunkData),
+      std::move(completion)};
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

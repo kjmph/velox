@@ -452,8 +452,8 @@ void CudfSplitReader::setupCudfDataSource() {
     dataSource_ = makeKvikioDataSource(split_->filePath);
     return;
   }
-  dataSource_ =
-      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+  dataSource_ = std::make_unique<BufferedInputDataSource>(
+      std::move(bufferedInput), ioStats_);
 }
 
 void CudfSplitReader::setupReaderOptions() {

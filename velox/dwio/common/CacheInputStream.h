@@ -20,6 +20,7 @@
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/caching/SsdCache.h"
 #include "velox/common/io/IoStatistics.h"
+#include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
@@ -49,6 +50,17 @@ class CacheInputStream : public SeekableInputStream {
   CacheInputStream(CacheInputStream&&) = delete;
 
   bool Next(const void** data, int* size) override;
+
+  /// Returns a retained cache view corresponding exactly to the buffer from the
+  /// most recent successful Next() call. The returned view holds an independent
+  /// shared cache pin and remains valid across subsequent stream operations and
+  /// after this stream is destroyed.
+  ///
+  /// Throws if Next() has not returned a buffer since construction or since the
+  /// most recent positioning operation or unsuccessful Next() call. May be
+  /// called more than once for the same Next() result.
+  CachedRegion retainedRegionForLastNext() const;
+
   void BackUp(int count) override;
   bool SkipInt64(int64_t count) override;
   int64_t ByteCount() const override;
@@ -88,6 +100,7 @@ class CacheInputStream : public SeekableInputStream {
   /// The pin is copied so the stream can outlive the CachedBufferedInput. When
   /// set, the stream skips coalesced loading, prefetching, and eviction.
   void setPreloadedPin(cache::CachePin pin) {
+    lastReturnedRegion_.reset();
     pin_ = std::move(pin);
     preloaded_ = true;
   }
@@ -162,6 +175,10 @@ class CacheInputStream : public SeekableInputStream {
 
   // Handle of cache entry.
   cache::CachePin pin_;
+
+  // Slice within 'pin_' returned by the most recent successful Next(). Reset by
+  // any operation that changes the stream position or cache pin.
+  std::optional<velox::common::Region> lastReturnedRegion_;
 
   // Offset of current run from start of 'entry_->nonContiguousData()'
   uint64_t offsetOfRun_;

@@ -57,6 +57,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfExchangeServerPort, "12345"},
       {CudfConfig::kCudfIntraNodeExchange, "false"},
       {CudfConfig::kCudfPartitionedOutputBatchRows, "123456"},
+      {CudfConfig::kCudfPartitionedOutputMaxBatchRows, "654321"},
       {CudfConfig::kCudfExchangeLogLevel, "7"},
       {CudfConfig::kCudfUcxxBlockingPolling, "true"},
       {CudfConfig::kCudfUcxxErrorHandling, "false"}};
@@ -81,6 +82,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.exchangeServerPort, 12345);
   ASSERT_EQ(config.intraNodeExchange, false);
   ASSERT_EQ(config.partitionedOutputBatchRows, 123456);
+  ASSERT_EQ(config.partitionedOutputMaxBatchRows, 654321);
   ASSERT_EQ(config.exchangeLogLevel, 7);
   ASSERT_EQ(config.ucxxBlockingPolling, true);
   ASSERT_EQ(config.ucxxErrorHandling, false);

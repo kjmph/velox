@@ -20,6 +20,8 @@
 #include "velox/experimental/ucx-exchange/tests/UcxTestData.h"
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
 
+#include <mutex>
+
 namespace facebook::velox::ucx_exchange {
 
 using exec::DriverCtx;
@@ -41,11 +43,14 @@ class SinkDriverMock {
   /// operators
   /// @param referenceData Table generator for reference data to check against,
   /// if should not check send null
+  /// @param verifySequentialChunks Whether each received chunk continues from
+  /// the preceding chunk's reference offset. This requires one sink driver.
 
   SinkDriverMock(
       std::shared_ptr<facebook::velox::exec::Task> task,
       uint32_t numDrivers = 1,
-      std::shared_ptr<BaseTableGenerator> referenceData = nullptr);
+      std::shared_ptr<BaseTableGenerator> referenceData = nullptr,
+      bool verifySequentialChunks = false);
 
   /// @brief Executes the exchange operator until it finishes receiving all data
   /// from the upstream.
@@ -75,6 +80,17 @@ class SinkDriverMock {
     return numChunksReceived_.load();
   }
 
+  /// @brief Returns the largest logical row count in a received chunk.
+  uint64_t maxChunkRowsReceived() const {
+    return maxChunkRowsReceived_.load();
+  }
+
+  /// @brief Returns logical row counts in receive order.
+  std::vector<uint64_t> receivedChunkRows() const {
+    std::lock_guard<std::mutex> lock(receivedChunkRowsMutex_);
+    return receivedChunkRows_;
+  }
+
   bool dataIsValid() {
     return dataValidFlag_;
   }
@@ -98,8 +114,13 @@ class SinkDriverMock {
   std::atomic<uint64_t> numRows_;
   std::atomic<uint64_t> numBytes_{0};
   std::atomic<uint64_t> numChunksReceived_{0};
+  std::atomic<uint64_t> maxChunkRowsReceived_{0};
+  mutable std::mutex receivedChunkRowsMutex_;
+  std::vector<uint64_t> receivedChunkRows_;
 
   const std::shared_ptr<BaseTableGenerator> referenceData_;
+  const bool verifySequentialChunks_;
+  size_t nextReferenceRow_{0};
   std::vector<std::thread> threads_;
 };
 

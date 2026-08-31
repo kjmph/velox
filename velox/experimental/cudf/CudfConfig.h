@@ -70,6 +70,8 @@ struct CudfConfig {
       "cudf.intra_node_exchange"};
   static constexpr const char* kCudfPartitionedOutputBatchRows{
       "cudf.partitioned_output_batch_rows"};
+  static constexpr const char* kCudfPartitionedOutputMaxBatchRows{
+      "cudf.partitioned_output_max_batch_rows"};
   static constexpr const char* kCudfExchangeLogLevel{"cudf.exchange_log_level"};
   static constexpr const char* kCudfUcxxBlockingPolling{
       "cudf.ucxx_blocking_polling"};
@@ -183,6 +185,10 @@ struct CudfConfig {
 
   /// Minimum rows to accumulate before flushing cuDF partitioned output.
   int64_t partitionedOutputBatchRows{10'000};
+
+  /// Maximum rows in one cuDF partitioned-output batch. Non-positive values
+  /// preserve the legacy unbounded behavior.
+  int64_t partitionedOutputMaxBatchRows{0};
 
   /// Verbosity for ucx-exchange VLOG modules.
   int32_t exchangeLogLevel{0};

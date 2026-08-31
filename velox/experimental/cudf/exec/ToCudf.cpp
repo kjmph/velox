@@ -442,6 +442,10 @@ void CudfConfig::initialize(
     partitionedOutputBatchRows =
         folly::to<int64_t>(config[kCudfPartitionedOutputBatchRows]);
   }
+  if (config.find(kCudfPartitionedOutputMaxBatchRows) != config.end()) {
+    partitionedOutputMaxBatchRows =
+        folly::to<int64_t>(config[kCudfPartitionedOutputMaxBatchRows]);
+  }
   if (config.find(kCudfExchangeLogLevel) != config.end()) {
     exchangeLogLevel = folly::to<int32_t>(config[kCudfExchangeLogLevel]);
   }

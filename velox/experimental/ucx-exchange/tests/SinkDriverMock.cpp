@@ -33,12 +33,17 @@ constexpr uint32_t kPartitionId = 0; // not used in tests.
 SinkDriverMock::SinkDriverMock(
     std::shared_ptr<facebook::velox::exec::Task> task,
     uint32_t numDrivers,
-    std::shared_ptr<BaseTableGenerator> referenceData)
+    std::shared_ptr<BaseTableGenerator> referenceData,
+    bool verifySequentialChunks)
     : task_{std::move(task)},
       numDrivers_{numDrivers},
       numRows_{0},
       numBytes_{0},
-      referenceData_(referenceData) {
+      referenceData_(referenceData),
+      verifySequentialChunks_(verifySequentialChunks) {
+  VELOX_USER_CHECK(
+      !verifySequentialChunks_ || numDrivers_ == 1,
+      "Sequential reference verification requires exactly one sink driver");
   // Create a UcxExchangeClient shared across all exchange operators.
   exchangeClient_ = std::make_shared<UcxExchangeClient>(
       task_->taskId(), task_->destination(), numDrivers_);
@@ -62,11 +67,16 @@ void SinkDriverMock::updateDataValidity(const cudf::table_view& tab) {
 
   auto stream = rmm::cuda_stream_default;
 
-  // Use the polymorphic verifyTable method
-  // Note: For chunk-based verification, we use startRow=0 since each chunk
-  // contains rows that should match the reference data from the beginning.
-  // This assumes the test sends the same data pattern in each chunk.
-  bool valid = referenceData_->verifyTable(tab, 0, tab.num_rows(), stream);
+  size_t startRow = 0;
+  if (verifySequentialChunks_) {
+    VELOX_CHECK_GT(referenceData_->getNumRows(), 0);
+    startRow = nextReferenceRow_;
+    nextReferenceRow_ =
+        (nextReferenceRow_ + tab.num_rows()) % referenceData_->getNumRows();
+  }
+
+  const bool valid =
+      referenceData_->verifyTable(tab, startRow, tab.num_rows(), stream);
 
   if (!valid) {
     dataValidFlag_ = false;
@@ -97,6 +107,15 @@ void SinkDriverMock::receiveAllData(UcxExchange* hybridExchange) {
         numBytes_.fetch_add(cudfRes->estimateFlatSize());
         numRows_ += cudfRes->size();
         numChunksReceived_.fetch_add(1);
+        {
+          std::lock_guard<std::mutex> lock(receivedChunkRowsMutex_);
+          receivedChunkRows_.push_back(cudfRes->size());
+        }
+        auto observedMax = maxChunkRowsReceived_.load();
+        while (observedMax < cudfRes->size() &&
+               !maxChunkRowsReceived_.compare_exchange_weak(
+                   observedMax, cudfRes->size())) {
+        }
         // If we have Reference data check the received data is the same
         if (referenceData_)
           updateDataValidity(cudfRes->getTableView());

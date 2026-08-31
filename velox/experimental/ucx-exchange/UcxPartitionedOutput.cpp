@@ -82,6 +82,35 @@ uint64_t effectiveFreeBytes(const CudfDeviceMemoryInfo& info) {
   return addSaturated(info.freeBytes, info.poolReusableBytes);
 }
 
+int64_t effectiveMaxRows(int64_t configuredMaxRows) {
+  if (configuredMaxRows <= 0) {
+    return configuredMaxRows;
+  }
+  return std::min<int64_t>(
+      configuredMaxRows,
+      static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()));
+}
+
+int64_t proportionalBytes(
+    int64_t remainingBytes,
+    vector_size_t selectedRows,
+    vector_size_t remainingRows) {
+  VELOX_CHECK_GE(remainingBytes, 0);
+  VELOX_CHECK_GE(selectedRows, 0);
+  VELOX_CHECK_GT(remainingRows, 0);
+  VELOX_CHECK_LE(selectedRows, remainingRows);
+  if (selectedRows == remainingRows) {
+    return remainingBytes;
+  }
+
+  // Avoid overflowing remainingBytes * selectedRows while preserving an exact
+  // residual for the segment's final slice.
+  const auto bytesPerRow = remainingBytes / remainingRows;
+  const auto residualBytes = remainingBytes % remainingRows;
+  return bytesPerRow * selectedRows +
+      residualBytes * selectedRows / remainingRows;
+}
+
 std::vector<cudf::size_type> toCudfIndices(
     const std::vector<column_index_t>& indices) {
   std::vector<cudf::size_type> result;
@@ -157,9 +186,12 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       replicateNulls_(planNode->isReplicateNulls()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
-      targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
+      flushThresholdRows_(ctx->queryConfig().get<int64_t>(
           CudfConfig::kCudfPartitionedOutputBatchRows,
           CudfConfig::getInstance().partitionedOutputBatchRows)),
+      maxRowsPerBatch_(ctx->queryConfig().get<int64_t>(
+          CudfConfig::kCudfPartitionedOutputMaxBatchRows,
+          CudfConfig::getInstance().partitionedOutputMaxBatchRows)),
       initialPayloadBytes_(
           std::max<uint64_t>(ctx->queryConfig().maxOutputBufferSize(), 1)) {
   if (planNode->outputType()->size() == 0 && !planNode->keys().empty()) {
@@ -207,9 +239,31 @@ void UcxPartitionedOutput::addInput(RowVectorPtr input) {
     lockedStats->addOutputVector(inputBytes, input->size());
   }
 
+  if (input->size() == 0) {
+    return;
+  }
+
+  VELOX_CHECK_LE(
+      inputBytes,
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+      "cuDF partitioned-output input estimate exceeds int64 range");
+  VELOX_CHECK_LE(
+      input->size(),
+      std::numeric_limits<int64_t>::max() - pendingRows_,
+      "cuDF partitioned-output pending row count overflow");
+  VELOX_CHECK_LE(
+      static_cast<int64_t>(inputBytes),
+      std::numeric_limits<int64_t>::max() - pendingBytes_,
+      "cuDF partitioned-output pending byte estimate overflow");
+
   pendingRows_ += input->size();
-  pendingBytes_ += inputBytes;
-  pendingInputs_.push_back(std::move(cudfVector));
+  pendingBytes_ += static_cast<int64_t>(inputBytes);
+  pendingInputs_.push_back(
+      PendingInputSegment{
+          std::move(cudfVector),
+          0,
+          input->size(),
+          static_cast<int64_t>(inputBytes)});
 
   if (shouldFlushPending()) {
     flushPending();
@@ -322,12 +376,13 @@ void UcxPartitionedOutput::partitionPendingInputBatch() {
             input.tableView,
             input.stream,
             cudf::get_current_device_resource_ref());
-        payloads.push_back(EmptyPayload{
-            destination,
-            static_cast<int32_t>(numRows),
-            std::make_unique<cudf::packed_columns>(
-                std::move(packedCols.metadata),
-                std::move(packedCols.gpu_data))});
+        payloads.push_back(
+            EmptyPayload{
+                destination,
+                static_cast<int32_t>(numRows),
+                std::make_unique<cudf::packed_columns>(
+                    std::move(packedCols.metadata),
+                    std::move(packedCols.gpu_data))});
       };
 
       if (kind_ != core::PartitionedOutputNode::Kind::kPartitioned ||
@@ -422,64 +477,150 @@ void UcxPartitionedOutput::flushPending() {
     return;
   }
 
-  const auto estimatedBytes = std::max<int64_t>(pendingBytes_, 1);
-  const auto numRows = pendingRows_;
+  int64_t allocationWaitBytes = 1;
 
   try {
-    cudf::table_view tableView;
-    rmm::cuda_stream_view stream = pendingInputs_.back()->stream();
+    struct SelectedInputSegment {
+      CudfVectorPtr owner;
+      vector_size_t nextRow;
+      vector_size_t numRows;
+      int64_t estimatedBytes;
+    };
+
+    const auto configuredMaxRows = effectiveMaxRows(maxRowsPerBatch_);
+    const auto numRows = configuredMaxRows <= 0
+        ? pendingRows_
+        : std::min<int64_t>(pendingRows_, configuredMaxRows);
+    VELOX_CHECK_GT(numRows, 0);
+    VELOX_CHECK_LE(
+        numRows,
+        static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()));
+
+    std::vector<SelectedInputSegment> selectedInputs;
+    selectedInputs.reserve(pendingInputs_.size());
+    int64_t rowsToSelect = numRows;
+    int64_t estimatedBytes = 0;
+    for (const auto& input : pendingInputs_) {
+      if (rowsToSelect == 0) {
+        break;
+      }
+      VELOX_CHECK_NOT_NULL(input.owner);
+      VELOX_CHECK_GT(input.remainingRows, 0);
+      const auto selectedRows = static_cast<vector_size_t>(
+          std::min<int64_t>(input.remainingRows, rowsToSelect));
+      const auto selectedBytes = proportionalBytes(
+          input.remainingEstimatedBytes, selectedRows, input.remainingRows);
+      VELOX_CHECK_LE(
+          selectedBytes,
+          std::numeric_limits<int64_t>::max() - estimatedBytes,
+          "cuDF partitioned-output selected byte estimate overflow");
+      selectedInputs.push_back(
+          SelectedInputSegment{
+              input.owner, input.nextRow, selectedRows, selectedBytes});
+      rowsToSelect -= selectedRows;
+      estimatedBytes += selectedBytes;
+    }
+    VELOX_CHECK_EQ(rowsToSelect, 0);
+    VELOX_CHECK(!selectedInputs.empty());
+    allocationWaitBytes = std::max<int64_t>(estimatedBytes, 1);
+
+    auto stream = selectedInputs.back().owner->stream();
     // Keeps the merged table alive while tableView references it.
+    cudf::table_view tableView;
     std::unique_ptr<cudf::table> mergedTable;
     std::vector<CudfVectorPtr> vectorOwners;
-
-    if (pendingInputs_.size() == 1 || outputType_->size() == 0) {
-      // Fast path: use a directly owned view (no GPU allocation). Zero-column
-      // inputs can retain all vector owners because no table data is accessed.
-      vectorOwners = std::move(pendingInputs_);
-      auto& cv = vectorOwners.back();
-      stream = cv->stream();
-      tableView = !needsRemap_
-          ? cv->getTableView()
-          : cv->getTableView().select(remap_.begin(), remap_.end());
-    } else {
-      // Collect (remapped) table views.
-      std::vector<cudf::table_view> views;
-      std::vector<rmm::cuda_stream_view> inputStreams;
-      views.reserve(pendingInputs_.size());
-      inputStreams.reserve(pendingInputs_.size());
-      for (auto& v : pendingInputs_) {
-        inputStreams.push_back(v->stream());
-        views.push_back(
-            !needsRemap_
-                ? v->getTableView()
-                : v->getTableView().select(remap_.begin(), remap_.end()));
-      }
-
-      cudf::detail::join_streams(inputStreams, stream);
-      mergedTable = cudf::concatenate(
-          views, stream, cudf::get_current_device_resource_ref());
-
-      orderCudfVectorDeallocationsAfterStream(
-          pendingInputs_, inputStreams, stream);
-
-      // Free input GPU memory before partitioning (peak = 2x -> 1x).
-      pendingInputs_.clear();
-
-      tableView = mergedTable->view();
+    std::vector<rmm::cuda_stream_view> inputStreams;
+    inputStreams.reserve(selectedInputs.size());
+    vectorOwners.reserve(selectedInputs.size());
+    for (const auto& input : selectedInputs) {
+      inputStreams.push_back(input.owner->stream());
+      vectorOwners.push_back(input.owner);
     }
 
-    pendingInputBatch_.emplace(PendingInputBatch{
-        std::move(mergedTable),
-        std::move(vectorOwners),
-        tableView,
-        numRows,
-        estimatedBytes,
-        stream});
-    pendingRows_ = 0;
-    pendingBytes_ = 0;
+    if (outputType_->size() == 0) {
+      // A zero-column table has no physical row count. Retain all selected
+      // owners and carry the bounded logical cardinality separately.
+      const auto ownerView = vectorOwners.back()->getTableView();
+      tableView = !needsRemap_ ? ownerView
+                               : ownerView.select(remap_.begin(), remap_.end());
+      VELOX_CHECK_EQ(tableView.num_columns(), 0);
+    } else {
+      std::vector<cudf::table_view> views;
+      views.reserve(selectedInputs.size());
+      for (const auto& input : selectedInputs) {
+        const auto ownerView = input.owner->getTableView();
+        VELOX_CHECK_GT(ownerView.num_columns(), 0);
+        VELOX_CHECK_EQ(ownerView.num_rows(), input.owner->size());
+        const auto sliceEnd = static_cast<int64_t>(input.nextRow) +
+            static_cast<int64_t>(input.numRows);
+        VELOX_CHECK_LE(sliceEnd, input.owner->size());
+        std::vector<cudf::size_type> offsets{
+            static_cast<cudf::size_type>(input.nextRow),
+            static_cast<cudf::size_type>(sliceEnd)};
+        auto slices = cudf::slice(ownerView, offsets);
+        VELOX_CHECK_EQ(slices.size(), 1);
+        views.push_back(
+            !needsRemap_ ? slices.front()
+                         : slices.front().select(remap_.begin(), remap_.end()));
+      }
+
+      if (views.size() == 1) {
+        // A sliced table_view is zero-copy. vectorOwners keeps its complete
+        // source vector alive until partitioning and transfer finish.
+        tableView = views.front();
+      } else {
+        cudf::detail::join_streams(inputStreams, stream);
+        mergedTable = cudf::concatenate(
+            views, stream, cudf::get_current_device_resource_ref());
+        orderCudfVectorDeallocationsAfterStream(
+            vectorOwners, inputStreams, stream);
+        vectorOwners.clear();
+        tableView = mergedTable->view();
+      }
+    }
+
+    pendingInputBatch_.emplace(
+        PendingInputBatch{
+            std::move(mergedTable),
+            std::move(vectorOwners),
+            tableView,
+            numRows,
+            estimatedBytes,
+            stream});
+
+    // Commit queue offsets only after all potentially allocating slice and
+    // concatenate work succeeds. A retry therefore cannot lose or duplicate
+    // rows.
+    for (size_t selectedIndex = 0; selectedIndex < selectedInputs.size();
+         ++selectedIndex) {
+      const auto& selected = selectedInputs[selectedIndex];
+      VELOX_CHECK(!pendingInputs_.empty());
+      auto& input = pendingInputs_.front();
+      VELOX_CHECK(
+          input.owner == selected.owner,
+          "Selected cuDF input owner no longer matches the pending queue");
+      VELOX_CHECK_EQ(input.nextRow, selected.nextRow);
+      VELOX_CHECK_LE(selected.numRows, input.remainingRows);
+      VELOX_CHECK_LE(selected.estimatedBytes, input.remainingEstimatedBytes);
+
+      input.nextRow += selected.numRows;
+      input.remainingRows -= selected.numRows;
+      input.remainingEstimatedBytes -= selected.estimatedBytes;
+      pendingRows_ -= selected.numRows;
+      pendingBytes_ -= selected.estimatedBytes;
+
+      if (input.remainingRows == 0) {
+        VELOX_CHECK_EQ(input.remainingEstimatedBytes, 0);
+        pendingInputs_.pop_front();
+      } else {
+        VELOX_CHECK_EQ(selectedIndex + 1, selectedInputs.size());
+      }
+    }
+    VELOX_CHECK_GE(pendingRows_, 0);
+    VELOX_CHECK_GE(pendingBytes_, 0);
     partitionPendingInputBatch();
   } catch (const std::bad_alloc&) {
-    recordAllocationPressure(static_cast<uint64_t>(estimatedBytes));
+    recordAllocationPressure(static_cast<uint64_t>(allocationWaitBytes));
   }
 }
 
@@ -569,8 +710,12 @@ void UcxPartitionedOutput::clearPending() {
 }
 
 bool UcxPartitionedOutput::shouldFlushPending() const {
-  return !pendingInputs_.empty() &&
-      (targetRowsPerChunk_ <= 0 || pendingRows_ >= targetRowsPerChunk_);
+  if (pendingInputs_.empty()) {
+    return false;
+  }
+  const auto maxRows = effectiveMaxRows(maxRowsPerBatch_);
+  return flushThresholdRows_ <= 0 || pendingRows_ >= flushThresholdRows_ ||
+      (maxRows > 0 && pendingRows_ >= maxRows);
 }
 
 bool UcxPartitionedOutput::shouldDrainPending() const {
@@ -688,19 +833,20 @@ void UcxPartitionedOutput::hashPartition(
   VELOX_CHECK_EQ(partitionOffsets[0], 0);
 
   auto partitionedView = partitionedTable->view();
-  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
-      std::move(partitionedTable),
-      {},
-      partitionedView,
-      std::move(partitionOffsets),
-      estimatedBytes,
-      false,
-      stream,
-      0,
-      {},
-      {},
-      {},
-      0});
+  pendingPartitionedBatch_.emplace(
+      PendingPartitionedBatch{
+          std::move(partitionedTable),
+          {},
+          partitionedView,
+          std::move(partitionOffsets),
+          estimatedBytes,
+          false,
+          stream,
+          0,
+          {},
+          {},
+          {},
+          0});
 }
 
 void UcxPartitionedOutput::enqueueReplicatedNullRows(
@@ -747,19 +893,20 @@ void UcxPartitionedOutput::equalPartition(
   }
   offsets.push_back(size);
 
-  pendingPartitionedBatch_.emplace(PendingPartitionedBatch{
-      std::move(tableOwner),
-      std::move(vectorOwners),
-      tableView,
-      std::move(offsets),
-      estimatedBytes,
-      false,
-      stream,
-      0,
-      {},
-      {},
-      {},
-      0});
+  pendingPartitionedBatch_.emplace(
+      PendingPartitionedBatch{
+          std::move(tableOwner),
+          std::move(vectorOwners),
+          tableView,
+          std::move(offsets),
+          estimatedBytes,
+          false,
+          stream,
+          0,
+          {},
+          {},
+          {},
+          0});
 }
 
 // Estimate payload bytes for a partition using the reservation estimate. The
@@ -1183,8 +1330,6 @@ bool UcxPartitionedOutput::tryDrainWithContiguousSplit(
   }
 
   pendingPartitionedBatch_.reset();
-  pendingRows_ = 0;
-  pendingBytes_ = 0;
   blockingReason_ = exec::BlockingReason::kNotBlocked;
   releaseReservations.dismiss();
   return true;
@@ -1352,8 +1497,6 @@ bool UcxPartitionedOutput::tryDrainWithFullContiguousSplit(
   }
 
   pendingPartitionedBatch_.reset();
-  pendingRows_ = 0;
-  pendingBytes_ = 0;
   blockingReason_ = exec::BlockingReason::kNotBlocked;
   releaseReservations.dismiss();
   return true;
@@ -1509,10 +1652,11 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
 
         std::optional<cudf::packed_columns> packedCols;
         try {
-          packedCols.emplace(cudf::pack(
-              tableSlices[0],
-              batch.stream,
-              cudf::get_current_device_resource_ref()));
+          packedCols.emplace(
+              cudf::pack(
+                  tableSlices[0],
+                  batch.stream,
+                  cudf::get_current_device_resource_ref()));
         } catch (const std::bad_alloc&) {
           recordChunkAllocationPressure(transferReservationBytes);
           return false;
@@ -1590,8 +1734,6 @@ bool UcxPartitionedOutput::drainPendingPartitionedBatch() {
   }
 
   pendingPartitionedBatch_.reset();
-  pendingRows_ = 0;
-  pendingBytes_ = 0;
   blockingReason_ = exec::BlockingReason::kNotBlocked;
   return true;
 }

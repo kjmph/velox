@@ -23,6 +23,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <deque>
 #include <memory>
 #include <optional>
 
@@ -36,7 +37,7 @@ class UcxPartitionedOutput : public exec::Operator,
                              public cudf_velox::NvtxHelper {
  public:
   // Default minimum rows to accumulate before flushing. Matches HTTP
-  // PartitionedOutput's ~10,000 row target. The cudf exchange system property
+  // PartitionedOutput's ~10,000 row target. The cuDF exchange system property
   // provides the cluster default; the same configuration key can override it
   // per query.
   static constexpr int64_t kDefaultTargetRowsPerChunk = 10'000;
@@ -129,6 +130,13 @@ class UcxPartitionedOutput : public exec::Operator,
     rmm::cuda_stream_view stream;
   };
 
+  struct PendingInputSegment {
+    cudf_velox::CudfVectorPtr owner;
+    vector_size_t nextRow{0};
+    vector_size_t remainingRows{0};
+    int64_t remainingEstimatedBytes{0};
+  };
+
   void partitionPendingInputBatch();
 
   bool drainPendingPartitionedBatch();
@@ -208,14 +216,19 @@ class UcxPartitionedOutput : public exec::Operator,
 
   bool shouldDrainPending() const;
 
-  /// Accumulated CudfVectors awaiting flush.
-  std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
-  /// Total rows across pendingInputs_.
+  /// Unconsumed input segments awaiting promotion into an output batch. A
+  /// segment may retain the suffix of a CudfVector after a bounded prefix has
+  /// been promoted.
+  std::deque<PendingInputSegment> pendingInputs_;
+  /// Total unconsumed rows across pendingInputs_.
   int64_t pendingRows_{0};
-  /// Estimated bytes across pendingInputs_.
+  /// Total estimated unconsumed bytes across pendingInputs_.
   int64_t pendingBytes_{0};
-  /// Configured row threshold for flushing (from QueryConfig).
-  const int64_t targetRowsPerChunk_;
+  /// Configured minimum row threshold for flushing (from QueryConfig).
+  const int64_t flushThresholdRows_;
+  /// Configured maximum rows per output batch (from QueryConfig).
+  /// Non-positive values preserve the legacy unbounded behavior.
+  const int64_t maxRowsPerBatch_;
   /// Initial target GPU payload size for geometrically chunked UCX messages.
   const uint64_t initialPayloadBytes_;
 

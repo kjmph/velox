@@ -1338,10 +1338,10 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     queueManager_->removeTask(srcTaskId);
   }
 
-  // --- Scenario 3: Large chunks (>= threshold) should NOT be accumulated ---
+  // --- Scenario 3: Large chunks are sliced at the target ---
   // 5 chunks × 20,000 rows = 100,000 total rows.
-  // Each chunk exceeds kTargetRowsPerChunk, so each addInput triggers an
-  // immediate flush via the single-input fast path. Expected: 5 output chunks.
+  // Each chunk is twice kTargetRows, so each addInput produces two bounded
+  // output chunks. Expected: 10 output chunks.
   {
     const int numChunks = 5;
     const int numRowsPerChunk = 20000;
@@ -1355,8 +1355,11 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     auto dataToSend = std::make_shared<UcxTestData>();
     dataToSend->initialize(numRowsPerChunk);
 
-    auto srcTask =
-        createPartitionedOutputTask(srcTaskId, pool_, rowType, numPartitions);
+    const std::unordered_map<std::string, std::string> extraConfig{
+        {cudf_velox::CudfConfig::kCudfPartitionedOutputMaxBatchRows,
+         std::to_string(kTargetRows)}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId, pool_, rowType, numPartitions, {}, FOUR_GBYTES, extraConfig);
     queueManager_->initializeTask(
         srcTask,
         core::PartitionedOutputNode::Kind::kPartitioned,
@@ -1369,8 +1372,8 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     const std::string sinkTaskId = taskPrefix + "sinkTask0";
     core::PlanNodeId exchangeNodeId;
     auto sinkTask = createExchangeTask(sinkTaskId, rowType, 0, exchangeNodeId);
-    auto sinkDriver =
-        std::make_shared<SinkDriverMock>(sinkTask, numDrivers, dataToSend);
+    auto sinkDriver = std::make_shared<SinkDriverMock>(
+        sinkTask, numDrivers, dataToSend, true /* verifySequentialChunks */);
 
     std::vector<exec::Split> splits;
     splits.emplace_back(remoteSplit(srcTaskId, 0));
@@ -1389,15 +1392,18 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
     EXPECT_TRUE(sinkDriver->dataIsValid())
         << "Large-chunk scenario data must match reference";
 
+    const auto expectedOutputChunks = static_cast<uint64_t>(numChunks) *
+        ((numRowsPerChunk + kTargetRows - 1) / kTargetRows);
+
     VLOG(0) << "batchAccumulationTest scenario 3: sent " << numChunks
             << " chunks of " << numRowsPerChunk << " rows, received "
             << sinkDriver->numChunksReceived() << " chunks (expected "
-            << numChunks << ")";
+            << expectedOutputChunks << ")";
 
-    // Large chunks should pass through without accumulation — each addInput
-    // immediately flushes because pendingRows >= kTargetRowsPerChunk.
-    EXPECT_EQ(sinkDriver->numChunksReceived(), static_cast<uint64_t>(numChunks))
-        << "Large chunks should not be accumulated";
+    EXPECT_EQ(sinkDriver->numChunksReceived(), expectedOutputChunks)
+        << "Large chunks should be sliced at the configured row target";
+    EXPECT_LE(sinkDriver->maxChunkRowsReceived(), kTargetRows)
+        << "No output chunk may exceed the configured row target";
 
     queueManager_->removeTask(srcTaskId);
   }
@@ -1475,6 +1481,168 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     queueManager_->removeTask(srcTaskId);
   }
+
+  // --- Scenario 5: One oversized input preserves its final remainder ---
+  // 25,001 rows at a 10,000-row target must produce 10,000, 10,000, and 5,001
+  // rows without loss, duplication, or reordering.
+  {
+    const int numChunks = 1;
+    const int numRowsPerChunk = 25001;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto rowType = UcxTestData::kTestRowType;
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+
+    const std::unordered_map<std::string, std::string> extraConfig{
+        {cudf_velox::CudfConfig::kCudfPartitionedOutputMaxBatchRows,
+         std::to_string(kTargetRows)}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId, pool_, rowType, numPartitions, {}, FOUR_GBYTES, extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+
+    const std::string sinkTaskId = taskPrefix + "sinkTask0";
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(sinkTaskId, rowType, 0, exchangeNodeId);
+    auto sinkDriver = std::make_shared<SinkDriverMock>(
+        sinkTask, numDrivers, dataToSend, true /* verifySequentialChunks */);
+
+    std::vector<exec::Split> splits;
+    splits.emplace_back(remoteSplit(srcTaskId, 0));
+    sinkDriver->addSplits(splits);
+
+    sourceDriver->run();
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    EXPECT_EQ(sinkDriver->numRows(), numRowsPerChunk);
+    EXPECT_EQ(sinkDriver->numChunksReceived(), 3);
+    EXPECT_LE(sinkDriver->maxChunkRowsReceived(), kTargetRows);
+    EXPECT_EQ(
+        sinkDriver->receivedChunkRows(),
+        (std::vector<uint64_t>{10000, 10000, 5001}));
+    EXPECT_TRUE(sinkDriver->dataIsValid())
+        << "Sliced remainder data must remain ordered and complete";
+
+    queueManager_->removeTask(srcTaskId);
+  }
+
+  // --- Scenario 6: The cap applies before multi-destination hash output ---
+  {
+    const int numChunks = 1;
+    const int numRowsPerChunk = 25001;
+    const int numPartitions = 2;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto rowType = UcxTestData::kTestRowType;
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+    const std::unordered_map<std::string, std::string> extraConfig{
+        {cudf_velox::CudfConfig::kCudfPartitionedOutputMaxBatchRows,
+         std::to_string(kTargetRows)}};
+    auto srcTask = createPartitionedOutputTask(
+        srcTaskId,
+        pool_,
+        rowType,
+        numPartitions,
+        {"c0"},
+        FOUR_GBYTES,
+        extraConfig);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+
+    std::vector<std::shared_ptr<SinkDriverMock>> sinkDrivers;
+    for (int partition = 0; partition < numPartitions; ++partition) {
+      core::PlanNodeId exchangeNodeId;
+      auto sinkTask = createExchangeTask(
+          taskPrefix + "sinkTask" + std::to_string(partition),
+          rowType,
+          partition,
+          exchangeNodeId);
+      auto sinkDriver = std::make_shared<SinkDriverMock>(sinkTask, numDrivers);
+      std::vector<exec::Split> splits{remoteSplit(srcTaskId, partition)};
+      sinkDriver->addSplits(splits);
+      sinkDrivers.push_back(std::move(sinkDriver));
+    }
+
+    sourceDriver->run();
+    for (auto& sinkDriver : sinkDrivers) {
+      sinkDriver->run();
+    }
+    sourceDriver->joinThreads();
+    for (auto& sinkDriver : sinkDrivers) {
+      sinkDriver->joinThreads();
+    }
+
+    uint64_t totalRows = 0;
+    for (const auto& sinkDriver : sinkDrivers) {
+      totalRows += sinkDriver->numRows();
+      EXPECT_LE(sinkDriver->maxChunkRowsReceived(), kTargetRows);
+    }
+    EXPECT_EQ(totalRows, numRowsPerChunk)
+        << "Bounded hash partitioning must not lose or duplicate rows";
+
+    queueManager_->removeTask(srcTaskId);
+  }
+
+  // --- Scenario 7: An unset cap preserves legacy oversized batches ---
+  {
+    const int numChunks = 1;
+    const int numRowsPerChunk = 20000;
+    const int numPartitions = 1;
+    const int numDrivers = 1;
+    const std::string taskPrefix = getUniqueTaskPrefix();
+    const std::string srcTaskId = taskPrefix + "sourceTask0";
+
+    auto rowType = UcxTestData::kTestRowType;
+    auto dataToSend = std::make_shared<UcxTestData>();
+    dataToSend->initialize(numRowsPerChunk);
+    auto srcTask =
+        createPartitionedOutputTask(srcTaskId, pool_, rowType, numPartitions);
+    queueManager_->initializeTask(
+        srcTask,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        numPartitions,
+        numDrivers);
+    auto sourceDriver = std::make_shared<SourceDriverMock>(
+        srcTask, numDrivers, numChunks, numRowsPerChunk, dataToSend);
+
+    core::PlanNodeId exchangeNodeId;
+    auto sinkTask = createExchangeTask(
+        taskPrefix + "sinkTask0", rowType, 0, exchangeNodeId);
+    auto sinkDriver =
+        std::make_shared<SinkDriverMock>(sinkTask, numDrivers, dataToSend);
+    std::vector<exec::Split> splits{remoteSplit(srcTaskId, 0)};
+    sinkDriver->addSplits(splits);
+
+    sourceDriver->run();
+    sinkDriver->run();
+    sourceDriver->joinThreads();
+    sinkDriver->joinThreads();
+
+    EXPECT_EQ(sinkDriver->numRows(), numRowsPerChunk);
+    EXPECT_EQ(sinkDriver->receivedChunkRows(), (std::vector<uint64_t>{20000}));
+    EXPECT_TRUE(sinkDriver->dataIsValid());
+
+    queueManager_->removeTask(srcTaskId);
+  }
 }
 
 TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
@@ -1497,7 +1665,8 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
                                int numPartitions,
                                int numChunks,
                                int numRowsPerChunk,
-                               bool projectNonEmptyInput) {
+                               bool projectNonEmptyInput,
+                               int64_t maxBatchRows) {
     config.intraNodeExchange = intraNode;
     const auto taskPrefix = getUniqueTaskPrefix();
     const auto srcTaskId = taskPrefix + "zeroColumnSource";
@@ -1515,6 +1684,12 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
       partitionFunctionSpec =
           std::make_shared<exec::RoundRobinPartitionFunctionSpec>();
     }
+    std::unordered_map<std::string, std::string> extraConfig;
+    if (maxBatchRows > 0) {
+      extraConfig.emplace(
+          cudf_velox::CudfConfig::kCudfPartitionedOutputMaxBatchRows,
+          std::to_string(maxBatchRows));
+    }
     auto srcTask = createPartitionedOutputTask(
         srcTaskId,
         pool_,
@@ -1522,7 +1697,7 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
         numPartitions,
         {},
         FOUR_GBYTES,
-        {},
+        extraConfig,
         rowType,
         std::move(partitionFunctionSpec));
     queueManager_->initializeTask(
@@ -1561,6 +1736,9 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
     ASSERT_EQ(expectedRows % numPartitions, 0);
     for (const auto& sinkDriver : sinkDrivers) {
       EXPECT_EQ(sinkDriver->numRows(), expectedRows / numPartitions);
+      if (maxBatchRows > 0) {
+        EXPECT_LE(sinkDriver->maxChunkRowsReceived(), maxBatchRows);
+      }
     }
     queueManager_->removeTask(srcTaskId);
   };
@@ -1572,14 +1750,25 @@ TEST_P(UcxExchangeTest, zeroColumnLogicalRowCount) {
       /*numPartitions=*/1,
       /*numChunks=*/1,
       /*numRowsPerChunk=*/1,
-      /*projectNonEmptyInput=*/true);
+      /*projectNonEmptyInput=*/true,
+      /*maxBatchRows=*/0);
   // Also cover accumulation, partitioning, and the intra-process handoff.
   runScenario(
       /*intraNode=*/true,
       /*numPartitions=*/3,
       /*numChunks=*/3,
       /*numRowsPerChunk=*/7,
-      /*projectNonEmptyInput=*/false);
+      /*projectNonEmptyInput=*/false,
+      /*maxBatchRows=*/0);
+  // Oversized projected input exercises logical-row slicing when the physical
+  // output schema has no columns.
+  runScenario(
+      /*intraNode=*/false,
+      /*numPartitions=*/1,
+      /*numChunks=*/1,
+      /*numRowsPerChunk=*/25001,
+      /*projectNonEmptyInput=*/true,
+      /*maxBatchRows=*/UcxPartitionedOutput::kDefaultTargetRowsPerChunk);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

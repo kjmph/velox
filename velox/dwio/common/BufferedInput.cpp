@@ -29,26 +29,61 @@ namespace facebook::velox::dwio::common {
 
 CachedRegion::CachedRegion(cache::CachePin pin) : pin_(std::move(pin)) {
   VELOX_CHECK(!pin_.empty(), "CachedRegion requires a non-empty cache pin");
+  initialize(0, pin_.checkedEntry()->size());
+}
+
+CachedRegion::CachedRegion(
+    cache::CachePin pin,
+    uint64_t offset,
+    uint64_t length)
+    : pin_(std::move(pin)) {
+  initialize(offset, length);
+}
+
+void CachedRegion::initialize(uint64_t offset, uint64_t length) {
+  VELOX_CHECK(!pin_.empty(), "CachedRegion requires a non-empty cache pin");
   auto* entry = pin_.checkedEntry();
   VELOX_CHECK(
       !entry->isExclusive(),
       "CachedRegion requires a shared (non-exclusive) cache pin");
-  size_ = entry->size();
+  VELOX_CHECK_GT(length, 0, "CachedRegion length must be positive");
+  VELOX_CHECK_LE(
+      offset,
+      entry->size(),
+      "CachedRegion offset {} exceeds cache entry size {}",
+      offset,
+      entry->size());
+  VELOX_CHECK_LE(
+      length,
+      entry->size() - offset,
+      "CachedRegion length {} exceeds the {} bytes available at offset {}",
+      length,
+      entry->size() - offset,
+      offset);
+
+  size_ = length;
   if (entry->hasContiguousData()) {
-    ranges_.push_back(
-        folly::Range<const char*>(entry->contiguousData(), size_));
-  } else {
-    auto& allocation = entry->nonContiguousData();
-    ranges_.reserve(allocation.numRuns());
-    uint64_t offset{0};
-    for (int i = 0; i < allocation.numRuns() && offset < size_; ++i) {
-      auto run = allocation.runAt(i);
-      const uint64_t bytes =
-          run.numPages() * memory::AllocationTraits::kPageSize;
-      const uint64_t readSize = std::min(bytes, size_ - offset);
-      ranges_.emplace_back(run.data<const char>(), readSize);
-      offset += readSize;
-    }
+    ranges_.emplace_back(entry->contiguousData() + offset, length);
+    return;
+  }
+
+  const auto& allocation = entry->nonContiguousData();
+  int32_t runIndex;
+  int32_t offsetInRun;
+  allocation.findRun(offset, &runIndex, &offsetInRun);
+  ranges_.reserve(allocation.numRuns() - runIndex);
+
+  uint64_t remaining = length;
+  while (remaining > 0) {
+    VELOX_CHECK_LT(runIndex, allocation.numRuns());
+    const auto run = allocation.runAt(runIndex);
+    VELOX_CHECK_LT(offsetInRun, run.numBytes());
+    const auto bytes =
+        std::min<uint64_t>(remaining, run.numBytes() - offsetInRun);
+    ranges_.emplace_back(run.data<const char>() + offsetInRun, bytes);
+    remaining -= bytes;
+    ++runIndex;
+    offsetInRun = 0;
   }
 }
 

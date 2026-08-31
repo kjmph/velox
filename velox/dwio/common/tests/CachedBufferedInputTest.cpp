@@ -237,6 +237,91 @@ class CachedBufferedInputTest : public testing::Test {
   std::shared_ptr<TempDirectoryPath> tempDirectory_;
 };
 
+TEST_F(CachedBufferedInputTest, retainRegionsReturnedByNext) {
+  const auto largestRunPages = allocator_->largestSizeClass();
+  const int32_t loadQuantum = AllocationTraits::pageBytes(
+      static_cast<uint64_t>(largestRunPages) * 2 + 1);
+  const auto contentSize = static_cast<uint64_t>(loadQuantum) + 127;
+  std::string content(contentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+
+  auto readFile = std::make_shared<InMemoryReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(loadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "retainRegionsReturnedByNext");
+  StringIdLease groupId(ids, "retainRegionsReturnedByNextGroup");
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      std::move(fileId),
+      cache_.get(),
+      tracker_,
+      std::move(groupId),
+      dataIoStats_,
+      nullptr,
+      executor_.get(),
+      readerOptions);
+
+  auto seekableStream = input.enqueue({0, contentSize}, nullptr);
+  auto* stream = dynamic_cast<CacheInputStream*>(seekableStream.get());
+  ASSERT_NE(stream, nullptr);
+  VELOX_ASSERT_THROW(
+      stream->retainedRegionForLastNext(),
+      "requires a preceding successful Next call");
+
+  input.load(LogType::TEST);
+  std::vector<CachedRegion> retainedRegions;
+  std::string reconstructed;
+  const void* buffer{nullptr};
+  int32_t size{0};
+  while (stream->Next(&buffer, &size)) {
+    ASSERT_GT(size, 0);
+    auto retained = stream->retainedRegionForLastNext();
+    ASSERT_EQ(retained.ranges().size(), 1);
+    EXPECT_EQ(retained.size(), size);
+    EXPECT_EQ(retained.ranges()[0].data(), buffer);
+    EXPECT_EQ(retained.ranges()[0].size(), size);
+    reconstructed.append(retained.ranges()[0].data(), size);
+    retainedRegions.push_back(std::move(retained));
+
+    if (retainedRegions.size() == 1) {
+      stream->BackUp(0);
+      VELOX_ASSERT_THROW(
+          stream->retainedRegionForLastNext(),
+          "requires a preceding successful Next call");
+    }
+  }
+  EXPECT_EQ(reconstructed, content);
+  // The first cache quantum is larger than the allocator's largest run and the
+  // final quantum is a separate contiguous tiny entry.
+  EXPECT_GT(retainedRegions.size(), 2);
+  VELOX_ASSERT_THROW(
+      stream->retainedRegionForLastNext(),
+      "requires a preceding successful Next call");
+
+  seekableStream.reset();
+  cache_->clear();
+  EXPECT_GT(cache_->refreshStats().numEntries, 0);
+
+  std::string afterStreamDestruction;
+  for (const auto& retained : retainedRegions) {
+    for (const auto& range : retained.ranges()) {
+      afterStreamDestruction.append(range.data(), range.size());
+    }
+  }
+  EXPECT_EQ(afterStreamDestruction, content);
+
+  retainedRegions.clear();
+  cache_->clear();
+  EXPECT_EQ(cache_->refreshStats().numEntries, 0);
+}
+
 enum class CacheRegionApi {
   kStringView,
   kIOBuf,

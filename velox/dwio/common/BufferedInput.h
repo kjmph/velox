@@ -36,6 +36,12 @@ class CachedRegion {
   /// The pin must be non-empty and in shared (non-exclusive) mode.
   explicit CachedRegion(cache::CachePin pin);
 
+  /// Creates a retained view over [offset, offset + length) within the cache
+  /// entry held by 'pin'. The slice may span multiple non-contiguous allocation
+  /// runs. The pin must be non-empty and in shared (non-exclusive) mode, length
+  /// must be positive, and the slice must be contained in the cache entry.
+  CachedRegion(cache::CachePin pin, uint64_t offset, uint64_t length);
+
   uint64_t size() const {
     return size_;
   }
@@ -53,6 +59,8 @@ class CachedRegion {
   folly::IOBuf toIOBuf() const;
 
  private:
+  void initialize(uint64_t offset, uint64_t length);
+
   cache::CachePin pin_;
   // Cached data size in bytes.
   uint64_t size_{0};

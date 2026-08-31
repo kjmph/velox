@@ -172,7 +172,9 @@ TEST_F(BufferedInputTest, hasCache) {
 }
 
 TEST_F(BufferedInputTest, cachedRegion) {
-  auto dataCache = cache::AsyncDataCache::create(memoryManager()->allocator());
+  MemoryManager localMemoryManager{MemoryManager::Options{}};
+  auto dataCache =
+      cache::AsyncDataCache::create(localMemoryManager.allocator());
 
   // Empty pin throws.
   VELOX_ASSERT_THROW(
@@ -276,6 +278,117 @@ TEST_F(BufferedInputTest, cachedRegion) {
             reinterpret_cast<const char*>(iobuf.data()), iobuf.length()),
         expected);
   }
+}
+
+TEST_F(BufferedInputTest, cachedRegionSlices) {
+  MemoryManager localMemoryManager{MemoryManager::Options{}};
+  auto dataCache =
+      cache::AsyncDataCache::create(localMemoryManager.allocator());
+  auto& ids = facebook::velox::fileIds();
+
+  auto populateEntry = [](cache::AsyncDataCacheEntry& entry,
+                          std::string_view data) {
+    uint64_t copiedBytes = 0;
+    for (auto range : entry.dataRanges(data.size())) {
+      std::memcpy(range.data(), data.data() + copiedBytes, range.size());
+      copiedBytes += range.size();
+    }
+    ASSERT_EQ(copiedBytes, data.size());
+    entry.setExclusiveToShared();
+  };
+  auto materialize = [](const CachedRegion& region) {
+    std::string result;
+    result.reserve(region.size());
+    for (const auto& range : region.ranges()) {
+      result.append(range.data(), range.size());
+    }
+    return result;
+  };
+
+  StringIdLease contiguousFileId(ids, "cachedRegionContiguousSlice");
+  constexpr uint64_t kContiguousSize = 256;
+  std::string contiguousData(kContiguousSize, '\0');
+  for (uint64_t i = 0; i < contiguousData.size(); ++i) {
+    contiguousData[i] = static_cast<char>(i % 251);
+  }
+  auto contiguousPin = dataCache->findOrCreate(
+      {contiguousFileId.id(), 0}, kContiguousSize, /*contiguous=*/true);
+  ASSERT_FALSE(contiguousPin.empty());
+  populateEntry(*contiguousPin.checkedEntry(), contiguousData);
+
+  constexpr uint64_t kContiguousOffset = 17;
+  constexpr uint64_t kContiguousLength = 73;
+  CachedRegion contiguousSlice{
+      contiguousPin, kContiguousOffset, kContiguousLength};
+  ASSERT_EQ(contiguousSlice.ranges().size(), 1);
+  EXPECT_EQ(contiguousSlice.size(), kContiguousLength);
+  EXPECT_EQ(
+      contiguousSlice.ranges()[0].data(),
+      contiguousPin.checkedEntry()->contiguousData() + kContiguousOffset);
+  EXPECT_EQ(
+      materialize(contiguousSlice),
+      contiguousData.substr(kContiguousOffset, kContiguousLength));
+
+  StringIdLease nonContiguousFileId(ids, "cachedRegionNonContiguousSlice");
+  const auto largestRunPages = dataCache->allocator()->largestSizeClass();
+  const uint64_t nonContiguousSize = AllocationTraits::pageBytes(
+      static_cast<uint64_t>(largestRunPages) * 2 + 1);
+  std::string nonContiguousData(nonContiguousSize, '\0');
+  for (uint64_t i = 0; i < nonContiguousData.size(); ++i) {
+    nonContiguousData[i] = static_cast<char>(i % 251);
+  }
+  auto nonContiguousPin = dataCache->findOrCreate(
+      {nonContiguousFileId.id(), 0},
+      nonContiguousSize,
+      /*contiguous=*/false);
+  ASSERT_FALSE(nonContiguousPin.empty());
+  auto* nonContiguousEntry = nonContiguousPin.checkedEntry();
+  ASSERT_FALSE(nonContiguousEntry->hasContiguousData());
+  ASSERT_GT(nonContiguousEntry->nonContiguousData().numRuns(), 1);
+  populateEntry(*nonContiguousEntry, nonContiguousData);
+
+  constexpr uint64_t kWithinRunOffset = 23;
+  constexpr uint64_t kWithinRunLength = 101;
+  CachedRegion withinRunSlice{
+      nonContiguousPin, kWithinRunOffset, kWithinRunLength};
+  ASSERT_EQ(withinRunSlice.ranges().size(), 1);
+  EXPECT_EQ(
+      withinRunSlice.ranges()[0].data(),
+      nonContiguousEntry->nonContiguousData().runAt(0).data<const char>() +
+          kWithinRunOffset);
+  EXPECT_EQ(
+      materialize(withinRunSlice),
+      nonContiguousData.substr(kWithinRunOffset, kWithinRunLength));
+
+  const auto firstRunBytes =
+      nonContiguousEntry->nonContiguousData().runAt(0).numBytes();
+  constexpr uint64_t kBytesBeforeBoundary = 19;
+  constexpr uint64_t kBytesAfterBoundary = 29;
+  const auto crossingOffset = firstRunBytes - kBytesBeforeBoundary;
+  constexpr uint64_t kCrossingLength =
+      kBytesBeforeBoundary + kBytesAfterBoundary;
+  CachedRegion crossingRunSlice{
+      nonContiguousPin, crossingOffset, kCrossingLength};
+  ASSERT_EQ(crossingRunSlice.ranges().size(), 2);
+  EXPECT_EQ(crossingRunSlice.ranges()[0].size(), kBytesBeforeBoundary);
+  EXPECT_EQ(crossingRunSlice.ranges()[1].size(), kBytesAfterBoundary);
+  EXPECT_EQ(
+      materialize(crossingRunSlice),
+      nonContiguousData.substr(crossingOffset, kCrossingLength));
+
+  VELOX_ASSERT_THROW(
+      (void)CachedRegion(nonContiguousPin, 0, 0),
+      "CachedRegion length must be positive");
+  VELOX_ASSERT_THROW(
+      (void)CachedRegion(nonContiguousPin, nonContiguousSize + 1, 1),
+      "exceeds cache entry size");
+  VELOX_ASSERT_THROW(
+      (void)CachedRegion(nonContiguousPin, nonContiguousSize - 1, 2),
+      "exceeds the 1 bytes available");
+  VELOX_ASSERT_THROW(
+      (void)CachedRegion(
+          nonContiguousPin, std::numeric_limits<uint64_t>::max(), 1),
+      "exceeds cache entry size");
 }
 
 TEST_F(BufferedInputTest, zeroLengthStream) {

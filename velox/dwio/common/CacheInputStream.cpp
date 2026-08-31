@@ -78,6 +78,7 @@ void CacheInputStream::makeCacheEvictable() {
 }
 
 bool CacheInputStream::Next(const void** buffer, int32_t* size) {
+  lastReturnedRegion_.reset();
   if (position_ >= region_.length) {
     *size = 0;
     return false;
@@ -90,6 +91,7 @@ bool CacheInputStream::Next(const void** buffer, int32_t* size) {
 
   loadPosition();
 
+  const auto returnedOffsetInEntry = offsetOfRun_ + offsetInRun_;
   *buffer = reinterpret_cast<const void**>(run_ + offsetInRun_);
   *size = runSize_ - offsetInRun_;
   if (window_.has_value()) {
@@ -123,10 +125,24 @@ bool CacheInputStream::Next(const void** buffer, int32_t* size) {
   if (tracker_ != nullptr) {
     tracker_->recordRead(trackingId_, *size, fileNum_, groupId_);
   }
+  lastReturnedRegion_ =
+      Region{returnedOffsetInEntry, static_cast<uint64_t>(*size)};
   return true;
 }
 
+CachedRegion CacheInputStream::retainedRegionForLastNext() const {
+  VELOX_CHECK(
+      lastReturnedRegion_.has_value(),
+      "retainedRegionForLastNext requires a preceding successful Next call");
+  VELOX_CHECK(
+      !pin_.empty(),
+      "Cache pin was released while the last returned region was valid");
+  return CachedRegion{
+      pin_, lastReturnedRegion_->offset, lastReturnedRegion_->length};
+}
+
 void CacheInputStream::BackUp(int32_t count) {
+  lastReturnedRegion_.reset();
   VELOX_CHECK_GE(count, 0, "can't backup negative distances");
 
   const uint64_t unsignedCount = static_cast<uint64_t>(count);
@@ -135,6 +151,7 @@ void CacheInputStream::BackUp(int32_t count) {
 }
 
 bool CacheInputStream::SkipInt64(int64_t count) {
+  lastReturnedRegion_.reset();
   if (count < 0) {
     return false;
   }
@@ -152,6 +169,7 @@ int64_t CacheInputStream::ByteCount() const {
 }
 
 void CacheInputStream::seekToPosition(PositionProvider& seekPosition) {
+  lastReturnedRegion_.reset();
   position_ = seekPosition.next();
 }
 
@@ -171,6 +189,7 @@ size_t CacheInputStream::positionSize() const {
 }
 
 void CacheInputStream::setRemainingBytes(uint64_t remainingBytes) {
+  lastReturnedRegion_.reset();
   VELOX_CHECK_GE(region_.length, position_ + remainingBytes);
   window_ = Region{static_cast<uint64_t>(position_), remainingBytes};
 }
@@ -247,6 +266,7 @@ void CacheInputStream::loadSync(const Region& region) {
 }
 
 void CacheInputStream::clearCachePin() {
+  lastReturnedRegion_.reset();
   if (preloaded_ || pin_.empty()) {
     return;
   }

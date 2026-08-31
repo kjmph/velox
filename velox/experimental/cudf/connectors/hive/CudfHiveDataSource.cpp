@@ -36,6 +36,7 @@
 
 #include <cudf/stream_compaction.hpp>
 
+#include <algorithm>
 #include <limits>
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -299,8 +300,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   }
   cudfSplitReader_->prepareSplit(runtimeStats_);
 
-  // TODO: `completedBytes_` should be updated in `next()` as we read more and
-  // more table bytes
+  // cuDF doesn't expose consistent per-read byte accounting for every data
+  // source yet. Report the nominal file range covered by this split, clamped
+  // to the file boundary. In particular, don't charge the whole file for each
+  // bounded split.
   try {
     const auto fileHandleKey = FileHandleKey{
         .filename = split_->filePath,
@@ -309,7 +312,10 @@ void CudfHiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
     auto const fileHandleCachePtr = fileHandleFactory_->generate(
         fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
     if (fileHandleCachePtr.get() and fileHandleCachePtr.get()->file) {
-      completedBytes_ += fileHandleCachePtr->file->size();
+      const auto fileSize = fileHandleCachePtr->file->size();
+      if (split_->start < fileSize) {
+        completedBytes_ += std::min(split_->size(), fileSize - split_->start);
+      }
     }
   } catch (const std::exception& e) {
     // Unable to get the file size, log a warning and continue
@@ -375,8 +381,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   VELOX_CHECK_NOT_NULL(output, "Cudf to Velox conversion yielded a nullptr");
 
   completedRows_ += output->size();
-
-  // TODO: Update `completedBytes_` here instead of in `addSplit()`
 
   return output;
 }

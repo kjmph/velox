@@ -24,6 +24,9 @@ TEST(ConfigTest, Defaults) {
   CudfConfig config;
   ASSERT_EQ(config.distinctHashJoinEnabled, true);
   ASSERT_EQ(config.probeUniqueInnerJoinEnabled, false);
+  ASSERT_TRUE(config.hostToDeviceStagingEnabled);
+  ASSERT_EQ(config.hostToDeviceStagingWindowBytes, 128ULL << 20);
+  ASSERT_EQ(config.hostToDeviceStagingPackThreads, 4);
 }
 
 TEST(ConfigTest, DistinctHashJoinCanBeDisabled) {
@@ -41,6 +44,9 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugEnabled, "true"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
+      {CudfConfig::kCudfHostToDeviceStagingEnabled, "false"},
+      {CudfConfig::kCudfHostToDeviceStagingWindowBytes, "67108864"},
+      {CudfConfig::kCudfHostToDeviceStagingPackThreads, "3"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "50000000"},
@@ -61,6 +67,9 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugEnabled, true);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
+  ASSERT_FALSE(config.hostToDeviceStagingEnabled);
+  ASSERT_EQ(config.hostToDeviceStagingWindowBytes, 67'108'864);
+  ASSERT_EQ(config.hostToDeviceStagingPackThreads, 3);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 50000000);

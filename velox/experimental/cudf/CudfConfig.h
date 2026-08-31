@@ -42,6 +42,12 @@ struct CudfConfig {
   static constexpr const char* kCudfJitExpressionPriority{
       "cudf.jit_expression_priority"};
   static constexpr const char* kCudfOutputMr{"cudf.output_mr"};
+  static constexpr const char* kCudfHostToDeviceStagingEnabled{
+      "cudf.host_to_device_staging_enabled"};
+  static constexpr const char* kCudfHostToDeviceStagingWindowBytes{
+      "cudf.host_to_device_staging_window_bytes"};
+  static constexpr const char* kCudfHostToDeviceStagingPackThreads{
+      "cudf.host_to_device_staging_pack_threads"};
   static constexpr const char* kCudfAllowCpuFallback{"cudf.allow_cpu_fallback"};
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
@@ -102,6 +108,16 @@ struct CudfConfig {
   /// memoryResource, a separate MR is created for output allocations.
   /// When empty, the main memoryResource is used.
   std::string outputMemoryResource;
+
+  /// Whether pageable or fragmented host input should use bounded pinned
+  /// staging before asynchronous host-to-device copies.
+  bool hostToDeviceStagingEnabled{true};
+
+  /// Bytes in each of the two process-global pinned staging windows.
+  uint64_t hostToDeviceStagingWindowBytes{128ULL << 20};
+
+  /// Persistent host copy threads used to pack a staging window.
+  uint32_t hostToDeviceStagingPackThreads{4};
 
   /// Register all the functions with the functionNamePrefix.
   std::string functionNamePrefix;

@@ -15,9 +15,15 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedStagingArena.h"
 
+#include "velox/common/caching/FileIds.h"
 #include "velox/common/file/File.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/common/io/Options.h"
+#include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
 
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -33,16 +39,22 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 namespace {
 
 using namespace std::chrono_literals;
+using facebook::velox::StringIdLease;
+using facebook::velox::cache::AsyncDataCache;
+using facebook::velox::cache::ScanTracker;
 using facebook::velox::dwio::common::BufferedInput;
+using facebook::velox::dwio::common::CachedBufferedInput;
 
 class TestCudaStream {
  public:
@@ -161,6 +173,10 @@ class CudfSplitReaderHelpersTest : public testing::Test {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
+  void TearDown() override {
+    PinnedStagingArena::setAllocationFailureForTesting(false);
+  }
+
   std::shared_ptr<ExecutorBufferedInput> makeInput(
       const std::string& data,
       folly::Executor* executor) {
@@ -179,6 +195,569 @@ TEST_F(CudfSplitReaderHelpersTest, normalizeKvikioS3Uri) {
   EXPECT_EQ(normalizeKvikioUri("file:/tmp/input"), "file:/tmp/input");
   EXPECT_EQ(
       normalizeKvikioUri("https://example.test/a"), "https://example.test/a");
+}
+
+TEST_F(CudfSplitReaderHelpersTest, bufferedInputPrefersDeviceReads) {
+  folly::CPUThreadPoolExecutor executor(1);
+  BufferedInputDataSource dataSource(makeInput("buffered-input", &executor));
+
+  EXPECT_TRUE(dataSource.supports_device_read());
+  EXPECT_TRUE(dataSource.is_device_read_preferred(1));
+}
+
+TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchPreservesRequestsAndOrder) {
+  std::string inputData;
+  for (int index = 0; index < 64; ++index) {
+    inputData.push_back(static_cast<char>('A' + index % 26));
+  }
+  folly::CPUThreadPoolExecutor executor(1);
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  BufferedInputDataSource dataSource(makeInput(inputData, &executor), ioStats);
+
+  TestCudaStream stream;
+  constexpr size_t kSingleByteReads = 34;
+  rmm::device_buffer destination(
+      kSingleByteReads + 2,
+      stream.view(),
+      cudf::get_current_device_resource_ref());
+  auto* destinationData = static_cast<uint8_t*>(destination.data());
+
+  std::vector<cudf::io::datasource::device_read_request> requests;
+  requests.reserve(kSingleByteReads + 2);
+  for (size_t index = 0; index < kSingleByteReads; ++index) {
+    requests.push_back({index, 1, destinationData + index});
+  }
+  requests.push_back({9, 0, nullptr});
+  requests.push_back(
+      {inputData.size() - 2, 17, destinationData + kSingleByteReads});
+
+  auto completion = dataSource.device_read_batch_async(
+      cudf::host_span<cudf::io::datasource::device_read_request const>{
+          requests.data(), requests.size()},
+      stream.view());
+  // The datasource contract requires an immediate descriptor copy.
+  std::fill(
+      requests.begin(),
+      requests.end(),
+      cudf::io::datasource::device_read_request{0, 0, nullptr});
+
+  std::vector<size_t> expectedResults(kSingleByteReads, 1);
+  expectedResults.push_back(0);
+  expectedResults.push_back(2);
+  EXPECT_EQ(completion.get(), expectedResults);
+
+  std::string actual(kSingleByteReads + 2, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual.substr(0, kSingleByteReads), inputData.substr(0, 34));
+  EXPECT_EQ(
+      actual.substr(kSingleByteReads), inputData.substr(inputData.size() - 2));
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfBufferedDeviceReadBatches").sum, 1);
+  EXPECT_EQ(
+      metrics.at("cudfBufferedDeviceReadRequests").sum, kSingleByteReads + 2);
+  EXPECT_EQ(metrics.at("cudfBufferedDeviceReadBytes").sum, actual.size());
+  EXPECT_EQ(
+      metrics.at("cudfBufferedDeviceReadFragments").sum, kSingleByteReads + 1);
+  EXPECT_EQ(metrics.at("cudfCopiedSourceBytes").sum, actual.size());
+  EXPECT_EQ(metrics.at("cudfPinnedStagingSmallReadBypasses").sum, 1);
+  EXPECT_EQ(metrics.at("cudfDirectHostToDeviceBytes").sum, actual.size());
+}
+
+TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchRetainsCachedRuns) {
+  PinnedStagingArena::configure(false, 0, 0);
+  constexpr size_t kLoadQuantum = 64 << 10;
+  std::string inputData(kLoadQuantum * 2 + 113, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+
+  auto allocator = std::make_shared<memory::MallocAllocator>(
+      memory::MemoryAllocator::Options{
+          .capacity = 16 << 20, .reservationByteLimit = 0});
+  auto cache = AsyncDataCache::create(allocator.get());
+  auto tracker = std::make_shared<ScanTracker>(
+      "cudfBatchRetainedRuns", nullptr, kLoadQuantum);
+  auto ioStatistics = std::make_shared<facebook::velox::io::IoStatistics>();
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  folly::CPUThreadPoolExecutor executor(2);
+  facebook::velox::io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setLoadQuantum(kLoadQuantum);
+  readerOptions.setCacheable(true);
+
+  auto& ids = facebook::velox::fileIds();
+  auto input = std::make_shared<CachedBufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData),
+      facebook::velox::dwio::common::MetricsLog::voidLog(),
+      StringIdLease(ids, "cudfBatchRetainedRunsFile"),
+      cache.get(),
+      tracker,
+      StringIdLease(ids, "cudfBatchRetainedRunsGroup"),
+      ioStatistics,
+      ioStats,
+      &executor,
+      readerOptions);
+  auto dataSource = std::make_shared<BufferedInputDataSource>(input, ioStats);
+
+  constexpr size_t kFirstOffset = kLoadQuantum - 29;
+  constexpr size_t kFirstSize = 83;
+  constexpr size_t kSecondOffset = kLoadQuantum * 2 - 17;
+  constexpr size_t kSecondSize = 71;
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kFirstSize + kSecondSize,
+      stream.view(),
+      cudf::get_current_device_resource_ref());
+  auto* destinationData = static_cast<uint8_t*>(destination.data());
+  const std::vector<cudf::io::datasource::device_read_request> requests{
+      {kFirstOffset, kFirstSize, destinationData},
+      {kSecondOffset, kSecondSize, destinationData + kFirstSize}};
+
+  StreamGate gate;
+  auto entered = gate.entered.get_future();
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.view().value(), waitForGate, &gate));
+  auto completion = dataSource->device_read_batch_async(
+      cudf::host_span<cudf::io::datasource::device_read_request const>{
+          requests.data(), requests.size()},
+      stream.view());
+  // The asynchronous operation owns the BufferedInput and all pins needed by
+  // the transfer; the datasource need not remain alive after scheduling.
+  dataSource.reset();
+  input.reset();
+  auto getResult = std::async(
+      std::launch::async, [completion = std::move(completion)]() mutable {
+        return completion.get();
+      });
+
+  if (entered.wait_for(10s) != std::future_status::ready) {
+    releaseGate(gate);
+    std::ignore = getResult.get();
+    FAIL() << "CUDA stream callback did not start";
+  }
+  const auto cacheDeadline = std::chrono::steady_clock::now() + 10s;
+  while (cache->refreshStats().numEntries == 0 &&
+         std::chrono::steady_clock::now() < cacheDeadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  if (cache->refreshStats().numEntries == 0) {
+    releaseGate(gate);
+    std::ignore = getResult.get();
+    FAIL() << "Cached device read did not populate the cache";
+  }
+
+  // executeDeviceReadBatch releases its CacheInputStreams before submitting
+  // H2D. Clearing the cache while the stream is gated therefore verifies that
+  // the transfer plan's independent pins retain the source fragments.
+  cache->clear();
+  EXPECT_GT(cache->refreshStats().numEntries, 0);
+  EXPECT_EQ(getResult.wait_for(0s), std::future_status::timeout);
+  releaseGate(gate);
+  EXPECT_EQ(getResult.get(), (std::vector<size_t>{kFirstSize, kSecondSize}));
+
+  std::string actual(kFirstSize + kSecondSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(
+      actual.substr(0, kFirstSize), inputData.substr(kFirstOffset, kFirstSize));
+  EXPECT_EQ(
+      actual.substr(kFirstSize), inputData.substr(kSecondOffset, kSecondSize));
+  cache->clear();
+  EXPECT_EQ(cache->refreshStats().numEntries, 0);
+  cache->shutdown();
+}
+
+TEST_F(
+    CudfSplitReaderHelpersTest,
+    stagedDeviceReadPinsSourcesBeforeWaitingForArena) {
+  constexpr size_t kLoadQuantum = 64 << 10;
+  constexpr size_t kWindowBytes = 1 << 20;
+  constexpr size_t kReadOffset = 43;
+  constexpr size_t kReadSize = kWindowBytes + kLoadQuantum;
+  PinnedStagingArena::configure(true, kWindowBytes, 2);
+  auto arenaBlocker = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(arenaBlocker.has_value());
+
+  std::string inputData(kReadOffset + kReadSize, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+
+  auto allocator = std::make_shared<memory::MallocAllocator>(
+      memory::MemoryAllocator::Options{
+          .capacity = 32 << 20, .reservationByteLimit = 0});
+  auto cache = AsyncDataCache::create(allocator.get());
+  auto tracker = std::make_shared<ScanTracker>(
+      "cudfStagedReadPinsBeforeArena", nullptr, kLoadQuantum);
+  auto ioStatistics = std::make_shared<facebook::velox::io::IoStatistics>();
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  folly::CPUThreadPoolExecutor executor(2);
+  facebook::velox::io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setLoadQuantum(kLoadQuantum);
+  readerOptions.setCacheable(true);
+
+  auto& ids = facebook::velox::fileIds();
+  auto input = std::make_shared<CachedBufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData),
+      facebook::velox::dwio::common::MetricsLog::voidLog(),
+      StringIdLease(ids, "cudfStagedReadPinsBeforeArenaFile"),
+      cache.get(),
+      tracker,
+      StringIdLease(ids, "cudfStagedReadPinsBeforeArenaGroup"),
+      ioStatistics,
+      ioStats,
+      &executor,
+      readerOptions);
+  BufferedInputDataSource dataSource(input, ioStats);
+
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+  auto completion = dataSource.device_read_async(
+      kReadOffset,
+      kReadSize,
+      static_cast<uint8_t*>(destination.data()),
+      stream.view());
+  auto getResult = std::async(
+      std::launch::async, [completion = std::move(completion)]() mutable {
+        return completion.get();
+      });
+
+  bool waitingForArena = false;
+  const auto waitingDeadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < waitingDeadline) {
+    const auto metrics = ioStats->stats();
+    const auto attempt = metrics.find("cudfPinnedStagingAttempts");
+    if (attempt != metrics.end() && attempt->second.sum == 1) {
+      waitingForArena = true;
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  if (!waitingForArena) {
+    arenaBlocker->release();
+    std::ignore = getResult.get();
+    FAIL() << "Device read did not reach the occupied staging arena";
+  }
+
+  // Reaching acquirePair means storage loading, Next(), and exact-region
+  // retention are complete. Clearing the cache while the arena is occupied
+  // must leave those entries pinned, proving no later storage retry can occur
+  // under the arena lease.
+  cache->clear();
+  EXPECT_GT(cache->refreshStats().numEntries, 0);
+  EXPECT_EQ(getResult.wait_for(0s), std::future_status::timeout);
+
+  arenaBlocker->release();
+  EXPECT_EQ(getResult.get(), kReadSize);
+  std::string actual(kReadSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData.substr(kReadOffset, kReadSize));
+
+  cache->clear();
+  EXPECT_EQ(cache->refreshStats().numEntries, 0);
+  EXPECT_GT(ioStats->stats().at("cudfPinnedStagingAcquireNanos").sum, 0);
+  cache->shutdown();
+}
+
+TEST_F(
+    CudfSplitReaderHelpersTest,
+    stagedDeviceReadReleasesCachePinsBeforeH2DCompletes) {
+  constexpr size_t kLoadQuantum = 64 << 10;
+  constexpr size_t kWindowBytes = 1 << 20;
+  constexpr size_t kReadOffset = 37;
+  constexpr size_t kReadSize = kWindowBytes + kLoadQuantum;
+  PinnedStagingArena::configure(true, kWindowBytes, 2);
+
+  std::string inputData(kReadOffset + kReadSize, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+
+  auto allocator = std::make_shared<memory::MallocAllocator>(
+      memory::MemoryAllocator::Options{
+          .capacity = 32 << 20, .reservationByteLimit = 0});
+  auto cache = AsyncDataCache::create(allocator.get());
+  auto tracker = std::make_shared<ScanTracker>(
+      "cudfStagedReadReleasesPins", nullptr, kLoadQuantum);
+  auto ioStatistics = std::make_shared<facebook::velox::io::IoStatistics>();
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  folly::CPUThreadPoolExecutor executor(2);
+  facebook::velox::io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setLoadQuantum(kLoadQuantum);
+  readerOptions.setCacheable(true);
+
+  auto& ids = facebook::velox::fileIds();
+  auto input = std::make_shared<CachedBufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData),
+      facebook::velox::dwio::common::MetricsLog::voidLog(),
+      StringIdLease(ids, "cudfStagedReadReleasesPinsFile"),
+      cache.get(),
+      tracker,
+      StringIdLease(ids, "cudfStagedReadReleasesPinsGroup"),
+      ioStatistics,
+      ioStats,
+      &executor,
+      readerOptions);
+  auto dataSource = std::make_shared<BufferedInputDataSource>(input, ioStats);
+
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+  const std::vector<cudf::io::datasource::device_read_request> requests{{
+      kReadOffset,
+      kReadSize,
+      static_cast<uint8_t*>(destination.data()),
+  }};
+
+  StreamGate gate;
+  auto entered = gate.entered.get_future();
+  CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.view().value(), waitForGate, &gate));
+  auto completion = dataSource->device_read_batch_async(
+      cudf::host_span<cudf::io::datasource::device_read_request const>{
+          requests.data(), requests.size()},
+      stream.view());
+  auto getResult = std::async(
+      std::launch::async, [completion = std::move(completion)]() mutable {
+        return completion.get();
+      });
+
+  if (entered.wait_for(10s) != std::future_status::ready) {
+    releaseGate(gate);
+    std::ignore = getResult.get();
+    FAIL() << "CUDA stream callback did not start";
+  }
+
+  const auto populatedDeadline = std::chrono::steady_clock::now() + 10s;
+  while (cache->refreshStats().numEntries == 0 &&
+         std::chrono::steady_clock::now() < populatedDeadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  if (cache->refreshStats().numEntries == 0) {
+    releaseGate(gate);
+    std::ignore = getResult.get();
+    FAIL() << "Staged device read did not populate the cache";
+  }
+
+  // Both windows can hold this request, so every cache source can be packed
+  // even though the stream gate prevents either H2D copy from completing.
+  const auto releaseDeadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    cache->clear();
+    if (cache->refreshStats().numEntries == 0) {
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
+  } while (std::chrono::steady_clock::now() < releaseDeadline);
+  if (cache->refreshStats().numEntries != 0) {
+    releaseGate(gate);
+    std::ignore = getResult.get();
+    FAIL() << "Cache pins remained after their bytes were staged";
+  }
+  EXPECT_EQ(getResult.wait_for(0s), std::future_status::timeout);
+
+  releaseGate(gate);
+  EXPECT_EQ(getResult.get(), (std::vector<size_t>{kReadSize}));
+  std::string actual(kReadSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData.substr(kReadOffset, kReadSize));
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfBufferedDeviceReadBatches").sum, 1);
+  EXPECT_EQ(metrics.at("cudfBufferedDeviceReadBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.at("cudfCacheBackedSourceBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingTransfers").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingWindows").sum, 2);
+  EXPECT_EQ(metrics.count("cudfPinnedStagingFallbacks"), 0);
+  cache->shutdown();
+}
+
+TEST_F(CudfSplitReaderHelpersTest, stagedDeviceReadRollsAcrossBothWindows) {
+  constexpr size_t kWindowBytes = 256 << 10;
+  constexpr size_t kReadSize = (2 << 20) + 113;
+  PinnedStagingArena::configure(true, kWindowBytes, 4);
+
+  std::string inputData(kReadSize, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+  auto input = std::make_shared<BufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData), *pool_);
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  BufferedInputDataSource dataSource(input, ioStats);
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+
+  auto completion = dataSource.device_read_async(
+      0, kReadSize, static_cast<uint8_t*>(destination.data()), stream.view());
+  EXPECT_EQ(completion.get(), kReadSize);
+
+  std::string actual(kReadSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData);
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfPinnedStagingAttempts").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingTransfers").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingWindows").sum, 9);
+  EXPECT_EQ(metrics.at("cudfCopiedSourceBytes").sum, kReadSize);
+}
+
+TEST_F(CudfSplitReaderHelpersTest, asyncLoadCompletesBeforePinnedStaging) {
+  constexpr size_t kReadSize = (1 << 20) + 31;
+  PinnedStagingArena::configure(true, 256 << 10, 2);
+
+  std::string inputData(kReadSize, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+  folly::CPUThreadPoolExecutor executor(1);
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  BufferedInputDataSource dataSource(makeInput(inputData, &executor), ioStats);
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+
+  EXPECT_EQ(
+      dataSource
+          .device_read_async(
+              0,
+              kReadSize,
+              static_cast<uint8_t*>(destination.data()),
+              stream.view())
+          .get(),
+      kReadSize);
+
+  std::string actual(kReadSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData);
+
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfPinnedStagingAttempts").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingTransfers").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.at("cudfCopiedSourceBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.count("cudfDirectHostToDeviceBytes"), 0);
+}
+
+TEST_F(CudfSplitReaderHelpersTest, disabledStagingIsNotAFailure) {
+  constexpr size_t kReadSize = (1 << 20) + 13;
+  PinnedStagingArena::configure(false, 0, 0);
+
+  std::string inputData(kReadSize, 'd');
+  auto input = std::make_shared<BufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData), *pool_);
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  BufferedInputDataSource dataSource(input, ioStats);
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+
+  EXPECT_EQ(
+      dataSource
+          .device_read_async(
+              0,
+              kReadSize,
+              static_cast<uint8_t*>(destination.data()),
+              stream.view())
+          .get(),
+      kReadSize);
+
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfPinnedStagingDisabledBypasses").sum, 1);
+  EXPECT_EQ(metrics.at("cudfDirectHostToDeviceBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.count("cudfPinnedStagingAttempts"), 0);
+  EXPECT_EQ(metrics.count("cudfPinnedStagingFallbacks"), 0);
+}
+
+TEST_F(CudfSplitReaderHelpersTest, stagingAllocationFailureFallsBack) {
+  constexpr size_t kReadSize = (1 << 20) + 17;
+  PinnedStagingArena::setAllocationFailureForTesting(true);
+  PinnedStagingArena::configure(true, 256 << 10, 2);
+
+  std::string inputData(kReadSize, '\0');
+  for (size_t index = 0; index < inputData.size(); ++index) {
+    inputData[index] = static_cast<char>(index % 251);
+  }
+  auto input = std::make_shared<BufferedInput>(
+      std::make_shared<InMemoryReadFile>(inputData), *pool_);
+  auto ioStats = std::make_shared<facebook::velox::IoStats>();
+  BufferedInputDataSource dataSource(input, ioStats);
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      kReadSize, stream.view(), cudf::get_current_device_resource_ref());
+
+  auto completion = dataSource.device_read_async(
+      0, kReadSize, static_cast<uint8_t*>(destination.data()), stream.view());
+  EXPECT_EQ(completion.get(), kReadSize);
+
+  std::string actual(kReadSize, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData);
+  const auto metrics = ioStats->stats();
+  EXPECT_EQ(metrics.at("cudfPinnedStagingAttempts").sum, 1);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingFallbacks").sum, 1);
+  EXPECT_EQ(metrics.at("cudfDirectHostToDeviceBytes").sum, kReadSize);
+  EXPECT_EQ(metrics.count("cudfPinnedStagingBytes"), 0);
+}
+
+TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchRejectsNullDestination) {
+  folly::CPUThreadPoolExecutor executor(1);
+  BufferedInputDataSource dataSource(makeInput("buffered-input", &executor));
+  const std::vector<cudf::io::datasource::device_read_request> requests{
+      {0, 0, nullptr}, {0, 1, nullptr}};
+
+  EXPECT_THROW(
+      dataSource.device_read_batch_async(
+          cudf::host_span<cudf::io::datasource::device_read_request const>{
+              requests.data(), requests.size()},
+          cudf::get_default_stream()),
+      VeloxException);
+}
+
+TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchClampsOverflowingExtent) {
+  folly::CPUThreadPoolExecutor executor(1);
+  BufferedInputDataSource dataSource(makeInput("short-input", &executor));
+  TestCudaStream stream;
+  rmm::device_buffer destination(
+      1, stream.view(), cudf::get_current_device_resource_ref());
+  const std::vector<cudf::io::datasource::device_read_request> requests{{
+      std::numeric_limits<size_t>::max() - 1,
+      4,
+      static_cast<uint8_t*>(destination.data()),
+  }};
+
+  auto completion = dataSource.device_read_batch_async(
+      cudf::host_span<cudf::io::datasource::device_read_request const>{
+          requests.data(), requests.size()},
+      stream.view());
+  EXPECT_EQ(completion.get(), (std::vector<size_t>{0}));
 }
 
 TEST_F(CudfSplitReaderHelpersTest, deviceReadFutureWaitsForDeviceCopy) {
@@ -206,10 +785,15 @@ TEST_F(CudfSplitReaderHelpersTest, deviceReadFutureWaitsForDeviceCopy) {
     std::ignore = completion.get();
     FAIL() << "CUDA stream callback did not start";
   }
-  EXPECT_EQ(completion.wait_for(0s), std::future_status::timeout);
+
+  auto completionWaiter = std::async(
+      std::launch::async, [completion = std::move(completion)]() mutable {
+        return completion.get();
+      });
+  EXPECT_EQ(completionWaiter.wait_for(100ms), std::future_status::timeout);
   releaseGate(gate);
 
-  EXPECT_EQ(completion.get(), inputData.size());
+  EXPECT_EQ(completionWaiter.get(), inputData.size());
   std::string actual(inputData.size(), '\0');
   CUDF_CUDA_TRY(cudaMemcpy(
       actual.data(),
@@ -219,50 +803,79 @@ TEST_F(CudfSplitReaderHelpersTest, deviceReadFutureWaitsForDeviceCopy) {
   EXPECT_EQ(actual, inputData);
 }
 
-TEST_F(CudfSplitReaderHelpersTest, bufferedLoadWaitsForDeviceCopies) {
-  const std::string inputData = "first-range-second-range";
+TEST_F(CudfSplitReaderHelpersTest, synchronousDeviceReadVariants) {
+  const std::string inputData = "synchronous-device-read";
   folly::CPUThreadPoolExecutor executor(1);
-  auto input = makeInput(inputData, &executor);
-  BufferedInputDataSource dataSource(input);
+  BufferedInputDataSource dataSource(makeInput(inputData, &executor));
+  TestCudaStream stream;
+
+  rmm::device_buffer destination(
+      inputData.size(), stream.view(), cudf::get_current_device_resource_ref());
+  const auto bytesRead = dataSource.device_read(
+      2,
+      inputData.size(),
+      static_cast<uint8_t*>(destination.data()),
+      stream.view());
+  ASSERT_EQ(bytesRead, inputData.size() - 2);
+  std::string actual(bytesRead, '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(),
+      destination.data(),
+      actual.size(),
+      cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData.substr(2));
+
+  auto owning = dataSource.device_read(1, 7, stream.view());
+  ASSERT_EQ(owning->size(), 7);
+  actual.assign(owning->size(), '\0');
+  CUDF_CUDA_TRY(cudaMemcpy(
+      actual.data(), owning->data(), actual.size(), cudaMemcpyDeviceToHost));
+  EXPECT_EQ(actual, inputData.substr(1, 7));
+}
+
+TEST_F(CudfSplitReaderHelpersTest, discardedDeviceBatchWaitsForDeviceCopy) {
+  const std::string inputData = "discarded-device-batch";
+  folly::CPUThreadPoolExecutor executor(1);
+  auto dataSource = std::make_shared<BufferedInputDataSource>(
+      makeInput(inputData, &executor));
 
   TestCudaStream stream;
   rmm::device_buffer destination(
       inputData.size(), stream.view(), cudf::get_current_device_resource_ref());
-  dataSource.enqueueForDevice(
-      0, inputData.size(), static_cast<uint8_t*>(destination.data()));
+  const std::vector<cudf::io::datasource::device_read_request> requests{{
+      0,
+      inputData.size(),
+      static_cast<uint8_t*>(destination.data()),
+  }};
 
   StreamGate gate;
   auto entered = gate.entered.get_future();
   CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.view().value(), waitForGate, &gate));
+  auto completion = dataSource->device_read_batch_async(
+      cudf::host_span<cudf::io::datasource::device_read_request const>{
+          requests.data(), requests.size()},
+      stream.view());
+  dataSource.reset();
 
-  auto completion =
-      std::async(std::launch::async, [&] { dataSource.load(stream.view()); });
-
+  auto discard = std::async(
+      std::launch::async, [completion = std::move(completion)]() mutable {
+        completion = std::future<std::vector<size_t>>{};
+      });
   if (entered.wait_for(10s) != std::future_status::ready) {
     releaseGate(gate);
-    completion.get();
+    discard.get();
     FAIL() << "CUDA stream callback did not start";
   }
-  EXPECT_EQ(completion.wait_for(0s), std::future_status::timeout);
+  EXPECT_EQ(discard.wait_for(0s), std::future_status::timeout);
   releaseGate(gate);
-  EXPECT_NO_THROW(completion.get());
-
-  std::string actual(inputData.size(), '\0');
-  CUDF_CUDA_TRY(cudaMemcpy(
-      actual.data(),
-      destination.data(),
-      actual.size(),
-      cudaMemcpyDeviceToHost));
-  EXPECT_EQ(actual, inputData);
+  EXPECT_NO_THROW(discard.get());
 }
 
-TEST_F(CudfSplitReaderHelpersTest, discardedBufferedFutureRollsBackBatch) {
-  const std::string inputData = "discarded-buffered-read";
+TEST_F(CudfSplitReaderHelpersTest, fetchByteRangesAcceptsEmptyBatch) {
   folly::CPUThreadPoolExecutor executor(1);
-  auto input = makeInput(inputData, &executor);
-  auto dataSource = std::make_shared<BufferedInputDataSource>(input);
-  const std::vector<cudf::io::text::byte_range_info> ranges{
-      {0, static_cast<int64_t>(inputData.size())}};
+  auto dataSource = std::make_shared<BufferedInputDataSource>(
+      makeInput("empty-range-batch", &executor));
+  const std::vector<cudf::io::text::byte_range_info> ranges;
   TestCudaStream stream;
 
   auto [buffers, spans, completion] = fetchByteRangesAsync(
@@ -271,10 +884,65 @@ TEST_F(CudfSplitReaderHelpersTest, discardedBufferedFutureRollsBackBatch) {
           ranges.data(), ranges.size()},
       stream.view(),
       cudf::get_current_device_resource_ref());
-  EXPECT_EQ(dataSource->pendingDeviceLoadCount(), 1);
+  ASSERT_EQ(buffers.size(), 1);
+  EXPECT_EQ(buffers.front().size(), 0);
+  EXPECT_TRUE(spans.empty());
+  EXPECT_NO_THROW(completion.get());
+}
 
-  completion = std::future<void>{};
-  EXPECT_EQ(dataSource->pendingDeviceLoadCount(), 0);
+TEST_F(CudfSplitReaderHelpersTest, fetchByteRangesAcceptsZeroSizedRanges) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto dataSource = std::make_shared<BufferedInputDataSource>(
+      makeInput("zero-sized-ranges", &executor));
+  const std::vector<cudf::io::text::byte_range_info> ranges{
+      {0, 0}, {std::numeric_limits<int64_t>::max(), 0}};
+  TestCudaStream stream;
+
+  auto [buffers, spans, completion] = fetchByteRangesAsync(
+      dataSource,
+      cudf::host_span<const cudf::io::text::byte_range_info>{
+          ranges.data(), ranges.size()},
+      stream.view(),
+      cudf::get_current_device_resource_ref());
+  ASSERT_EQ(buffers.size(), 1);
+  EXPECT_EQ(buffers.front().size(), 0);
+  ASSERT_EQ(spans.size(), ranges.size());
+  EXPECT_TRUE(spans[0].empty());
+  EXPECT_TRUE(spans[1].empty());
+  EXPECT_NO_THROW(completion.get());
+}
+
+TEST_F(
+    CudfSplitReaderHelpersTest,
+    fetchByteRangesRejectsInvalidRangesBeforeAllocation) {
+  folly::CPUThreadPoolExecutor executor(1);
+  auto dataSource = std::make_shared<BufferedInputDataSource>(
+      makeInput("invalid-ranges", &executor));
+  TestCudaStream stream;
+
+  const auto fetch = [&](const auto& ranges) {
+    return fetchByteRangesAsync(
+        dataSource,
+        cudf::host_span<const cudf::io::text::byte_range_info>{
+            ranges.data(), ranges.size()},
+        stream.view(),
+        cudf::get_current_device_resource_ref());
+  };
+
+  const std::vector<cudf::io::text::byte_range_info> negativeOffset{{-1, 1}};
+  EXPECT_THROW((void)fetch(negativeOffset), VeloxException);
+
+  const std::vector<cudf::io::text::byte_range_info> negativeSize{{0, -1}};
+  EXPECT_THROW((void)fetch(negativeSize), VeloxException);
+
+  constexpr auto kMaximumRange = std::numeric_limits<int64_t>::max();
+  const std::vector<cudf::io::text::byte_range_info> totalSizeOverflow{
+      {0, kMaximumRange}, {0, kMaximumRange}, {0, 2}};
+  EXPECT_THROW((void)fetch(totalSizeOverflow), VeloxException);
+
+  const std::vector<cudf::io::text::byte_range_info> paddedSizeOverflow{
+      {0, kMaximumRange}, {0, kMaximumRange}, {0, 1}};
+  EXPECT_THROW((void)fetch(paddedSizeOverflow), VeloxException);
 }
 
 TEST_F(CudfSplitReaderHelpersTest, discardedFutureDrainsBeforeDatasourceDies) {

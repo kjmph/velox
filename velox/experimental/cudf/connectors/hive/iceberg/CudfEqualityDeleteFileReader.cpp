@@ -110,7 +110,8 @@ CudfEqualityDeleteFileReader::CudfEqualityDeleteFileReader(
   // Directly read the Parquet-format equality delete file to the
   // deleteKeyTable_ using cuDF
   if (deleteFile.fileFormat == dwio::common::FileFormat::PARQUET) {
-    directReadEqualityDeleteFile(deleteFile, std::move(deleteFileInput));
+    directReadEqualityDeleteFile(
+        deleteFile, std::move(deleteFileInput), ioStats);
     return;
   }
 
@@ -160,15 +161,16 @@ CudfEqualityDeleteFileReader::CudfEqualityDeleteFileReader(
 
 void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
     const velox_iceberg::IcebergDeleteFile& deleteFile,
-    std::shared_ptr<dwio::common::BufferedInput> bufferedInput) {
+    std::shared_ptr<dwio::common::BufferedInput> bufferedInput,
+    const std::shared_ptr<::facebook::velox::IoStats>& ioStats) {
   using cudf_velox::connector::hive::BufferedInputDataSource;
 
   // Create a cuDF data source
   std::shared_ptr<cudf::io::datasource> dataSource;
   auto sourceInfo = [&]() {
     if (bufferedInput) {
-      dataSource =
-          std::make_shared<BufferedInputDataSource>(std::move(bufferedInput));
+      dataSource = std::make_shared<BufferedInputDataSource>(
+          std::move(bufferedInput), ioStats);
       return cudf::io::source_info{dataSource.get()};
     }
     return cudf::io::source_info{normalizeKvikioUri(deleteFile.filePath)};

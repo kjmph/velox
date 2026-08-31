@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedStagingArena.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
@@ -315,6 +316,11 @@ void registerCudf() {
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
 
+  connector::hive::PinnedStagingArena::configure(
+      CudfConfig::getInstance().hostToDeviceStagingEnabled,
+      CudfConfig::getInstance().hostToDeviceStagingWindowBytes,
+      CudfConfig::getInstance().hostToDeviceStagingPackThreads);
+
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
       mrMode, CudfConfig::getInstance().memoryPercent, true);
@@ -349,6 +355,7 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  connector::hive::PinnedStagingArena::reset();
   output_mr_.reset();
   mr_.reset();
   clearCurrentDeviceMemoryInfo();
@@ -385,6 +392,18 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];
+  }
+  if (config.find(kCudfHostToDeviceStagingEnabled) != config.end()) {
+    hostToDeviceStagingEnabled =
+        folly::to<bool>(config[kCudfHostToDeviceStagingEnabled]);
+  }
+  if (config.find(kCudfHostToDeviceStagingWindowBytes) != config.end()) {
+    hostToDeviceStagingWindowBytes =
+        folly::to<uint64_t>(config[kCudfHostToDeviceStagingWindowBytes]);
+  }
+  if (config.find(kCudfHostToDeviceStagingPackThreads) != config.end()) {
+    hostToDeviceStagingPackThreads =
+        folly::to<uint32_t>(config[kCudfHostToDeviceStagingPackThreads]);
   }
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
     batchSizeMinThreshold =

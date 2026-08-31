@@ -71,25 +71,15 @@ endif()
 velox_resolve_dependency_url(kvikio)
 
 set(VELOX_cudf_VERSION 26.08 CACHE STRING "cudf version")
-if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
-  # Direct S3 receive requires cuDF to drain every issued datasource future
-  # and fence asynchronous device I/O before source or destination storage can
-  # unwind. Keep the output-transport pin unchanged for ordinary cuDF builds.
-  set(VELOX_cudf_COMMIT cfa634eaee86ee8fb21fbeb6b5b2f8e7421be7f4)
-  set(
-    VELOX_cudf_BUILD_SHA256_CHECKSUM
-    8a7b19fb7d70a0b83dbee4fe71e17b4892a6dd7209e65dbad63047e808cf6bd1
-  )
-  set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
-else()
-  # kjmph/cudf commit based on 4302ee8 with hash-partition concurrency diagnostics
-  set(VELOX_cudf_COMMIT 6229a9bc4775f60d555d6d43fdbebd37079b8704)
-  set(
-    VELOX_cudf_BUILD_SHA256_CHECKSUM
-    d326ee7b2441db3fcd34c47c406ac81290ec6eb27deb74f4fb7e6f0ca94e47b8
-  )
-  set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
-endif()
+# GPU input uses cuDF's lifetime-safe asynchronous reads and optional batched
+# datasource interface regardless of the selected S3 reader mode. Keep one pin
+# for direct-receive and ordinary builds so both expose the same datasource ABI.
+set(VELOX_cudf_COMMIT 285b175a37736f4204395b4c293bf111f0ac34a0)
+set(
+  VELOX_cudf_BUILD_SHA256_CHECKSUM
+  c09034cad016449bc4f7f010e71417aee2519e7fb536bfc8aa5acd88906220bf
+)
+set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Probe for a system UCX install. The variables are used only to gate ucxx

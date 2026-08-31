@@ -137,7 +137,8 @@ class CudfEqualityDeleteFileReader {
   // deleteKeyTable_ cudf table.
   void directReadEqualityDeleteFile(
       const velox_iceberg::IcebergDeleteFile& deleteFile,
-      std::shared_ptr<dwio::common::BufferedInput> bufferedInput);
+      std::shared_ptr<dwio::common::BufferedInput> bufferedInput,
+      const std::shared_ptr<::facebook::velox::IoStats>& ioStats);
 
   // Lazily constructs the equality column indices in the input table
   // on the first call to applyDeletes().

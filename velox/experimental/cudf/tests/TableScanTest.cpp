@@ -829,36 +829,51 @@ TEST_F(TableScanTest, splitOffsetAndLength) {
   writeToFile(filePath->getPath(), vectors);
   createDuckDbTable(vectors);
 
+  const auto fileSize = fs::file_size(filePath->getPath());
+
   // Note that the number of row groups selected within `halfFileSize` may
   // change in the future and this test may start failing. In such a case,
   // just adjust the duckdb sql string accordingly.
-  const auto halfFileSize = fs::file_size(filePath->getPath()) / 2;
+  const auto halfFileSize = fileSize / 2;
 
-  // First half of file - OFFSET 0 LIMIT 6000
-  assertQuery(
-      tableScanNode(),
-      makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize),
-      "SELECT * FROM tmp OFFSET 0 LIMIT 6000");
+  auto rawInputBytes = [](const std::shared_ptr<Task>& task,
+                          const PlanNodeId& scanNodeId) {
+    return toPlanStats(task->taskStats()).at(scanNodeId).rawInputBytes;
+  };
 
-  // Second half of file - OFFSET 6000 LIMIT 4000
-  assertQuery(
-      tableScanNode(),
-      makeCudfHiveConnectorSplit(filePath->getPath(), halfFileSize),
+  // Two adjacent splits cover the file exactly. Make the second split longer
+  // than the remaining suffix to exercise clamping at the file boundary.
+  auto plan = tableScanNode();
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(plan)
+          .maxDrivers(1)
+          .splits(
+              {makeCudfHiveConnectorSplit(filePath->getPath(), 0, halfFileSize),
+               makeCudfHiveConnectorSplit(
+                   filePath->getPath(), halfFileSize, fileSize)})
+          .assertResults("SELECT * FROM tmp");
+  EXPECT_EQ(rawInputBytes(task, plan->id()), fileSize);
+
+  // An unbounded suffix contributes only the bytes remaining in the file.
+  plan = tableScanNode();
+  task = assertQuery(
+      plan,
+      makeCudfHiveConnectorSplit(
+          filePath->getPath(),
+          halfFileSize,
+          std::numeric_limits<uint64_t>::max()),
       "SELECT * FROM tmp OFFSET 6000 LIMIT 4000");
+  EXPECT_EQ(rawInputBytes(task, plan->id()), fileSize - halfFileSize);
 
-  const auto fileSize = fs::file_size(filePath->getPath());
-
-  // All row groups
-  assertQuery(
-      tableScanNode(),
-      makeCudfHiveConnectorSplit(filePath->getPath(), 0, fileSize),
-      "SELECT * FROM tmp");
-
-  // No row groups
-  assertQuery(
-      tableScanNode(),
-      makeCudfHiveConnectorSplit(filePath->getPath(), fileSize),
+  // A split beginning at EOF contributes no bytes and reads no row groups.
+  plan = tableScanNode();
+  task = assertQuery(
+      plan,
+      makeCudfHiveConnectorSplit(
+          filePath->getPath(), fileSize, std::numeric_limits<uint64_t>::max()),
       "SELECT * FROM tmp LIMIT 0");
+  EXPECT_EQ(rawInputBytes(task, plan->id()), 0);
 }
 
 // Verify that extractFiltersFromRemainingFilter extracts simple single-column

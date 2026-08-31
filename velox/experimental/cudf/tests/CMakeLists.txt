@@ -164,6 +164,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_pinned_staging_arena_test
+  SOURCES Main.cpp PinnedStagingArenaTest.cpp
+  LIBS velox_cudf_hive_connector Folly::folly
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_hash_join_test
   SOURCES HashJoinTest.cpp Main.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_vector_fuzzer Folly::folly fmt::fmt

@@ -71,12 +71,12 @@ velox_resolve_dependency_url(kvikio)
 
 set(VELOX_cudf_VERSION 26.08 CACHE STRING "cudf version")
 # GPU input uses cuDF's lifetime-safe asynchronous reads and batched datasource
-# interface regardless of the selected S3 reader mode. Keep one pin for direct
-# receive and ordinary builds so both expose the same datasource ABI.
-set(VELOX_cudf_COMMIT bf2183a5e5b2be70c36de73bd331cb3bf8d99794)
+# interface, including its exported host worker pool, regardless of the selected
+# S3 reader mode. Keep one pin so both build modes expose the same datasource ABI.
+set(VELOX_cudf_COMMIT 4e6bc63cec146e3aca99a55175f541f91a5acab2)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  1ea5c52be7684bddec428a17c40bc3d4f663e07e8550aca055b29db5050f7386
+  1cc98ceaa3a54c32c0b26433d1de6451a9af7c9d4630795339ca82f2284c7348
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/kjmph/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)

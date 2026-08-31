@@ -617,6 +617,31 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     }
 
     return tree.push(createLiteral(value, scalars));
+  } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
+    // Classify fields by expression type before consulting operator names.
+    // Planner-generated symbols may legitimately be named after an operator
+    // (for example, a projected Q14 expression named "multiply"). Such a
+    // field has no inputs and must not be interpreted as a binary call.
+    const auto fieldName =
+        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
+    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
+      auto& schema = inputRowSchema[sideIdx];
+      if (schema.get()->containsChild(fieldName)) {
+        auto columnIndex = schema.get()->getChildIdx(fieldName);
+        // This column may be complex data type like ROW, we need to get the
+        // name from row. Push fieldName.name to the tree.
+        auto side = static_cast<cudf::ast::table_reference>(sideIdx);
+        if (fieldExpr->field() == fieldName) {
+          return tree.push(cudf::ast::column_reference(columnIndex, side));
+        } else if (!allowPureAstOnly) {
+          return addPrecomputeInstruction(
+              fieldName, "nested_column", fieldExpr->field());
+        } else {
+          VELOX_FAIL("Unsupported type for nested column operation");
+        }
+      }
+    }
+    VELOX_FAIL("Field not found: {}", name);
   } else if (binaryOps.find(name) != binaryOps.end()) {
     if (name == "and" or name == "or") {
       return multipleInputsToPairWise(expr);
@@ -701,28 +726,6 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     } else {
       VELOX_FAIL("Unsupported type for cast operation");
     }
-  } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
-    // Refer to the appropriate side
-    const auto fieldName =
-        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
-    for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
-      auto& schema = inputRowSchema[sideIdx];
-      if (schema.get()->containsChild(fieldName)) {
-        auto columnIndex = schema.get()->getChildIdx(fieldName);
-        // This column may be complex data type like ROW, we need to get the
-        // name from row. Push fieldName.name to the tree.
-        auto side = static_cast<cudf::ast::table_reference>(sideIdx);
-        if (fieldExpr->field() == fieldName) {
-          return tree.push(cudf::ast::column_reference(columnIndex, side));
-        } else if (!allowPureAstOnly) {
-          return addPrecomputeInstruction(
-              fieldName, "nested_column", fieldExpr->field());
-        } else {
-          VELOX_FAIL("Unsupported type for nested column operation");
-        }
-      }
-    }
-    VELOX_FAIL("Field not found: {}", name);
   } else {
     VELOX_UNREACHABLE("Unsupported expression: {}", name);
   }

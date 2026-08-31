@@ -99,6 +99,13 @@ TEST_F(CudfExpressionSelectionTest, astRoot) {
   ASSERT_TRUE(ast != nullptr || jit != nullptr);
 }
 
+TEST_F(CudfExpressionSelectionTest, astOperatorNamedInputColumn) {
+  auto rowType = ROW({{"multiply", DOUBLE()}});
+  auto expr = compileExecExpr("multiply + 1.0", rowType, execCtx_.get());
+
+  EXPECT_NO_THROW(ASTExpression(expr, rowType));
+}
+
 TEST_F(CudfExpressionSelectionTest, functionRoot) {
   auto expr = compileExecExpr("lower(name)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/false));

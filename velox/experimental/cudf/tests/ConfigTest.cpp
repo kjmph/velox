@@ -27,6 +27,7 @@ TEST(ConfigTest, Defaults) {
   ASSERT_TRUE(config.hostToDeviceStagingEnabled);
   ASSERT_EQ(config.hostToDeviceStagingWindowBytes, 128ULL << 20);
   ASSERT_EQ(config.hostToDeviceStagingPackThreads, 4);
+  ASSERT_EQ(config.hostToDeviceStagingWindowSets, 2);
 }
 
 TEST(ConfigTest, DistinctHashJoinCanBeDisabled) {
@@ -47,6 +48,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfHostToDeviceStagingEnabled, "false"},
       {CudfConfig::kCudfHostToDeviceStagingWindowBytes, "67108864"},
       {CudfConfig::kCudfHostToDeviceStagingPackThreads, "3"},
+      {CudfConfig::kCudfHostToDeviceStagingWindowSets, "5"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "50000000"},
@@ -71,6 +73,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_FALSE(config.hostToDeviceStagingEnabled);
   ASSERT_EQ(config.hostToDeviceStagingWindowBytes, 67'108'864);
   ASSERT_EQ(config.hostToDeviceStagingPackThreads, 3);
+  ASSERT_EQ(config.hostToDeviceStagingWindowSets, 5);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 50000000);

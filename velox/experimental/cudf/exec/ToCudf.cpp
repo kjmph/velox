@@ -319,7 +319,8 @@ void registerCudf() {
   connector::hive::PinnedStagingArena::configure(
       CudfConfig::getInstance().hostToDeviceStagingEnabled,
       CudfConfig::getInstance().hostToDeviceStagingWindowBytes,
-      CudfConfig::getInstance().hostToDeviceStagingPackThreads);
+      CudfConfig::getInstance().hostToDeviceStagingPackThreads,
+      CudfConfig::getInstance().hostToDeviceStagingWindowSets);
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
@@ -404,6 +405,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfHostToDeviceStagingPackThreads) != config.end()) {
     hostToDeviceStagingPackThreads =
         folly::to<uint32_t>(config[kCudfHostToDeviceStagingPackThreads]);
+  }
+  if (config.find(kCudfHostToDeviceStagingWindowSets) != config.end()) {
+    hostToDeviceStagingWindowSets =
+        folly::to<uint32_t>(config[kCudfHostToDeviceStagingWindowSets]);
   }
   if (config.find(kCudfBatchSizeMinThreshold) != config.end()) {
     batchSizeMinThreshold =

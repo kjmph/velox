@@ -1538,11 +1538,15 @@ Note: These configurations are experimental and subject to change.
    * - cudf.host_to_device_staging_window_bytes
      - integer
      - 134217728
-     - Size in bytes of each of the two process-wide pinned host staging windows.
+     - Size in bytes of each process-wide pinned host staging window.
    * - cudf.host_to_device_staging_pack_threads
      - integer
      - 4
-     - Number of persistent host threads used to pack each pinned staging window.
+     - Number of persistent host threads in each pinned staging window set. Total persistent pack threads are this value multiplied by ``cudf.host_to_device_staging_window_sets``.
+   * - cudf.host_to_device_staging_window_sets
+     - integer
+     - 2
+     - Number of concurrent two-window sets in the process-wide pinned host staging arena. Total pinned memory is twice this value multiplied by ``cudf.host_to_device_staging_window_bytes``. If a later set cannot be allocated, completed sets remain available. The effective capacity and active leases are recorded as the ``cudfPinnedStagingWindowSetCapacityAtAcquireSamples`` and ``cudfPinnedStagingActiveLeasesAtAcquireSamples`` runtime distributions; their sums are sample totals, not gauges.
    * - cudf.function_name_prefix
      - string
      - ""

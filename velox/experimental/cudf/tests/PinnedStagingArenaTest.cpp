@@ -25,8 +25,13 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -35,6 +40,38 @@ namespace {
 
 using namespace std::chrono_literals;
 
+bool waitForQueuedLeases(uint32_t expected) {
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  do {
+    if (PinnedStagingArena::waitingLeaseCountForTesting() >= expected) {
+      return true;
+    }
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  return PinnedStagingArena::waitingLeaseCountForTesting() >= expected;
+}
+
+std::optional<uint32_t> firstAllowedNumaNode() {
+#if defined(__linux__)
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    constexpr std::string_view kPrefix = "Mems_allowed_list:";
+    if (!line.starts_with(kPrefix)) {
+      continue;
+    }
+    const auto firstDigit = line.find_first_of("0123456789", kPrefix.size());
+    if (firstDigit == std::string::npos) {
+      return std::nullopt;
+    }
+    const auto end = line.find_first_not_of("0123456789", firstDigit);
+    return static_cast<uint32_t>(
+        std::stoul(line.substr(firstDigit, end - firstDigit)));
+  }
+#endif
+  return std::nullopt;
+}
+
 class PinnedStagingArenaTest : public testing::Test {
  protected:
   static void SetUpTestSuite() {
@@ -42,51 +79,155 @@ class PinnedStagingArenaTest : public testing::Test {
     ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
   }
 
+  void SetUp() override {
+    // Keep tests independent of a launcher environment inherited by the test
+    // process. Individual strict-placement tests opt back in explicitly.
+    PinnedStagingArena::setRequireNumaLocalForTesting(false);
+  }
+
   void TearDown() override {
     PinnedStagingArena::setAllocationFailureForTesting(false);
+    PinnedStagingArena::setRegistrationFailureAtForTesting(0);
+    PinnedStagingArena::clearNumaNodeForTesting();
+    PinnedStagingArena::clearRequireNumaLocalForTesting();
   }
 };
 
 TEST_F(PinnedStagingArenaTest, disabled) {
-  PinnedStagingArena::configure(false, 0, 0);
+  PinnedStagingArena::configure(false, 0, 0, 0);
   EXPECT_FALSE(PinnedStagingArena::enabled());
   EXPECT_FALSE(PinnedStagingArena::acquirePair().has_value());
 }
 
 TEST_F(PinnedStagingArenaTest, validatesEnabledConfiguration) {
-  EXPECT_THROW(PinnedStagingArena::configure(true, 0, 1), VeloxException);
-  EXPECT_THROW(PinnedStagingArena::configure(true, 4096, 0), VeloxException);
+  EXPECT_THROW(PinnedStagingArena::configure(true, 0, 1, 1), VeloxException);
+  EXPECT_THROW(PinnedStagingArena::configure(true, 4096, 0, 1), VeloxException);
+  EXPECT_THROW(PinnedStagingArena::configure(true, 4096, 1, 0), VeloxException);
+  EXPECT_THROW(
+      PinnedStagingArena::configure(
+          true,
+          std::numeric_limits<size_t>::max() / PinnedStagingArena::kWindowCount,
+          1,
+          2),
+      VeloxException);
 }
 
 TEST_F(PinnedStagingArenaTest, acquiresBothWindowsAtomically) {
   constexpr uint64_t kWindowBytes = 4096;
-  PinnedStagingArena::configure(true, kWindowBytes, 2);
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 1);
   EXPECT_TRUE(PinnedStagingArena::enabled());
 
   auto first = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(first.has_value());
   EXPECT_EQ(first->capacity(), kWindowBytes);
+  EXPECT_EQ(first->windowSetCount(), 1);
+  EXPECT_EQ(first->activeLeasesAtAcquire(), 1);
+  EXPECT_FALSE(first->wasContended());
   EXPECT_NE(first->data(0), first->data(1));
   auto* firstWindow = first->data(0);
   auto* secondWindow = first->data(1);
 
-  std::promise<void> waiterStarted;
-  auto waiter = std::async(std::launch::async, [&waiterStarted]() {
-    waiterStarted.set_value();
-    return PinnedStagingArena::acquirePair();
-  });
-  waiterStarted.get_future().wait();
-  EXPECT_EQ(waiter.wait_for(50ms), std::future_status::timeout);
+  auto waiter = std::async(
+      std::launch::async, []() { return PinnedStagingArena::acquirePair(); });
+  EXPECT_TRUE(waitForQueuedLeases(1));
+  EXPECT_EQ(waiter.wait_for(0ms), std::future_status::timeout);
 
   first->release();
   auto second = waiter.get();
   ASSERT_TRUE(second.has_value());
   EXPECT_EQ(second->data(0), firstWindow);
   EXPECT_EQ(second->data(1), secondWindow);
+  EXPECT_TRUE(second->wasContended());
+}
+
+TEST_F(PinnedStagingArenaTest, leasesIndependentWindowSetsConcurrently) {
+  constexpr uint64_t kWindowBytes = 4096;
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 2);
+
+  auto first = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(first.has_value());
+  auto second = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(second.has_value());
+
+  EXPECT_EQ(first->windowSetCount(), 2);
+  EXPECT_EQ(first->activeLeasesAtAcquire(), 1);
+  EXPECT_EQ(second->activeLeasesAtAcquire(), 2);
+  EXPECT_FALSE(first->wasContended());
+  EXPECT_FALSE(second->wasContended());
+  EXPECT_NE(first->data(0), second->data(0));
+  EXPECT_NE(first->data(1), second->data(1));
+
+  auto* firstWindow = first->data(0);
+  auto waiter = std::async(
+      std::launch::async, []() { return PinnedStagingArena::acquirePair(); });
+  EXPECT_TRUE(waitForQueuedLeases(1));
+  EXPECT_EQ(waiter.wait_for(0ms), std::future_status::timeout);
+
+  first->release();
+  auto third = waiter.get();
+  ASSERT_TRUE(third.has_value());
+  EXPECT_TRUE(third->wasContended());
+  EXPECT_EQ(third->activeLeasesAtAcquire(), 2);
+  EXPECT_EQ(third->data(0), firstWindow);
+}
+
+TEST_F(PinnedStagingArenaTest, packsIndependentWindowSetsConcurrently) {
+  constexpr uint64_t kWindowBytes = PinnedStagingArena::kPackQuantumBytes + 17;
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 2);
+
+  auto first = PinnedStagingArena::acquirePair();
+  auto second = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+
+  std::vector<uint8_t> firstSource(kWindowBytes, 0x31);
+  std::vector<uint8_t> secondSource(kWindowBytes, 0x72);
+  const std::array firstCopy = {
+      PinnedStagingArena::Copy{firstSource.data(), 0, firstSource.size()}};
+  const std::array secondCopy = {
+      PinnedStagingArena::Copy{secondSource.data(), 0, secondSource.size()}};
+
+  auto firstPack =
+      std::async(std::launch::async, [&]() { first->pack(0, firstCopy); });
+  auto secondPack =
+      std::async(std::launch::async, [&]() { second->pack(0, secondCopy); });
+  firstPack.get();
+  secondPack.get();
+
+  EXPECT_EQ(
+      std::memcmp(first->data(0), firstSource.data(), firstSource.size()), 0);
+  EXPECT_EQ(
+      std::memcmp(second->data(0), secondSource.data(), secondSource.size()),
+      0);
+}
+
+TEST_F(PinnedStagingArenaTest, retainsCompletedSetAfterLaterAllocationFailure) {
+  // Two allocations complete set zero. Allocation four fails after the first
+  // window of set one was allocated, so that incomplete set must be discarded
+  // while set zero remains usable.
+  PinnedStagingArena::setAllocationFailureAtForTesting(4);
+  PinnedStagingArena::configure(true, 4096, 2, 3);
+
+  auto first = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->windowSetCount(), 1);
+
+  auto waiter = std::async(
+      std::launch::async, []() { return PinnedStagingArena::acquirePair(); });
+  EXPECT_TRUE(waitForQueuedLeases(1));
+  EXPECT_EQ(waiter.wait_for(0ms), std::future_status::timeout);
+
+  auto* retainedWindow = first->data(0);
+  first->release();
+  auto replacement = waiter.get();
+  ASSERT_TRUE(replacement.has_value());
+  EXPECT_EQ(replacement->windowSetCount(), 1);
+  EXPECT_EQ(replacement->data(0), retainedWindow);
+  EXPECT_TRUE(replacement->wasContended());
 }
 
 TEST_F(PinnedStagingArenaTest, moveAndReleaseWindowSet) {
-  PinnedStagingArena::configure(true, 4096, 2);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
   auto first = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(first.has_value());
 
@@ -108,7 +249,7 @@ TEST_F(PinnedStagingArenaTest, moveAndReleaseWindowSet) {
 TEST_F(PinnedStagingArenaTest, packsBothWindowsInParallel) {
   constexpr uint64_t kWindowBytes =
       2 * PinnedStagingArena::kPackQuantumBytes + 17;
-  PinnedStagingArena::configure(true, kWindowBytes, 4);
+  PinnedStagingArena::configure(true, kWindowBytes, 4, 1);
   auto lease = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(lease.has_value());
 
@@ -152,7 +293,7 @@ TEST_F(PinnedStagingArenaTest, packsBothWindowsInParallel) {
 
 TEST_F(PinnedStagingArenaTest, validatesAllRangesBeforeWriting) {
   constexpr uint64_t kWindowBytes = 4096;
-  PinnedStagingArena::configure(true, kWindowBytes, 2);
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 1);
   auto lease = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(lease.has_value());
   std::memset(lease->data(0), 0x5a, kWindowBytes);
@@ -192,17 +333,14 @@ TEST_F(PinnedStagingArenaTest, validatesAllRangesBeforeWriting) {
 }
 
 TEST_F(PinnedStagingArenaTest, resetInterruptsWaiterButPreservesWindowSet) {
-  PinnedStagingArena::configure(true, 4096, 2);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
   auto first = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(first.has_value());
 
-  std::promise<void> waiterStarted;
-  auto waiter = std::async(std::launch::async, [&waiterStarted]() {
-    waiterStarted.set_value();
-    return PinnedStagingArena::acquirePair();
-  });
-  waiterStarted.get_future().wait();
-  EXPECT_EQ(waiter.wait_for(50ms), std::future_status::timeout);
+  auto waiter = std::async(
+      std::launch::async, []() { return PinnedStagingArena::acquirePair(); });
+  EXPECT_TRUE(waitForQueuedLeases(1));
+  EXPECT_EQ(waiter.wait_for(0ms), std::future_status::timeout);
 
   PinnedStagingArena::reset();
   EXPECT_FALSE(waiter.get().has_value());
@@ -216,13 +354,103 @@ TEST_F(PinnedStagingArenaTest, resetInterruptsWaiterButPreservesWindowSet) {
 
 TEST_F(PinnedStagingArenaTest, allocationFailureDisablesGeneration) {
   PinnedStagingArena::setAllocationFailureForTesting(true);
-  PinnedStagingArena::configure(true, 4096, 2);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
   EXPECT_FALSE(PinnedStagingArena::acquirePair().has_value());
   EXPECT_FALSE(PinnedStagingArena::acquirePair().has_value());
 
   PinnedStagingArena::setAllocationFailureForTesting(false);
-  PinnedStagingArena::configure(true, 4096, 2);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
   EXPECT_TRUE(PinnedStagingArena::acquirePair().has_value());
+}
+
+TEST_F(PinnedStagingArenaTest, portableAllocationCanBeSelectedExplicitly) {
+  PinnedStagingArena::setNumaNodeForTesting(std::nullopt);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
+  auto lease = PinnedStagingArena::acquirePair();
+  ASSERT_TRUE(lease.has_value());
+  EXPECT_EQ(
+      PinnedStagingArena::hostAllocationStrategyForTesting(),
+      PinnedStagingArena::HostAllocationStrategy::kCudaHostAlloc);
+}
+
+TEST_F(PinnedStagingArenaTest, requiredNumaBindingFailsClosed) {
+  PinnedStagingArena::setNumaNodeForTesting(std::nullopt);
+  PinnedStagingArena::setRequireNumaLocalForTesting(true);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
+  EXPECT_FALSE(PinnedStagingArena::acquirePair().has_value());
+  EXPECT_EQ(
+      PinnedStagingArena::hostAllocationStrategyForTesting(),
+      PinnedStagingArena::HostAllocationStrategy::kUninitialized);
+}
+
+TEST_F(PinnedStagingArenaTest, resolvesRelativeAndAbsolutePolicyNodes) {
+  constexpr std::array<uint32_t, 1> kPolicyNodes{1};
+  constexpr std::array<uint32_t, 3> kAllowedNodes{2, 5, 9};
+  EXPECT_EQ(
+      PinnedStagingArena::resolveNumaNodeForTesting(
+          true, kPolicyNodes, kAllowedNodes),
+      5);
+  EXPECT_EQ(
+      PinnedStagingArena::resolveNumaNodeForTesting(
+          false, kPolicyNodes, kAllowedNodes),
+      1);
+
+  constexpr std::array<uint32_t, 2> kMultiplePolicyNodes{0, 1};
+  EXPECT_FALSE(
+      PinnedStagingArena::resolveNumaNodeForTesting(
+          true, kMultiplePolicyNodes, kAllowedNodes)
+          .has_value());
+  constexpr std::array<uint32_t, 1> kOutOfRangePolicyNode{3};
+  EXPECT_THROW(
+      PinnedStagingArena::resolveNumaNodeForTesting(
+          true, kOutOfRangePolicyNode, kAllowedNodes),
+      std::runtime_error);
+}
+
+TEST_F(PinnedStagingArenaTest, usesStrictNumaLocalRegisteredAllocation) {
+  const auto numaNode = firstAllowedNumaNode();
+  if (!numaNode.has_value()) {
+    GTEST_SKIP() << "No allowed NUMA node is visible";
+  }
+
+  PinnedStagingArena::setNumaNodeForTesting(numaNode);
+  PinnedStagingArena::setRequireNumaLocalForTesting(true);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
+  auto lease = PinnedStagingArena::acquirePair();
+  if (!lease.has_value()) {
+    GTEST_SKIP()
+        << "The test environment does not permit mbind/cudaHostRegister";
+  }
+  EXPECT_EQ(
+      PinnedStagingArena::hostAllocationStrategyForTesting(),
+      PinnedStagingArena::HostAllocationStrategy::kMmapMbindCudaHostRegister);
+}
+
+TEST_F(
+    PinnedStagingArenaTest,
+    registrationFailureDoesNotFallBackFromStrictNumaAllocation) {
+  const auto numaNode = firstAllowedNumaNode();
+  if (!numaNode.has_value()) {
+    GTEST_SKIP() << "No allowed NUMA node is visible";
+  }
+
+  // First prove that this environment can exercise the real strict path.
+  PinnedStagingArena::setNumaNodeForTesting(numaNode);
+  PinnedStagingArena::setRequireNumaLocalForTesting(true);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
+  auto probe = PinnedStagingArena::acquirePair();
+  if (!probe.has_value()) {
+    GTEST_SKIP()
+        << "The test environment does not permit mbind/cudaHostRegister";
+  }
+  probe->release();
+
+  PinnedStagingArena::setRegistrationFailureAtForTesting(1);
+  PinnedStagingArena::configure(true, 4096, 2, 1);
+  EXPECT_FALSE(PinnedStagingArena::acquirePair().has_value());
+  EXPECT_EQ(
+      PinnedStagingArena::hostAllocationStrategyForTesting(),
+      PinnedStagingArena::HostAllocationStrategy::kUninitialized);
 }
 
 } // namespace

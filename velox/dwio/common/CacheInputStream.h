@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <folly/container/F14Set.h>
+
 #include "velox/common/caching/FileIds.h"
 #include "velox/common/caching/ScanTracker.h"
 #include "velox/common/caching/SsdCache.h"
@@ -127,6 +129,14 @@ class CacheInputStream : public SeekableInputStream {
   }
 
  private:
+  friend class CachedBufferedInput;
+
+  // Records an exact cache entry start that must be made immediately
+  // evictable when this is a non-cacheable stream. CachedBufferedInput calls
+  // this for planned/coalesced entries and loadSync calls it for entries found
+  // or created on demand.
+  void recordCacheEntryForEviction(uint64_t offset);
+
   // Ensures that the current position is covered by 'pin_'.
   void loadPosition();
 
@@ -210,6 +220,11 @@ class CacheInputStream : public SeekableInputStream {
   // True if prefetch the next 'loadQuantum_' has been started. Cleared when
   // moving to the next load quantum.
   bool prefetchStarted_{false};
+
+  // Exact entry starts associated with this stream. Reconstructing these from
+  // load-quantum boundaries is insufficient when a cached prefix and its
+  // missing suffix are represented by adjacent entries.
+  folly::F14FastSet<uint64_t> cacheEntryOffsetsForEviction_;
 };
 
 } // namespace facebook::velox::dwio::common

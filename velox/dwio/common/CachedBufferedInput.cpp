@@ -16,7 +16,6 @@
 
 #include "velox/dwio/common/CachedBufferedInput.h"
 #include "folly/io/Cursor.h"
-#include "velox/common/Casts.h"
 #include "velox/common/memory/Allocation.h"
 #include "velox/common/time/Timer.h"
 #include "velox/dwio/common/CacheInputStream.h"
@@ -144,6 +143,7 @@ std::vector<CacheRequest*> makeRequestParts(
             size,
             request.trackingId));
     parts.push_back(extraRequests.back().get());
+    parts.back()->stream = request.stream;
     parts.back()->coalesces = prefetch;
     if (prefetchOne) {
       break;
@@ -244,23 +244,62 @@ void CachedBufferedInput::load(const LogType /*unused*/) {
                                                                          : 0;
     auto parts = makeRequestParts(
         request, trackingData, options_.loadQuantum(), extraRequests);
-    for (auto part : parts) {
-      if (cache_->exists(part->key)) {
-        continue;
-      }
-      if (ssdFile != nullptr) {
-        part->ssdPin = ssdFile->find(part->key);
-        if (!part->ssdPin.empty() && part->ssdPin.run().size() < part->size) {
-          LOG(WARNING) << "Ignoring SSD shorter than requested: "
-                       << part->ssdPin.run().size() << " vs " << part->size;
-          part->ssdPin.clear();
-        }
-        if (!part->ssdPin.empty()) {
-          ssdLoad[loadIndex].push_back(part);
+    for (auto* initialPart : parts) {
+      auto* part = initialPart;
+      VELOX_CHECK_NOT_NULL(part->stream);
+      // A request can be composed from any number of adjacent memory-cache
+      // entries, an SSD prefix, and a storage suffix. Cache keys identify the
+      // start offset but not the length, so a shorter entry at the same key is
+      // a valid prefix rather than stale data.
+      while (part != nullptr) {
+        part->stream->recordCacheEntryForEviction(part->key.offset);
+        const auto cachedSize = cache_->entrySizeForPlanning(part->key);
+        if (cachedSize.has_value()) {
+          VELOX_CHECK_GT(
+              cachedSize.value(), 0, "Cache entries must make progress");
+          if (cachedSize.value() >= part->size) {
+            break;
+          }
+          part->key.offset += cachedSize.value();
+          part->size -= cachedSize.value();
           continue;
         }
+
+        // An entry may have been published after entrySizeForPlanning(). If
+        // so, leave it for the stream to consume rather than planning
+        // duplicate I/O.
+        if (cache_->exists(part->key)) {
+          break;
+        }
+
+        if (ssdFile != nullptr) {
+          part->ssdPin = ssdFile->find(part->key);
+          if (!part->ssdPin.empty()) {
+            const uint64_t ssdSize = part->ssdPin.run().size();
+            VELOX_CHECK_GT(ssdSize, 0, "SSD entries must make progress");
+            if (ssdSize < part->size) {
+              const auto suffixOffset = part->key.offset + ssdSize;
+              const auto suffixSize = part->size - ssdSize;
+              extraRequests.push_back(
+                  std::make_unique<CacheRequest>(
+                      RawFileCacheKey{part->key.fileNum, suffixOffset},
+                      suffixSize,
+                      part->trackingId));
+              auto* suffix = extraRequests.back().get();
+              suffix->stream = part->stream;
+              suffix->coalesces = part->coalesces;
+              part->size = ssdSize;
+              ssdLoad[loadIndex].push_back(part);
+              part = suffix;
+              continue;
+            }
+            ssdLoad[loadIndex].push_back(part);
+            break;
+          }
+        }
+        storageLoad[loadIndex].push_back(part);
+        break;
       }
-      storageLoad[loadIndex].push_back(part);
     }
   }
 
@@ -456,7 +495,9 @@ class DwioCoalescedLoad : public DwioCoalescedLoadBase {
             pin.checkedEntry()->setPrefetch(true);
           }
           pins.push_back(std::move(pin));
-        });
+        },
+        /*contiguous=*/false,
+        cache::CacheEntrySizePolicy::kAllowSmaller);
     if (pins.empty()) {
       return pins;
     }
@@ -512,7 +553,9 @@ class SsdLoad : public DwioCoalescedLoadBase {
           }
           pins.push_back(std::move(pin));
           ssdPins.push_back(std::move(requests_[index].ssdPin));
-        });
+        },
+        /*contiguous=*/false,
+        cache::CacheEntrySizePolicy::kAllowSmaller);
     if (pins.empty()) {
       return pins;
     }
@@ -524,6 +567,27 @@ class SsdLoad : public DwioCoalescedLoadBase {
 };
 
 } // namespace
+
+uint64_t CachedBufferedInput::StreamCoalescedLoad::firstOffset() const {
+  VELOX_CHECK(!regions.empty());
+  return regions.front().offset;
+}
+
+uint64_t CachedBufferedInput::StreamCoalescedLoad::endOffset() const {
+  VELOX_CHECK(!regions.empty());
+  uint64_t end = 0;
+  for (const auto& region : regions) {
+    end = std::max(end, region.offset + region.length);
+  }
+  return end;
+}
+
+bool CachedBufferedInput::StreamCoalescedLoad::covers(uint64_t position) const {
+  return std::any_of(regions.begin(), regions.end(), [&](const Region& region) {
+    return position >= region.offset &&
+        position - region.offset < region.length;
+  });
+}
 
 void CachedBufferedInput::readRegion(
     const std::vector<CacheRequest*>& requests,
@@ -547,9 +611,28 @@ void CachedBufferedInput::readRegion(
         options_.maxCoalesceDistance());
   }
   coalescedLoads_.push_back(load);
+  folly::F14FastMap<const SeekableInputStream*, std::vector<Region>>
+      streamRegions;
+  for (const auto* request : requests) {
+    if (request->stream == nullptr) {
+      continue;
+    }
+    streamRegions[request->stream].emplace_back(
+        request->key.offset, request->size);
+  }
   streamToCoalescedLoad_.withWLock([&](auto& loads) {
-    for (auto& request : requests) {
-      loads[request->stream] = load;
+    for (auto& [stream, regions] : streamRegions) {
+      std::sort(regions.begin(), regions.end());
+      auto& streamLoads = loads[stream];
+      const auto insertion = std::lower_bound(
+          streamLoads.begin(),
+          streamLoads.end(),
+          regions.front().offset,
+          [](const StreamCoalescedLoad& queued, uint64_t newOffset) {
+            return queued.firstOffset() < newOffset;
+          });
+      streamLoads.insert(
+          insertion, StreamCoalescedLoad{std::move(regions), load});
     }
   });
 }
@@ -607,20 +690,89 @@ void CachedBufferedInput::readRegions(
 }
 
 std::shared_ptr<cache::CoalescedLoad> CachedBufferedInput::coalescedLoad(
-    const SeekableInputStream* stream) {
+    const SeekableInputStream* stream,
+    uint64_t position) {
   return streamToCoalescedLoad_.withWLock(
       [&](auto& loads) -> std::shared_ptr<cache::CoalescedLoad> {
         auto it = loads.find(stream);
         if (it == loads.end()) {
           return nullptr;
         }
-        auto load = std::move(it->second);
-        auto* dwioLoad = checkedPointerCast<DwioCoalescedLoadBase>(load.get());
-        for (auto& request : dwioLoad->requests()) {
-          loads.erase(request.stream);
+        VELOX_CHECK(!it->second.empty());
+        auto& streamLoads = it->second;
+        streamLoads.erase(
+            std::remove_if(
+                streamLoads.begin(),
+                streamLoads.end(),
+                [&](const auto& queued) {
+                  return queued.endOffset() <= position;
+                }),
+            streamLoads.end());
+        if (streamLoads.empty()) {
+          loads.erase(it);
+          return nullptr;
+        }
+
+        const auto covering = std::find_if(
+            streamLoads.begin(), streamLoads.end(), [&](const auto& queued) {
+              return queued.covers(position);
+            });
+        if (covering == streamLoads.end()) {
+          return nullptr;
+        }
+        auto load = covering->load;
+
+        // The selected load may cover requests from multiple streams. Once
+        // one stream triggers it, none of the correlated streams should try
+        // to trigger the same load again.
+        for (auto streamIt = loads.begin(); streamIt != loads.end();) {
+          auto& queuedLoads = streamIt->second;
+          queuedLoads.erase(
+              std::remove_if(
+                  queuedLoads.begin(),
+                  queuedLoads.end(),
+                  [&](const auto& queued) { return queued.load == load; }),
+              queuedLoads.end());
+          if (queuedLoads.empty()) {
+            auto eraseIt = streamIt++;
+            loads.erase(eraseIt);
+          } else {
+            ++streamIt;
+          }
         }
         return load;
       });
+}
+
+void CachedBufferedInput::discardCoalescedLoads(
+    const SeekableInputStream* stream) {
+  streamToCoalescedLoad_.withWLock([&](auto& loads) {
+    const auto it = loads.find(stream);
+    if (it == loads.end()) {
+      return;
+    }
+    folly::F14FastSet<const cache::CoalescedLoad*> discarded;
+    for (const auto& queued : it->second) {
+      discarded.insert(queued.load.get());
+    }
+    for (auto streamIt = loads.begin(); streamIt != loads.end();) {
+      auto& queuedLoads = streamIt->second;
+      queuedLoads.erase(
+          std::remove_if(
+              queuedLoads.begin(),
+              queuedLoads.end(),
+              [&](const auto& queued) {
+                return discarded.contains(queued.load.get());
+              }),
+          queuedLoads.end());
+      if (queuedLoads.empty()) {
+        auto eraseIt = streamIt++;
+        loads.erase(eraseIt);
+      } else {
+        ++streamIt;
+      }
+    }
+  });
 }
 
 void CachedBufferedInput::reset() {
@@ -662,9 +814,10 @@ bool CachedBufferedInput::prefetch(Region region) {
   }
   auto stream = enqueue(region, nullptr);
   load(LogType::FILE);
-  // Remove the coalesced load made for the stream. It will not be accessed. The
-  // cache entry will be accessed.
-  coalescedLoad(stream.get());
+  // Remove all coalesced loads made for the temporary stream. They are
+  // submitted independently when an executor is present and will not be
+  // triggered through this stream.
+  discardCoalescedLoads(stream.get());
   return true;
 }
 

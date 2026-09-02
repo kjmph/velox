@@ -47,7 +47,7 @@ struct CacheRequest {
   /// accessed large columns where hitting one piece should not load the
   /// adjacent pieces.
   bool coalesces{true};
-  const SeekableInputStream* stream;
+  CacheInputStream* stream{nullptr};
 };
 
 class CachedBufferedInput : public BufferedInput {
@@ -205,11 +205,12 @@ class CachedBufferedInput : public BufferedInput {
 
   std::optional<CachedRegion> findCachedRegion(uint64_t offset) const override;
 
-  /// Returns the CoalescedLoad that contains the correlated loads for 'stream'
-  /// or nullptr if none. Returns nullptr on all but first call for 'stream'
-  /// since the load is to be triggered by the first access.
+  /// Returns the CoalescedLoad that covers 'position' in 'stream', or nullptr
+  /// if none. Associations entirely before 'position' are stale after a seek
+  /// and are discarded without executing their I/O.
   std::shared_ptr<cache::CoalescedLoad> coalescedLoad(
-      const SeekableInputStream* stream);
+      const SeekableInputStream* stream,
+      uint64_t position);
 
   folly::Executor* executor() const override {
     return executor_;
@@ -251,6 +252,11 @@ class CachedBufferedInput : public BufferedInput {
       bool prefetch,
       const std::vector<int32_t>& groupEnds);
 
+  // Removes every load associated with 'stream', including the corresponding
+  // associations on other streams. Used when a temporary prefetch stream will
+  // never consume the loads itself.
+  void discardCoalescedLoads(const SeekableInputStream* stream);
+
   template <bool kSsd>
   void makeLoads(std::vector<CacheRequest*> requests[2]);
 
@@ -278,10 +284,25 @@ class CachedBufferedInput : public BufferedInput {
   // Regions that are candidates for loading.
   std::vector<CacheRequest> requests_;
 
-  // Map from stream to its coalesced load.
+  struct StreamCoalescedLoad {
+    std::vector<velox::common::Region> regions;
+    std::shared_ptr<cache::CoalescedLoad> load;
+
+    uint64_t firstOffset() const;
+
+    uint64_t endOffset() const;
+
+    bool covers(uint64_t position) const;
+  };
+
+  // Ordered coalesced loads associated with each stream. One stream can span
+  // multiple groups when its requests exceed maxCoalesceBytes. Exact logical
+  // regions identify which load covers the stream's current position and keep
+  // SSD and storage loads in stream order even though they are planned in
+  // separate passes.
   folly::Synchronized<folly::F14FastMap<
       const SeekableInputStream*,
-      std::shared_ptr<cache::CoalescedLoad>>>
+      std::vector<StreamCoalescedLoad>>>
       streamToCoalescedLoad_;
 
   // All distinct coalesced loads.

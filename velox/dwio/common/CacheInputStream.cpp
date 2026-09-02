@@ -66,14 +66,14 @@ void CacheInputStream::makeCacheEvictable() {
   if (preloaded_ || cacheable_) {
     return;
   }
-  // Walks through the potential prefetch or access cache space of this cache
-  // input stream, and marks those exist cache entries as immediate evictable.
-  uint64_t position = 0;
-  while (position < region_.length) {
-    const auto nextRegion = nextQuantizedLoadRegion(position);
-    const cache::RawFileCacheKey key{fileNum_, nextRegion.offset};
-    cache_->makeEvictable(key);
-    position = nextRegion.offset + nextRegion.length;
+  for (const auto offset : cacheEntryOffsetsForEviction_) {
+    cache_->makeEvictable(cache::RawFileCacheKey{fileNum_, offset});
+  }
+}
+
+void CacheInputStream::recordCacheEntryForEviction(uint64_t offset) {
+  if (!cacheable_) {
+    cacheEntryOffsetsForEviction_.insert(offset);
   }
 }
 
@@ -195,21 +195,6 @@ void CacheInputStream::setRemainingBytes(uint64_t remainingBytes) {
 }
 
 void CacheInputStream::loadSync(const Region& region) {
-  int64_t hitSize = region.length;
-  if (window_.has_value()) {
-    const int64_t regionEnd = region.offset + region.length;
-    const int64_t windowStart = region_.offset + window_.value().offset;
-    const int64_t windowEnd =
-        region_.offset + window_.value().offset + window_.value().length;
-    hitSize = std::min(windowEnd, regionEnd) -
-        std::max<int64_t>(windowStart, region.offset);
-  }
-
-  // rawBytesRead is the number of bytes touched. Whether they come from disk,
-  // ssd or memory is itemized in different counters. A coalesced read from
-  // InputStream removes itself from this count so as not to double count when
-  // the individual parts are hit.
-  ioStats_->incRawBytesRead(hitSize);
   prefetchStarted_ = false;
 
   // TODO: add a maximum retry limit or timeout to prevent infinite loops under
@@ -220,7 +205,11 @@ void CacheInputStream::loadSync(const Region& region) {
     cache::RawFileCacheKey key{fileNum_, region.offset};
     clearCachePin();
     pin_ = cache_->findOrCreate(
-        key, region.length, /*contiguous=*/false, &cacheLoadWait);
+        key,
+        region.length,
+        /*contiguous=*/false,
+        &cacheLoadWait,
+        cache::CacheEntrySizePolicy::kAllowSmaller);
     if (pin_.empty()) {
       VELOX_CHECK(cacheLoadWait.valid());
       uint64_t waitUs{0};
@@ -236,6 +225,26 @@ void CacheInputStream::loadSync(const Region& region) {
     }
 
     auto* entry = pin_.checkedEntry();
+    VELOX_CHECK_GT(entry->size(), 0, "Cache entries must make progress");
+    recordCacheEntryForEviction(entry->offset());
+    const auto loadedLength = std::min<uint64_t>(region.length, entry->size());
+    int64_t hitSize = loadedLength;
+    if (window_.has_value()) {
+      const int64_t regionEnd = region.offset + loadedLength;
+      const int64_t windowStart = region_.offset + window_.value().offset;
+      const int64_t windowEnd =
+          region_.offset + window_.value().offset + window_.value().length;
+      hitSize = std::max<int64_t>(
+          0,
+          std::min(windowEnd, regionEnd) -
+              std::max<int64_t>(windowStart, region.offset));
+    }
+
+    // rawBytesRead is the number of bytes touched. Whether they come from
+    // disk, SSD, or memory is itemized in different counters. A short cached
+    // prefix is counted here and its missing suffix is counted by the next
+    // load, avoiding double-counting the original larger request.
+    ioStats_->incRawBytesRead(hitSize);
     if (!entry->getAndClearFirstUseFlag()) {
       // Hit memory cache.
       ioStats_->ramHit().increment(hitSize);
@@ -343,62 +352,71 @@ std::string CacheInputStream::ssdFileName() const {
 
 void CacheInputStream::loadPosition() {
   const auto offset = region_.offset;
+  const uint64_t positionInFile = offset + position_;
 
-  if (pin_.empty()) {
-    VELOX_CHECK(!preloaded_, "Preloaded stream must always have a valid pin");
-    auto load = bufferedInput_->coalescedLoad(this);
-    if (load != nullptr) {
-      folly::SemiFuture<bool> waitFuture(false);
-      uint64_t loadUs{0};
-      {
-        MicrosecondWallTimer timer(&loadUs);
-        try {
-          if (!load->loadOrFuture(&waitFuture, cacheable_)) {
-            waitFuture.wait();
+  // When an entry at the aligned quantum key is a short prefix, continue at
+  // its exact end. This preserves normal aligned cache reuse for seeks while
+  // allowing a quantum to be composed from multiple adjacent entries.
+  std::optional<Region> suffixRegion;
+  while (true) {
+    if (pin_.empty()) {
+      VELOX_CHECK(!preloaded_, "Preloaded stream must always have a valid pin");
+      auto load = bufferedInput_->coalescedLoad(this, positionInFile);
+      if (load != nullptr) {
+        folly::SemiFuture<bool> waitFuture(false);
+        uint64_t loadUs{0};
+        {
+          MicrosecondWallTimer timer(&loadUs);
+          try {
+            if (!load->loadOrFuture(&waitFuture, cacheable_)) {
+              waitFuture.wait();
+            }
+          } catch (const std::exception& e) {
+            // Log the error and continue. The error, if it persists, will be
+            // hit again in looking up the specific entry and thrown from
+            // there.
+            LOG(ERROR) << "IOERR: error in coalesced load " << e.what();
           }
-        } catch (const std::exception& e) {
-          // Log the error and continue. The error, if it persists, will be
-          // hit again in looking up the specific entry and thrown from there.
-          LOG(ERROR) << "IOERR: error in coalesced load " << e.what();
+        }
+        ioStats_->queryThreadIoLatencyUs().increment(loadUs);
+        if (load->isSsdLoad()) {
+          ioStats_->coalescedSsdLoadLatencyUs().increment(loadUs);
+        } else {
+          ioStats_->coalescedStorageLoadLatencyUs().increment(loadUs);
         }
       }
-      ioStats_->queryThreadIoLatencyUs().increment(loadUs);
-      if (load->isSsdLoad()) {
-        ioStats_->coalescedSsdLoadLatencyUs().increment(loadUs);
+
+      // There is no need to update the metric in the loadData method because
+      // loadSync is always executed regardless and updates the metric.
+      loadSync(suffixRegion.value_or(nextQuantizedLoadRegion(position_)));
+      suffixRegion.reset();
+    }
+
+    auto* entry = pin_.checkedEntry();
+    const uint64_t entryOffset = entry->offset();
+    const uint64_t entryEnd = entryOffset + entry->size();
+    if (entryOffset <= positionInFile && entryEnd > positionInFile) {
+      // The position is inside the range of 'entry'.
+      const auto offsetInEntry = positionInFile - entryOffset;
+      if (entry->hasContiguousData()) {
+        run_ = reinterpret_cast<uint8_t*>(entry->contiguousData());
+        runSize_ = entry->size();
+        offsetInRun_ = offsetInEntry;
+        offsetOfRun_ = 0;
       } else {
-        ioStats_->coalescedStorageLoadLatencyUs().increment(loadUs);
+        entry->nonContiguousData().findRun(
+            offsetInEntry, &runIndex_, &offsetInRun_);
+        offsetOfRun_ = offsetInEntry - offsetInRun_;
+        const auto run = entry->nonContiguousData().runAt(runIndex_);
+        run_ = run.data();
+        runSize_ = memory::AllocationTraits::pageBytes(run.numPages());
+        if (offsetOfRun_ + runSize_ > entry->size()) {
+          runSize_ = entry->size() - offsetOfRun_;
+        }
       }
+      return;
     }
 
-    const auto nextLoadRegion = nextQuantizedLoadRegion(position_);
-    // There is no need to update the metric in the loadData method because
-    // loadSync is always executed regardless and updates the metric.
-    loadSync(nextLoadRegion);
-  }
-
-  auto* entry = pin_.checkedEntry();
-  const uint64_t positionInFile = offset + position_;
-  if (entry->offset() <= positionInFile &&
-      entry->offset() + entry->size() > positionInFile) {
-    // The position is inside the range of 'entry'.
-    const auto offsetInEntry = positionInFile - entry->offset();
-    if (entry->hasContiguousData()) {
-      run_ = reinterpret_cast<uint8_t*>(entry->contiguousData());
-      runSize_ = entry->size();
-      offsetInRun_ = offsetInEntry;
-      offsetOfRun_ = 0;
-    } else {
-      entry->nonContiguousData().findRun(
-          offsetInEntry, &runIndex_, &offsetInRun_);
-      offsetOfRun_ = offsetInEntry - offsetInRun_;
-      const auto run = entry->nonContiguousData().runAt(runIndex_);
-      run_ = run.data();
-      runSize_ = memory::AllocationTraits::pageBytes(run.numPages());
-      if (offsetOfRun_ + runSize_ > entry->size()) {
-        runSize_ = entry->size() - offsetOfRun_;
-      }
-    }
-  } else {
     // Position is out of range for the current entry. This cannot happen for
     // preloaded entries since they cover the entire file.
     VELOX_CHECK(
@@ -407,8 +425,18 @@ void CacheInputStream::loadPosition() {
         positionInFile,
         entry->offset(),
         entry->offset() + entry->size());
+
+    const auto quantum = nextQuantizedLoadRegion(position_);
+    const auto quantumEnd = quantum.offset + quantum.length;
+    // If this entry is a prefix of the current aligned quantum, advance to its
+    // end. For a backward seek or an entry from an earlier quantum, restart at
+    // the aligned quantum key instead.
+    if (entryOffset >= quantum.offset && entryEnd < quantumEnd &&
+        entryEnd <= positionInFile) {
+      VELOX_CHECK_GT(entryEnd, entryOffset, "Cache entries must make progress");
+      suffixRegion = Region{entryEnd, quantumEnd - entryEnd};
+    }
     clearCachePin();
-    loadPosition();
   }
 }
 
@@ -418,7 +446,7 @@ velox::common::Region CacheInputStream::nextQuantizedLoadRegion(
   // Quantize position to previous multiple of 'loadQuantum_'.
   nextRegion.offset += (prevLoadedPosition / loadQuantum_) * loadQuantum_;
   // Set length to be the lesser of 'loadQuantum_' and distance to end of
-  // 'region_'
+  // 'region_'.
   nextRegion.length = std::min<uint64_t>(
       loadQuantum_, region_.length - (nextRegion.offset - region_.offset));
   return nextRegion;

@@ -120,6 +120,13 @@ struct RawFileCacheKey {
     return offset == other.offset && fileNum == other.fileNum;
   }
 };
+
+/// Controls whether an entry that begins at the requested key but is shorter
+/// than the requested size is stale or is a reusable prefix.
+enum class CacheEntrySizePolicy : uint8_t {
+  kRequireAtLeast,
+  kAllowSmaller,
+};
 } // namespace facebook::velox::cache
 
 namespace std {
@@ -625,12 +632,21 @@ class CacheShard {
       : cache_(cache), maxWriteRatio_(maxWriteRatio) {}
 
   /// See AsyncDataCache::findOrCreate. If 'contiguous' is true, the
-  /// entry's data is allocated as a single contiguous region.
+  /// entry's data is allocated as a single contiguous region. With
+  /// kAllowSmaller, an existing shared entry that starts at 'key' but is
+  /// shorter than 'size' is returned as a valid prefix.
   CachePin findOrCreate(
       RawFileCacheKey key,
       uint64_t size,
       bool contiguous = false,
       folly::SemiFuture<bool>* readyFuture = nullptr);
+
+  CachePin findOrCreate(
+      RawFileCacheKey key,
+      uint64_t size,
+      bool contiguous,
+      folly::SemiFuture<bool>* readyFuture,
+      CacheEntrySizePolicy sizePolicy);
 
   /// Finds a cache entry for 'key'. Returns a shared-mode pin if the entry
   /// exists and is not exclusive. Returns an empty pin (inside optional) if
@@ -646,6 +662,11 @@ class CacheShard {
 
   /// Returns true if there is an entry for 'key'. Updates access time.
   bool exists(RawFileCacheKey key) const;
+
+  /// Returns an advisory size for planning adjacent loads. The entry may be
+  /// exclusive and may change or disappear immediately after this call.
+  /// Does not update access statistics or pin the entry.
+  std::optional<uint64_t> entrySizeForPlanning(RawFileCacheKey key) const;
 
   bool testingIsEvictable(RawFileCacheKey key) const;
 
@@ -731,7 +752,8 @@ class CacheShard {
   std::optional<CachePin> lookupLocked(
       RawFileCacheKey key,
       uint64_t size,
-      folly::SemiFuture<bool>* waitFuture);
+      folly::SemiFuture<bool>* waitFuture,
+      CacheEntrySizePolicy sizePolicy = CacheEntrySizePolicy::kRequireAtLeast);
 
   void tryAddFreeEntry(std::unique_ptr<AsyncDataCacheEntry>&& entry);
 
@@ -893,6 +915,9 @@ class AsyncDataCache : public memory::Cache {
   /// nullptr and the pin is exclusive on some other pin, this is set to
   /// a future that is realized when the pin is no longer exclusive.
   /// When the future is realized, the caller may retry findOrCreate().
+  /// With kAllowSmaller, an existing shared entry that starts at 'key' but is
+  /// shorter than 'size' is returned as a valid prefix. The
+  /// caller is responsible for requesting the remaining suffix separately.
   /// runtime error with code kNoCacheSpace if there is no space to
   /// create the new entry after evicting any unpinned content.
   CachePin findOrCreate(
@@ -900,6 +925,13 @@ class AsyncDataCache : public memory::Cache {
       uint64_t size,
       bool contiguous = false,
       folly::SemiFuture<bool>* waitFuture = nullptr);
+
+  CachePin findOrCreate(
+      RawFileCacheKey key,
+      uint64_t size,
+      bool contiguous,
+      folly::SemiFuture<bool>* waitFuture,
+      CacheEntrySizePolicy sizePolicy);
 
   /// Finds a cache entry for 'key'. Returns a shared-mode pin if the entry
   /// exists and is not exclusive. Returns an empty pin (inside optional) if
@@ -915,6 +947,11 @@ class AsyncDataCache : public memory::Cache {
 
   /// Returns true if there is an entry for 'key'. Updates access time.
   bool exists(RawFileCacheKey key) const;
+
+  /// Returns an advisory size for planning adjacent loads. The entry may be
+  /// exclusive and may change or disappear immediately after this call.
+  /// Does not update access statistics or pin the entry.
+  std::optional<uint64_t> entrySizeForPlanning(RawFileCacheKey key) const;
 
   /// Returns true if the entry for 'key' exists and has been marked as
   /// immediately evictable (lastUse == 0). Returns false if entry does not
@@ -978,9 +1015,11 @@ class AsyncDataCache : public memory::Cache {
       const std::vector<RawFileCacheKey>& keys,
       const SizeFunc& sizeFunc,
       const ProcessPin& processPin,
-      bool contiguous = false) {
+      bool contiguous = false,
+      CacheEntrySizePolicy sizePolicy = CacheEntrySizePolicy::kRequireAtLeast) {
     for (size_t i = 0; i < keys.size(); ++i) {
-      auto pin = findOrCreate(keys[i], sizeFunc(i), contiguous);
+      auto pin =
+          findOrCreate(keys[i], sizeFunc(i), contiguous, nullptr, sizePolicy);
       if (pin.empty() || pin.checkedEntry()->isShared()) {
         continue;
       }

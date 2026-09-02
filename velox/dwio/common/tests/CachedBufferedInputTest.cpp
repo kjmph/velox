@@ -522,6 +522,511 @@ TEST_F(CachedBufferedInputTest, duplicateRegionsShareCoalescedSsdRead) {
   testDuplicateRegionsShareCoalescedRead(true);
 }
 
+TEST_F(CachedBufferedInputTest, composeCachedPrefixWithMissingSuffix) {
+  constexpr uint64_t kContentSize = 3 << 20;
+  constexpr uint64_t kLoadQuantum = 1 << 20;
+  constexpr uint64_t kOffset = 123;
+  constexpr uint64_t kPrefixSize = 64 << 10;
+  constexpr uint64_t kSecondSize = 128 << 10;
+  constexpr uint64_t kFullSize = 2 * kLoadQuantum;
+
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kLoadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "composeCachedPrefixWithMissingSuffix");
+  StringIdLease groupId(ids, "composeCachedPrefixWithMissingSuffixGroup");
+
+  auto readRegion = [&](uint64_t size) {
+    CachedBufferedInput input(
+        readFile,
+        MetricsLog::voidLog(),
+        fileId,
+        cache_.get(),
+        tracker_,
+        groupId,
+        dataIoStats_,
+        nullptr,
+        nullptr,
+        readerOptions);
+    auto stream = input.enqueue(common::Region{kOffset, size}, nullptr);
+    input.load(LogType::TEST);
+
+    std::string result;
+    while (const auto next = getNext(*stream)) {
+      result.append(next.value());
+    }
+    return result;
+  };
+
+  EXPECT_EQ(readRegion(kPrefixSize), content.substr(kOffset, kPrefixSize));
+  EXPECT_EQ(dataIoStats_->read().sum(), kPrefixSize);
+  EXPECT_EQ(dataIoStats_->read().count(), 1);
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+
+  EXPECT_EQ(readRegion(kSecondSize), content.substr(kOffset, kSecondSize));
+  EXPECT_EQ(dataIoStats_->read().sum(), kSecondSize);
+  EXPECT_EQ(dataIoStats_->read().count(), 2);
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+
+  EXPECT_EQ(readRegion(kFullSize), content.substr(kOffset, kFullSize));
+  // Each growing request fetches only its missing suffix. Across all requests,
+  // each storage byte in the largest region is fetched exactly once.
+  EXPECT_EQ(dataIoStats_->read().sum(), kFullSize);
+  // The final two-quantum request has one suffix load per quantum.
+  EXPECT_EQ(dataIoStats_->read().count(), 4);
+  auto stats = cache_->refreshStats();
+  EXPECT_EQ(stats.numStales, 0);
+  EXPECT_EQ(stats.numEntries, 4);
+
+  const auto readOperationsBeforeHotHit = dataIoStats_->read().count();
+  const auto readBytesBeforeHotHit = dataIoStats_->read().sum();
+  const auto readsBeforeHotHit = readFile->numReads();
+  EXPECT_EQ(readRegion(kFullSize), content.substr(kOffset, kFullSize));
+  EXPECT_EQ(readFile->numReads(), readsBeforeHotHit);
+  EXPECT_EQ(dataIoStats_->read().count(), readOperationsBeforeHotHit);
+  EXPECT_EQ(dataIoStats_->read().sum(), readBytesBeforeHotHit);
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+
+  // A seek into an already cached quantum must begin lookup at the aligned
+  // quantum key and walk the cached prefix chain. It must not create an
+  // overlapping entry at the exact seek position.
+  CachedBufferedInput seekInput(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+  auto seekStream =
+      seekInput.enqueue(common::Region{kOffset, kFullSize}, nullptr);
+  seekInput.load(LogType::TEST);
+  constexpr uint64_t kSeekPosition = kLoadQuantum / 2 + 17;
+  ASSERT_TRUE(seekStream->SkipInt64(kSeekPosition));
+  auto next = getNext(*seekStream);
+  ASSERT_TRUE(next.has_value());
+  EXPECT_EQ(
+      next->substr(0, std::min<size_t>(next->size(), 4096)),
+      content.substr(
+          kOffset + kSeekPosition, std::min<size_t>(next->size(), 4096)));
+  EXPECT_EQ(dataIoStats_->read().count(), readOperationsBeforeHotHit);
+  EXPECT_EQ(dataIoStats_->read().sum(), readBytesBeforeHotHit);
+  EXPECT_EQ(cache_->refreshStats().numEntries, 4);
+}
+
+TEST_F(CachedBufferedInputTest, shortSuffixPublishedAfterPlanning) {
+  constexpr uint64_t kContentSize = 2 << 20;
+  constexpr uint64_t kLoadQuantum = 1 << 20;
+  constexpr uint64_t kOffset = 321;
+  constexpr uint64_t kPrefixSize = 64 << 10;
+  constexpr uint64_t kPublishedSuffixSize = 64 << 10;
+
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kLoadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "shortSuffixPublishedAfterPlanning");
+  StringIdLease groupId(ids, "shortSuffixPublishedAfterPlanningGroup");
+
+  auto makeInput = [&]() {
+    return std::make_unique<CachedBufferedInput>(
+        readFile,
+        MetricsLog::voidLog(),
+        fileId,
+        cache_.get(),
+        tracker_,
+        groupId,
+        dataIoStats_,
+        nullptr,
+        nullptr,
+        readerOptions);
+  };
+
+  {
+    auto input = makeInput();
+    auto stream = input->enqueue(common::Region{kOffset, kPrefixSize}, nullptr);
+    input->load(LogType::TEST);
+    EXPECT_EQ(getNext(*stream), content.substr(kOffset, kPrefixSize));
+  }
+
+  auto input = makeInput();
+  auto stream = input->enqueue(common::Region{kOffset, kLoadQuantum}, nullptr);
+  input->load(LogType::TEST);
+  ASSERT_EQ(input->testingCoalescedLoads().size(), 1);
+
+  // Publish a short entry after the larger suffix load has been planned but
+  // before its makePins() call. Prefix-aware pin acquisition must retain this
+  // entry rather than invalidate it as stale.
+  input->cacheRegion(
+      kOffset + kPrefixSize,
+      kPublishedSuffixSize,
+      std::string_view(content).substr(
+          kOffset + kPrefixSize, kPublishedSuffixSize));
+
+  std::string result;
+  while (const auto next = getNext(*stream)) {
+    result.append(next.value());
+  }
+  EXPECT_EQ(result, content.substr(kOffset, kLoadQuantum));
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+  EXPECT_EQ(dataIoStats_->read().sum(), kLoadQuantum - kPublishedSuffixSize);
+  EXPECT_EQ(
+      input->testingCoalescedLoads()[0]->state(),
+      CoalescedLoad::State::kLoaded);
+}
+
+TEST_F(CachedBufferedInputTest, composeMemoryPrefixWithSsdSuffix) {
+  resetCacheWithSsd();
+  constexpr uint64_t kContentSize = 1 << 20;
+  constexpr uint64_t kOffset = 777;
+  constexpr uint64_t kPrefixSize = 64 << 10;
+  constexpr uint64_t kFullSize = 128 << 10;
+
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(1 << 20);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "composeMemoryPrefixWithSsdSuffix");
+  StringIdLease groupId(ids, "composeMemoryPrefixWithSsdSuffixGroup");
+  seedSsd(
+      fileId.id(),
+      kOffset + kPrefixSize,
+      std::string_view(content).substr(
+          kOffset + kPrefixSize, kFullSize - kPrefixSize));
+
+  auto readRegion = [&](uint64_t size) {
+    CachedBufferedInput input(
+        readFile,
+        MetricsLog::voidLog(),
+        fileId,
+        cache_.get(),
+        tracker_,
+        groupId,
+        dataIoStats_,
+        nullptr,
+        nullptr,
+        readerOptions);
+    auto stream = input.enqueue(common::Region{kOffset, size}, nullptr);
+    input.load(LogType::TEST);
+    std::string result;
+    while (const auto next = getNext(*stream)) {
+      result.append(next.value());
+    }
+    return result;
+  };
+
+  EXPECT_EQ(readRegion(kPrefixSize), content.substr(kOffset, kPrefixSize));
+  EXPECT_EQ(readRegion(kFullSize), content.substr(kOffset, kFullSize));
+  EXPECT_EQ(dataIoStats_->read().sum(), kPrefixSize);
+  EXPECT_EQ(dataIoStats_->ssdRead().sum(), kFullSize - kPrefixSize);
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+}
+
+TEST_F(CachedBufferedInputTest, composeSsdPrefixWithStorageSuffix) {
+  resetCacheWithSsd();
+  constexpr uint64_t kContentSize = 1 << 20;
+  constexpr uint64_t kOffset = 913;
+  constexpr uint64_t kPrefixSize = 64 << 10;
+  constexpr uint64_t kFullSize = 256 << 10;
+
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(1 << 20);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "composeSsdPrefixWithStorageSuffix");
+  StringIdLease groupId(ids, "composeSsdPrefixWithStorageSuffixGroup");
+  seedSsd(
+      fileId.id(),
+      kOffset,
+      std::string_view(content).substr(kOffset, kPrefixSize));
+
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+  auto stream = input.enqueue(common::Region{kOffset, kFullSize}, nullptr);
+  input.load(LogType::TEST);
+  ASSERT_EQ(input.testingCoalescedLoads().size(), 2);
+
+  std::string result;
+  while (const auto next = getNext(*stream)) {
+    result.append(next.value());
+  }
+  EXPECT_EQ(result, content.substr(kOffset, kFullSize));
+  EXPECT_EQ(dataIoStats_->ssdRead().sum(), kPrefixSize);
+  EXPECT_EQ(dataIoStats_->read().sum(), kFullSize - kPrefixSize);
+  EXPECT_EQ(cache_->refreshStats().numStales, 0);
+  for (const auto& load : input.testingCoalescedLoads()) {
+    EXPECT_EQ(load->state(), CoalescedLoad::State::kLoaded);
+  }
+}
+
+TEST_F(CachedBufferedInputTest, nonCacheableTracksExactPrefixChain) {
+  constexpr uint64_t kContentSize = 1 << 20;
+  constexpr uint64_t kOffset = 999;
+  constexpr uint64_t kPartSize = 64 << 10;
+  constexpr uint64_t kFullSize = 4 * kPartSize;
+
+  std::string content(kContentSize, 'x');
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kFullSize);
+  readerOptions.setCacheable(false);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "nonCacheableTracksExactPrefixChain");
+  StringIdLease groupId(ids, "nonCacheableTracksExactPrefixChainGroup");
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+
+  for (uint64_t part = 0; part < 4; ++part) {
+    input.cacheRegion(
+        kOffset + part * kPartSize,
+        kPartSize,
+        std::string_view(content).substr(
+            kOffset + part * kPartSize, kPartSize));
+  }
+
+  auto stream = input.enqueue(common::Region{kOffset, kFullSize}, nullptr);
+  input.load(LogType::TEST);
+  stream.reset();
+  for (uint64_t part = 0; part < 4; ++part) {
+    EXPECT_TRUE(cache_->testingIsEvictable(
+        cache::RawFileCacheKey{fileId.id(), kOffset + part * kPartSize}));
+  }
+}
+
+TEST_F(CachedBufferedInputTest, oneStreamConsumesMultipleCoalescedLoads) {
+  constexpr uint64_t kLoadQuantum = 64 << 10;
+  constexpr uint64_t kContentSize = 8 * kLoadQuantum;
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kLoadQuantum);
+  readerOptions.setMaxCoalesceBytes(2 * kLoadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "oneStreamConsumesMultipleCoalescedLoads");
+  StringIdLease groupId(ids, "oneStreamConsumesMultipleCoalescedLoadsGroup");
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+  auto stream = input.enqueue(common::Region{0, kContentSize}, nullptr);
+  input.load(LogType::TEST);
+  ASSERT_GT(input.testingCoalescedLoads().size(), 1);
+  EXPECT_EQ(input.testingStreamToCoalescedLoadSize(), 1);
+
+  std::string result;
+  while (const auto next = getNext(*stream)) {
+    result.append(next.value());
+  }
+  EXPECT_EQ(result, content);
+  EXPECT_EQ(input.testingStreamToCoalescedLoadSize(), 0);
+  EXPECT_EQ(dataIoStats_->read().sum(), kContentSize);
+  EXPECT_EQ(dataIoStats_->read().count(), input.testingCoalescedLoads().size());
+  for (const auto& load : input.testingCoalescedLoads()) {
+    EXPECT_EQ(load->state(), CoalescedLoad::State::kLoaded);
+  }
+}
+
+TEST_F(CachedBufferedInputTest, seekSkipsEarlierCoalescedLoads) {
+  constexpr uint64_t kLoadQuantum = 64 << 10;
+  constexpr uint64_t kContentSize = 8 * kLoadQuantum;
+  constexpr uint64_t kSeekPosition = 6 * kLoadQuantum;
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kLoadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "seekSkipsEarlierCoalescedLoads");
+  StringIdLease groupId(ids, "seekSkipsEarlierCoalescedLoadsGroup");
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+  auto stream = input.enqueue(common::Region{0, kContentSize}, nullptr);
+  input.load(LogType::TEST);
+  ASSERT_EQ(input.testingCoalescedLoads().size(), 8);
+  ASSERT_TRUE(stream->SkipInt64(kSeekPosition));
+
+  auto first = getNext(*stream);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first.value(), content.substr(kSeekPosition, first.value().size()));
+  EXPECT_EQ(dataIoStats_->read().sum(), kLoadQuantum);
+  EXPECT_EQ(dataIoStats_->read().count(), 1);
+  EXPECT_EQ(input.testingStreamToCoalescedLoadSize(), 1);
+  for (int32_t i = 0; i < 6; ++i) {
+    EXPECT_EQ(
+        input.testingCoalescedLoads()[i]->state(),
+        CoalescedLoad::State::kPlanned);
+  }
+  EXPECT_EQ(
+      input.testingCoalescedLoads()[6]->state(), CoalescedLoad::State::kLoaded);
+  EXPECT_EQ(
+      input.testingCoalescedLoads()[7]->state(),
+      CoalescedLoad::State::kPlanned);
+
+  std::string result = std::move(first.value());
+  while (const auto next = getNext(*stream)) {
+    result.append(next.value());
+  }
+  EXPECT_EQ(result, content.substr(kSeekPosition));
+  EXPECT_EQ(dataIoStats_->read().sum(), kContentSize - kSeekPosition);
+  EXPECT_EQ(dataIoStats_->read().count(), 2);
+  EXPECT_EQ(input.testingStreamToCoalescedLoadSize(), 0);
+  for (int32_t i = 0; i < 6; ++i) {
+    EXPECT_EQ(
+        input.testingCoalescedLoads()[i]->state(),
+        CoalescedLoad::State::kPlanned);
+  }
+  EXPECT_EQ(
+      input.testingCoalescedLoads()[7]->state(), CoalescedLoad::State::kLoaded);
+}
+
+TEST_F(CachedBufferedInputTest, mixedLoadsFollowLogicalStreamOrder) {
+  resetCacheWithSsd();
+  constexpr uint64_t kLoadQuantum = 64 << 10;
+  constexpr uint64_t kContentSize = 2 * kLoadQuantum;
+  std::string content(kContentSize, '\0');
+  for (uint64_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<char>(i % 251);
+  }
+  auto readFile = std::make_shared<tests::utils::CountingReadFile>(content);
+  io::ReaderOptions readerOptions(pool_.get());
+  readerOptions.setDataIoStats(dataIoStats_);
+  readerOptions.setMetadataIoStats(metadataIoStats_);
+  readerOptions.setLoadQuantum(kLoadQuantum);
+
+  auto& ids = fileIds();
+  StringIdLease fileId(ids, "mixedLoadsFollowLogicalStreamOrder");
+  StringIdLease groupId(ids, "mixedLoadsFollowLogicalStreamOrderGroup");
+  seedSsd(fileId.id(), 0, std::string_view(content).substr(0, kLoadQuantum));
+
+  CachedBufferedInput input(
+      readFile,
+      MetricsLog::voidLog(),
+      fileId,
+      cache_.get(),
+      tracker_,
+      groupId,
+      dataIoStats_,
+      nullptr,
+      nullptr,
+      readerOptions);
+  auto stream = input.enqueue(common::Region{0, kContentSize}, nullptr);
+  input.load(LogType::TEST);
+  ASSERT_EQ(input.testingCoalescedLoads().size(), 2);
+
+  std::shared_ptr<CoalescedLoad> ssdLoad;
+  std::shared_ptr<CoalescedLoad> storageLoad;
+  for (const auto& load : input.testingCoalescedLoads()) {
+    if (load->isSsdLoad()) {
+      ssdLoad = load;
+    } else {
+      storageLoad = load;
+    }
+  }
+  ASSERT_NE(ssdLoad, nullptr);
+  ASSERT_NE(storageLoad, nullptr);
+  ASSERT_EQ(ssdLoad->state(), CoalescedLoad::State::kPlanned);
+  ASSERT_EQ(storageLoad->state(), CoalescedLoad::State::kPlanned);
+
+  // Storage and SSD requests are planned in separate passes. Accessing the
+  // first quantum must trigger its SSD load, not the later storage load that
+  // happened to be created first.
+  auto first = getNext(*stream);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(ssdLoad->state(), CoalescedLoad::State::kLoaded);
+  EXPECT_EQ(storageLoad->state(), CoalescedLoad::State::kPlanned);
+  EXPECT_EQ(dataIoStats_->ssdRead().sum(), kLoadQuantum);
+  EXPECT_EQ(dataIoStats_->read().sum(), 0);
+
+  std::string result = std::move(first.value());
+  while (const auto next = getNext(*stream)) {
+    result.append(next.value());
+  }
+  EXPECT_EQ(result, content);
+  EXPECT_EQ(storageLoad->state(), CoalescedLoad::State::kLoaded);
+  EXPECT_EQ(dataIoStats_->read().sum(), kLoadQuantum);
+}
+
 TEST_F(CachedBufferedInputTest, readAfterReset) {
   constexpr int32_t kContentSize = 4 << 20; // 4MB
   std::string content;

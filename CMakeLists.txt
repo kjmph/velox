@@ -385,8 +385,13 @@ if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
   unset(VELOX_S3_DIRECT_RECEIVE_DEPENDENCIES_SUPPORTED CACHE)
   check_cxx_source_compiles(
     "
+      #include <aws/core/SDKConfig.h>
       #include <aws/core/http/DirectResponseReceiveStream.h>
+      #include <aws/core/http/curl/AdaptiveTcpMssPolicy.h>
       #include <curl/curl.h>
+      #ifndef AWS_CURL_HAS_ADAPTIVE_TCP_MSS
+      #error AWS SDK lacks adaptive TCP MSS support
+      #endif
       #ifndef CURL_HAS_RECV_BUFFER_CALLBACKS
       #error curl lacks caller-owned receive buffers
       #endif
@@ -404,7 +409,8 @@ if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
         curl_easy_cleanup(easy);
         return result == CURLE_OK &&
                 curl_recv_buffer_build_version_v1() == 1 &&
-                Aws::Http::GetDirectResponseReceiveApiVersionV2() == 2
+                Aws::Http::GetDirectResponseReceiveApiVersionV2() == 2 &&
+                Aws::Http::GetAdaptiveTcpMssApiVersionV1() == 1
             ? 0
             : 1;
       }
@@ -415,8 +421,8 @@ if(VELOX_ENABLE_S3_DIRECT_RECEIVE)
   if(NOT VELOX_S3_DIRECT_RECEIVE_DEPENDENCIES_SUPPORTED)
     message(
       FATAL_ERROR
-      "S3 direct receive requires the patched AWS SDK ABI and curl "
-      "caller-owned receive-buffer API"
+      "S3 direct receive requires the patched AWS SDK direct-receive and "
+      "adaptive TCP MSS ABIs plus the curl caller-owned receive-buffer API"
     )
   endif()
 

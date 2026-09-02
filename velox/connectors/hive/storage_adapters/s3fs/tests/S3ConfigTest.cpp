@@ -38,11 +38,13 @@ TEST(S3ConfigTest, defaultConfig) {
   ASSERT_EQ(s3Config.iamRoleSessionName(), "velox-session");
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Never");
   ASSERT_EQ(
-      s3Config.cacheKey("foo", config), "s3:v1:0::3:foo:8:disabled:4:true");
+      s3Config.cacheKey("foo", config),
+      "s3:v2:0::3:foo:8:disabled:4:true:5:false");
   ASSERT_EQ(s3Config.bucket(), "");
   ASSERT_EQ(s3Config.useIMDS(), true);
   ASSERT_EQ(s3Config.minPartSize(), 10485760);
   ASSERT_EQ(s3Config.directReceiveMode(), S3DirectReceiveMode::DISABLED);
+  ASSERT_FALSE(s3Config.adaptiveTcpMss());
 }
 
 TEST(S3ConfigTest, overrideConfig) {
@@ -62,6 +64,7 @@ TEST(S3ConfigTest, overrideConfig) {
        "my-credentials-provider"},
       {S3Config::baseConfigKey(S3Config::Keys::kIMDSEnabled), "false"},
       {S3Config::baseConfigKey(S3Config::Keys::kMultipartMinPartSize), "20MB"},
+      {S3Config::baseConfigKey(S3Config::Keys::kAdaptiveTcpMss), "true"},
       {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
        "preferred"}};
   auto configBase =
@@ -79,15 +82,16 @@ TEST(S3ConfigTest, overrideConfig) {
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "RequestDependent");
   ASSERT_EQ(
       s3Config.cacheKey("foo", configBase),
-      "s3:v1:8:endpoint:3:foo:9:preferred:5:false");
+      "s3:v2:8:endpoint:3:foo:9:preferred:5:false:4:true");
   ASSERT_EQ(
       s3Config.cacheKey("bar", configBase),
-      "s3:v1:8:endpoint:3:bar:9:preferred:5:false");
+      "s3:v2:8:endpoint:3:bar:9:preferred:5:false:4:true");
   ASSERT_EQ(s3Config.bucket(), "bucket");
   ASSERT_EQ(s3Config.credentialsProvider(), "my-credentials-provider");
   ASSERT_EQ(s3Config.useIMDS(), false);
   ASSERT_EQ(s3Config.minPartSize(), 20971520);
   ASSERT_EQ(s3Config.directReceiveMode(), S3DirectReceiveMode::PREFERRED);
+  ASSERT_TRUE(s3Config.adaptiveTcpMss());
   ASSERT_EQ(
       s3Config.effectiveDirectReceiveMode(),
       S3DirectReceiveMode::CALLER_BUFFER);
@@ -148,16 +152,16 @@ TEST(S3ConfigTest, directReceivePolicyIsPartOfFileSystemCacheIdentity) {
   };
 
   EXPECT_EQ(
-      "s3:v1:8:endpoint:6:bucket:8:disabled:4:true",
+      "s3:v2:8:endpoint:6:bucket:8:disabled:4:true:5:false",
       S3Config::cacheKey("bucket", makeProperties("disabled", "true")));
   EXPECT_EQ(
-      "s3:v1:8:endpoint:6:bucket:13:caller-buffer:4:true",
+      "s3:v2:8:endpoint:6:bucket:13:caller-buffer:4:true:5:false",
       S3Config::cacheKey("bucket", makeProperties("caller-buffer", "true")));
   EXPECT_EQ(
-      "s3:v1:8:endpoint:6:bucket:9:preferred:4:true",
+      "s3:v2:8:endpoint:6:bucket:9:preferred:4:true:5:false",
       S3Config::cacheKey("bucket", makeProperties("PREFERRED", "TRUE")));
   EXPECT_EQ(
-      "s3:v1:8:endpoint:6:bucket:9:preferred:5:false",
+      "s3:v2:8:endpoint:6:bucket:9:preferred:5:false:5:false",
       S3Config::cacheKey("bucket", makeProperties("preferred", "false")));
 
   auto disabledProperties = std::make_shared<config::ConfigBase>(
@@ -167,6 +171,17 @@ TEST(S3ConfigTest, directReceivePolicyIsPartOfFileSystemCacheIdentity) {
       S3Config::cacheKey(
           "endpoint-bucket-direct-receive-preferred-ssl-true",
           disabledProperties));
+
+  auto adaptiveProperties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {S3Config::baseConfigKey(S3Config::Keys::kEndpoint), "endpoint"},
+          {S3Config::baseConfigKey(S3Config::Keys::kDirectReceiveMode),
+           "preferred"},
+          {S3Config::baseConfigKey(S3Config::Keys::kSSLEnabled), "true"},
+          {S3Config::baseConfigKey(S3Config::Keys::kAdaptiveTcpMss), "true"}});
+  EXPECT_NE(
+      S3Config::cacheKey("bucket", makeProperties("preferred", "true")),
+      S3Config::cacheKey("bucket", adaptiveProperties));
 }
 
 TEST(S3ConfigTest, overrideBucketConfig) {
@@ -210,10 +225,10 @@ TEST(S3ConfigTest, overrideBucketConfig) {
   ASSERT_EQ(s3Config.payloadSigningPolicy(), "Always");
   ASSERT_EQ(
       s3Config.cacheKey(bucket, configBase),
-      "s3:v1:30:bucket.s3-region.amazonaws.com:6:bucket:8:disabled:5:false");
+      "s3:v2:30:bucket.s3-region.amazonaws.com:6:bucket:8:disabled:5:false:5:false");
   ASSERT_EQ(
       s3Config.cacheKey("foo", configBase),
-      "s3:v1:8:endpoint:3:foo:8:disabled:5:false");
+      "s3:v2:8:endpoint:3:foo:8:disabled:5:false:5:false");
   ASSERT_EQ(s3Config.credentialsProvider(), "override-credentials-provider");
   ASSERT_EQ(s3Config.useIMDS(), false);
   ASSERT_EQ(s3Config.minPartSize(), 20971520);

@@ -268,7 +268,7 @@ TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchPreservesRequestsAndOrder) {
 }
 
 TEST_F(CudfSplitReaderHelpersTest, deviceReadBatchRetainsCachedRuns) {
-  PinnedStagingArena::configure(false, 0, 0);
+  PinnedStagingArena::configure(false, 0, 0, 0);
   constexpr size_t kLoadQuantum = 64 << 10;
   std::string inputData(kLoadQuantum * 2 + 113, '\0');
   for (size_t index = 0; index < inputData.size(); ++index) {
@@ -379,7 +379,7 @@ TEST_F(
   constexpr size_t kWindowBytes = 1 << 20;
   constexpr size_t kReadOffset = 43;
   constexpr size_t kReadSize = kWindowBytes + kLoadQuantum;
-  PinnedStagingArena::configure(true, kWindowBytes, 2);
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 1);
   auto arenaBlocker = PinnedStagingArena::acquirePair();
   ASSERT_TRUE(arenaBlocker.has_value());
 
@@ -465,7 +465,17 @@ TEST_F(
 
   cache->clear();
   EXPECT_EQ(cache->refreshStats().numEntries, 0);
-  EXPECT_GT(ioStats->stats().at("cudfPinnedStagingAcquireNanos").sum, 0);
+  const auto metrics = ioStats->stats();
+  EXPECT_GT(metrics.at("cudfPinnedStagingAcquireNanos").sum, 0);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingContendedAcquisitions").sum, 1);
+  const auto& activeLeaseSamples =
+      metrics.at("cudfPinnedStagingActiveLeasesAtAcquireSamples");
+  EXPECT_EQ(activeLeaseSamples.sum, 1);
+  EXPECT_EQ(activeLeaseSamples.count, 1);
+  const auto& capacitySamples =
+      metrics.at("cudfPinnedStagingWindowSetCapacityAtAcquireSamples");
+  EXPECT_EQ(capacitySamples.sum, 1);
+  EXPECT_EQ(capacitySamples.count, 1);
   cache->shutdown();
 }
 
@@ -476,7 +486,7 @@ TEST_F(
   constexpr size_t kWindowBytes = 1 << 20;
   constexpr size_t kReadOffset = 37;
   constexpr size_t kReadSize = kWindowBytes + kLoadQuantum;
-  PinnedStagingArena::configure(true, kWindowBytes, 2);
+  PinnedStagingArena::configure(true, kWindowBytes, 2, 1);
 
   std::string inputData(kReadOffset + kReadSize, '\0');
   for (size_t index = 0; index < inputData.size(); ++index) {
@@ -581,6 +591,14 @@ TEST_F(
   EXPECT_EQ(metrics.at("cudfPinnedStagingTransfers").sum, 1);
   EXPECT_EQ(metrics.at("cudfPinnedStagingBytes").sum, kReadSize);
   EXPECT_EQ(metrics.at("cudfPinnedStagingWindows").sum, 2);
+  const auto& activeLeaseSamples =
+      metrics.at("cudfPinnedStagingActiveLeasesAtAcquireSamples");
+  EXPECT_EQ(activeLeaseSamples.sum, 1);
+  EXPECT_EQ(activeLeaseSamples.count, 1);
+  const auto& capacitySamples =
+      metrics.at("cudfPinnedStagingWindowSetCapacityAtAcquireSamples");
+  EXPECT_EQ(capacitySamples.sum, 1);
+  EXPECT_EQ(capacitySamples.count, 1);
   EXPECT_EQ(metrics.count("cudfPinnedStagingFallbacks"), 0);
   cache->shutdown();
 }
@@ -588,7 +606,7 @@ TEST_F(
 TEST_F(CudfSplitReaderHelpersTest, stagedDeviceReadRollsAcrossBothWindows) {
   constexpr size_t kWindowBytes = 256 << 10;
   constexpr size_t kReadSize = (2 << 20) + 113;
-  PinnedStagingArena::configure(true, kWindowBytes, 4);
+  PinnedStagingArena::configure(true, kWindowBytes, 4, 1);
 
   std::string inputData(kReadSize, '\0');
   for (size_t index = 0; index < inputData.size(); ++index) {
@@ -618,12 +636,21 @@ TEST_F(CudfSplitReaderHelpersTest, stagedDeviceReadRollsAcrossBothWindows) {
   EXPECT_EQ(metrics.at("cudfPinnedStagingTransfers").sum, 1);
   EXPECT_EQ(metrics.at("cudfPinnedStagingBytes").sum, kReadSize);
   EXPECT_EQ(metrics.at("cudfPinnedStagingWindows").sum, 9);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingMemcpyBatchAttempts").sum, 9);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingMemcpyBatchCopies").sum, 9);
+#if CUDART_VERSION >= 13000
+  EXPECT_EQ(metrics.at("cudfPinnedStagingNativeMemcpyBatchAttempts").sum, 9);
+  EXPECT_EQ(metrics.at("cudfPinnedStagingNativeMemcpyBatchCopies").sum, 9);
+#else
+  EXPECT_EQ(metrics.count("cudfPinnedStagingNativeMemcpyBatchAttempts"), 0);
+  EXPECT_EQ(metrics.count("cudfPinnedStagingNativeMemcpyBatchCopies"), 0);
+#endif
   EXPECT_EQ(metrics.at("cudfCopiedSourceBytes").sum, kReadSize);
 }
 
 TEST_F(CudfSplitReaderHelpersTest, asyncLoadCompletesBeforePinnedStaging) {
   constexpr size_t kReadSize = (1 << 20) + 31;
-  PinnedStagingArena::configure(true, 256 << 10, 2);
+  PinnedStagingArena::configure(true, 256 << 10, 2, 1);
 
   std::string inputData(kReadSize, '\0');
   for (size_t index = 0; index < inputData.size(); ++index) {
@@ -664,7 +691,7 @@ TEST_F(CudfSplitReaderHelpersTest, asyncLoadCompletesBeforePinnedStaging) {
 
 TEST_F(CudfSplitReaderHelpersTest, disabledStagingIsNotAFailure) {
   constexpr size_t kReadSize = (1 << 20) + 13;
-  PinnedStagingArena::configure(false, 0, 0);
+  PinnedStagingArena::configure(false, 0, 0, 0);
 
   std::string inputData(kReadSize, 'd');
   auto input = std::make_shared<BufferedInput>(
@@ -695,7 +722,7 @@ TEST_F(CudfSplitReaderHelpersTest, disabledStagingIsNotAFailure) {
 TEST_F(CudfSplitReaderHelpersTest, stagingAllocationFailureFallsBack) {
   constexpr size_t kReadSize = (1 << 20) + 17;
   PinnedStagingArena::setAllocationFailureForTesting(true);
-  PinnedStagingArena::configure(true, 256 << 10, 2);
+  PinnedStagingArena::configure(true, 256 << 10, 2, 1);
 
   std::string inputData(kReadSize, '\0');
   for (size_t index = 0; index < inputData.size(); ++index) {

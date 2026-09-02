@@ -47,6 +47,8 @@ struct CudfConfig {
       "cudf.host_to_device_staging_window_bytes"};
   static constexpr const char* kCudfHostToDeviceStagingPackThreads{
       "cudf.host_to_device_staging_pack_threads"};
+  static constexpr const char* kCudfHostToDeviceStagingWindowSets{
+      "cudf.host_to_device_staging_window_sets"};
   static constexpr const char* kCudfAllowCpuFallback{"cudf.allow_cpu_fallback"};
   static constexpr const char* kCudfLogFallback{"cudf.log_fallback"};
   static constexpr const char* kCudfBatchSizeMinThreshold{
@@ -93,11 +95,15 @@ struct CudfConfig {
   /// staging before asynchronous host-to-device copies.
   bool hostToDeviceStagingEnabled{true};
 
-  /// Bytes in each of the two process-global pinned staging windows.
+  /// Bytes in each process-global pinned staging window.
   uint64_t hostToDeviceStagingWindowBytes{128ULL << 20};
 
-  /// Persistent host copy threads used to pack a staging window.
+  /// Persistent host copy threads per staging window set. Total persistent
+  /// pack threads are this value multiplied by hostToDeviceStagingWindowSets.
   uint32_t hostToDeviceStagingPackThreads{4};
+
+  /// Concurrent two-window sets in the process-global staging arena.
+  uint32_t hostToDeviceStagingWindowSets{2};
 
   /// Register all the functions with the functionNamePrefix.
   std::string functionNamePrefix;

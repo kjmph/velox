@@ -54,11 +54,13 @@ std::string S3Config::cacheKey(
   folly::toLowerAscii(directReceiveMode);
   auto sslEnabled = configuredValue(Keys::kSSLEnabled);
   folly::toLowerAscii(sslEnabled);
+  auto adaptiveTcpMss = configuredValue(Keys::kAdaptiveTcpMss);
+  folly::toLowerAscii(adaptiveTcpMss);
 
   // The filesystem registry accepts only a string cache key. Length-prefix
   // every field so endpoint and bucket text cannot collide with policy
   // delimiters or with each other.
-  std::string key{"s3:v1"};
+  std::string key{"s3:v2"};
   auto appendField = [&](std::string_view value) {
     key.append(fmt::format(":{}:", value.size()));
     key.append(value.data(), value.size());
@@ -67,6 +69,7 @@ std::string S3Config::cacheKey(
   appendField(bucket);
   appendField(directReceiveMode);
   appendField(sslEnabled);
+  appendField(adaptiveTcpMss);
   return key;
 }
 

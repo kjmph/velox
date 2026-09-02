@@ -1306,6 +1306,10 @@ do not resolve these patched dependencies.
        Otherwise, the file is split into multiple equal sized chunks of this part size excluding the last chunk.
        The `AWS specification <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html> `_ limits the part size between 5MB and 5GB.
        Some S3 backend providers enforce these limits strictly.
+   * - hive.s3.adaptive-tcp-mss-enabled
+     - bool
+     - false
+     - Experimental. Observe ``TCP_INFO`` after successful, sufficiently large S3 responses and avoid reusing standard-MTU connections only after a jumbo-capable connection has been observed on the same local address and IP family. A bounded fallback retains a working standard-MTU connection if jumbo connectivity disappears. Linux and the patched AWS SDK curl client only. Proxied connections are not classified.
    * - hive.s3.direct-receive-mode
      - string
      - disabled

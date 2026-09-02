@@ -80,6 +80,7 @@ class S3Config {
     kCredentialsProvider,
     kIMDSEnabled,
     kMultipartMinPartSize,
+    kAdaptiveTcpMss,
     kDirectReceiveMode,
     kEnd
   };
@@ -122,6 +123,8 @@ class S3Config {
             {Keys::kIMDSEnabled, std::make_pair("aws-imds-enabled", "true")},
             {Keys::kMultipartMinPartSize,
              std::make_pair("min-part-size", "10MB")},
+            {Keys::kAdaptiveTcpMss,
+             std::make_pair("adaptive-tcp-mss-enabled", "false")},
             {Keys::kDirectReceiveMode,
              std::make_pair("direct-receive-mode", "disabled")},
         };
@@ -260,6 +263,13 @@ class S3Config {
   }
 
   size_t minPartSize() const;
+
+  /// Observe successful S3 responses and avoid reusing standard-MTU TCP
+  /// connections only after this process proves a jumbo path on the same
+  /// local address. The transport retains a bounded standard-MTU fallback.
+  bool adaptiveTcpMss() const {
+    return folly::to<bool>(config_.find(Keys::kAdaptiveTcpMss)->second.value());
+  }
 
   /// Returns the configured direct-receive policy before transport resolution.
   S3DirectReceiveMode directReceiveMode() const;

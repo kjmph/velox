@@ -32,6 +32,10 @@
 #include <stdexcept>
 
 #include <aws/core/Aws.h>
+#include <aws/core/SDKConfig.h>
+#if defined(AWS_CURL_HAS_ADAPTIVE_TCP_MSS)
+#include <aws/core/http/curl/AdaptiveTcpMssPolicy.h>
+#endif
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/AdaptiveRetryStrategy.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
@@ -292,6 +296,22 @@ class S3FileSystem::Impl {
     if (s3Config_->maxConnections().has_value()) {
       clientConfig.maxConnections = s3Config_->maxConnections().value();
     }
+
+#if defined(AWS_CURL_HAS_ADAPTIVE_TCP_MSS)
+    if (s3Config_->adaptiveTcpMss()) {
+      VELOX_USER_CHECK_EQ(
+          Aws::Http::GetAdaptiveTcpMssApiVersionV1(),
+          1U,
+          "hive.s3.adaptive-tcp-mss-enabled requires AWS SDK adaptive TCP "
+          "MSS API version 1");
+    }
+    clientConfig.curlOptions.adaptiveTcpMss = s3Config_->adaptiveTcpMss();
+#else
+    VELOX_USER_CHECK(
+        !s3Config_->adaptiveTcpMss(),
+        "hive.s3.adaptive-tcp-mss-enabled requires an AWS SDK build with "
+        "adaptive TCP MSS support");
+#endif
 
     auto retryStrategy = getRetryStrategy(s3Config_);
     if (retryStrategy.has_value()) {

@@ -1029,6 +1029,223 @@ TEST_F(AggregationTest, partialAggregationOmitsDiagnosticFlushThresholdStat) {
           .customStats.count("cudfPartialAggregationFlushThresholdBytes"));
 }
 
+TEST_F(AggregationTest, partialAggregationSlicesOversizedInput) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  constexpr int32_t kMaxSliceRows = 7;
+  cudfConfig.batchSizeMaxThreshold = kMaxSliceRows;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  constexpr vector_size_t kRows = 33;
+  auto input = makeRowVector({
+      makeFlatVector<int32_t>(kRows, [](auto row) { return row % 9; }),
+      makeFlatVector<int64_t>(
+          kRows, [](auto row) { return static_cast<int64_t>(row + 1); }),
+  });
+  createDuckDbTable({input});
+
+  core::PlanNodeId partialAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(
+              PlanBuilder()
+                  .values({input})
+                  .partialAggregation(
+                      {"c0"}, {"sum(c1)", "count(c1)", "min(c1)", "max(c1)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults(
+              "SELECT c0, sum(c1), count(c1), min(c1), max(c1) "
+              "FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& partialStats = planStats.at(partialAggId);
+  EXPECT_GT(
+      partialStats.customStats.at("cudfGroupbyInputSliceTargetBytes").sum, 0);
+  EXPECT_EQ(
+      partialStats.customStats.at("cudfGroupbyInputSlices").sum,
+      (kRows + kMaxSliceRows - 1) / kMaxSliceRows);
+  EXPECT_EQ(
+      partialStats.customStats.at("cudfGroupbyInputSliceRows").sum, kRows);
+  EXPECT_EQ(
+      partialStats.customStats.at("cudfGroupbyMaxInputSliceRows").max,
+      kMaxSliceRows);
+}
+
+TEST_F(AggregationTest, partialAggregationSlicesByByteBudgetWithoutRowLimit) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMaxThreshold.reset();
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  constexpr vector_size_t kRows = 41;
+  constexpr int64_t kInputWorkBytes = 64;
+  const auto makeInput = [&](vector_size_t begin, vector_size_t size) {
+    return makeRowVector({
+        makeFlatVector<int32_t>(
+            size, [begin](auto row) { return begin + row; }),
+        makeFlatVector<int64_t>(
+            size,
+            [begin](auto row) {
+              return static_cast<int64_t>(begin + row + 1);
+            }),
+    });
+  };
+  auto firstInput = makeInput(0, 4);
+  auto secondInput = makeInput(4, kRows - 4);
+  createDuckDbTable({firstInput, secondInput});
+
+  core::PlanNodeId partialAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, kInputWorkBytes)
+          .plan(
+              PlanBuilder()
+                  .values({firstInput, secondInput})
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& partialStats = planStats.at(partialAggId);
+  EXPECT_LE(
+      partialStats.customStats.at("cudfGroupbyInputSliceTargetBytes").max,
+      kInputWorkBytes);
+  EXPECT_GT(partialStats.customStats.at("cudfGroupbyInputSlices").sum, 1);
+  EXPECT_EQ(
+      partialStats.customStats.at("cudfGroupbyInputSliceRows").sum, kRows);
+  EXPECT_LT(
+      partialStats.customStats.at("cudfGroupbyMaxInputSliceRows").max, kRows);
+  EXPECT_GT(
+      partialStats.customStats.at("cudfPartialAggregationPreSliceFlush").sum,
+      0);
+  EXPECT_GT(
+      partialStats.customStats.at("cudfPartialAggregationDeferredInput").sum,
+      0);
+}
+
+TEST_F(AggregationTest, closeReleasesPendingPartialInput) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMaxThreshold = 2;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  auto rawInput = makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2, 3, 4}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto planNode = PlanBuilder()
+                      .values({rawInput})
+                      .partialAggregation({"c0"}, {"sum(c1)"})
+                      .planNode();
+  auto partialAggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  ASSERT_NE(partialAggregation, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "AggregationTest.closePendingPartialInput",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  cudf_velox::CudfGroupby groupby(0, &driverCtx, partialAggregation);
+  groupby.initialize();
+
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto ownedTable =
+      std::shared_ptr<cudf::table>(cudf_velox::with_arrow::toCudfTable(
+          rawInput, pool(), stream, cudf::get_current_device_resource_ref()));
+  std::weak_ptr<cudf::table> weakOwner = ownedTable;
+  auto cudfInput = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      partialAggregation->sources()[0]->outputType(),
+      rawInput->size(),
+      ownedTable->view(),
+      cudf_velox::CudfVector::ViewOwner{ownedTable},
+      stream);
+  ownedTable.reset();
+
+  groupby.addInput(std::move(cudfInput));
+  EXPECT_FALSE(groupby.needsInput());
+  EXPECT_FALSE(weakOwner.expired());
+  groupby.close();
+  EXPECT_TRUE(weakOwner.expired())
+      << "close() must release an oversized input with unprocessed slices";
+}
+
+TEST_F(AggregationTest, noMoreInputDrainsPendingPartialSlices) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMaxThreshold = 2;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  auto rawInput = makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2, 3, 4}),
+      makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+  });
+  auto planNode = PlanBuilder()
+                      .values({rawInput})
+                      .partialAggregation({"c0"}, {"sum(c1)"})
+                      .planNode();
+  auto partialAggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  ASSERT_NE(partialAggregation, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "AggregationTest.drainPendingPartialInput",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  cudf_velox::CudfGroupby groupby(0, &driverCtx, partialAggregation);
+  groupby.initialize();
+
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto ownedTable =
+      std::shared_ptr<cudf::table>(cudf_velox::with_arrow::toCudfTable(
+          rawInput, pool(), stream, cudf::get_current_device_resource_ref()));
+  auto cudfInput = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      partialAggregation->sources()[0]->outputType(),
+      rawInput->size(),
+      ownedTable->view(),
+      cudf_velox::CudfVector::ViewOwner{ownedTable},
+      stream);
+
+  groupby.addInput(std::move(cudfInput));
+  groupby.noMoreInput();
+
+  vector_size_t outputRows = 0;
+  for (int32_t attempts = 0; attempts < 10 && !groupby.isFinished();
+       ++attempts) {
+    if (auto output = groupby.getOutput()) {
+      outputRows += output->size();
+    }
+  }
+  EXPECT_TRUE(groupby.isFinished());
+  EXPECT_EQ(outputRows, rawInput->size());
+  groupby.close();
+}
+
 TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   auto vectors = {
       makeRowVector({makeFlatVector<int32_t>(

@@ -63,6 +63,7 @@ constexpr uint64_t kMinFinalAggregationBucketBytes = 128ULL << 20;
 constexpr uint64_t kMaxFinalAggregationBucketBytes = 1ULL << 30;
 constexpr uint32_t kMaxFinalAggregationPartitionFanout = 256;
 constexpr uint32_t kMaxFinalAggregationHashDepth = 8;
+constexpr uint64_t kDecimalAggregateStateWorkBytes = 64;
 
 uint64_t ceilingDivide(uint64_t dividend, uint64_t divisor) {
   VELOX_CHECK_GT(divisor, 0);
@@ -74,6 +75,13 @@ uint64_t saturatedAdd(uint64_t lhs, uint64_t rhs) {
     return std::numeric_limits<uint64_t>::max();
   }
   return lhs + rhs;
+}
+
+uint64_t saturatedMultiply(uint64_t lhs, uint64_t rhs) {
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return lhs * rhs;
 }
 
 uint32_t roundUpToPowerOfTwo(uint64_t value, uint32_t maximum) {
@@ -90,6 +98,26 @@ uint32_t advanceHashSeed(uint32_t& seed) {
   // hash functions without making output depend on process-global state.
   seed = seed * 1664525U + 1013904223U;
   return seed;
+}
+
+uint64_t conservativePhysicalBytesPerRow(const TypePtr& type) {
+  // Account for one byte of nullability per logical column. This deliberately
+  // overestimates cuDF's bit mask so the row budget remains conservative for
+  // small slices as well as large ones.
+  constexpr uint64_t kNullByte = 1;
+  if (type->isFixedWidth()) {
+    return saturatedAdd(type->cppSizeInBytes(), kNullByte);
+  }
+
+  // Variable-width columns need at least an offset and a null bit per row.
+  // Their payload is covered by the actual input bytes-per-row estimate used
+  // alongside this projected intermediate-state estimate.
+  uint64_t bytes = saturatedAdd(sizeof(cudf::size_type), kNullByte);
+  for (uint32_t i = 0; i < type->size(); ++i) {
+    bytes =
+        saturatedAdd(bytes, conservativePhysicalBytesPerRow(type->childAt(i)));
+  }
+  return bytes;
 }
 
 std::unique_ptr<cudf::column> takeGroupbyResultColumn(
@@ -1138,8 +1166,6 @@ void CudfGroupby::initialize() {
       outputType_,
       aggregationInput.constants,
       &aggregationInputChannels_);
-  partialAggregationFlushThresholdBytes_ =
-      partialAggregationFlushThresholdBytes();
   nextFinalAggregationHashSeed_ = cudf::DEFAULT_HASH_SEED;
   streamingEnabled_ = !hasCompanionAggregates(aggregationNode_->aggregates());
 
@@ -1174,6 +1200,35 @@ void CudfGroupby::initialize() {
     }
   }
 
+  partialAggregationFlushThresholdBytes_ =
+      partialAggregationFlushThresholdBytes();
+  if (streamingEnabled_ && isPartialOutput_) {
+    // A partial group-by can expand narrow raw input into wider serialized
+    // intermediate state. Use the same finite byte target for input work and
+    // retained partial output so neither the first aggregation nor the
+    // pre-compaction concatenate can grow to an unbounded input batch.
+    groupbyInputSliceTargetBytes_ = std::min<uint64_t>(
+        finalAggregationBucketTargetBytes(),
+        static_cast<uint64_t>(
+            std::max<int64_t>(partialAggregationFlushThresholdBytes_, 1)));
+    partialAggregationFlushThresholdBytes_ =
+        saturateCast(groupbyInputSliceTargetBytes_);
+    projectedIntermediateBytesPerRow_ =
+        projectedIntermediateBytesPerRow(*aggregationNode_);
+
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfGroupbyInputSliceTargetBytes",
+        RuntimeCounter(
+            saturateCast(groupbyInputSliceTargetBytes_),
+            RuntimeCounter::Unit::kBytes));
+    lockedStats->addRuntimeStat(
+        "cudfGroupbyProjectedIntermediateBytesPerRow",
+        RuntimeCounter(
+            saturateCast(projectedIntermediateBytesPerRow_),
+            RuntimeCounter::Unit::kBytes));
+  }
+
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
   // output types reported by aggregation functions. We can't do that in cudf
@@ -1185,6 +1240,159 @@ void CudfGroupby::initialize() {
   // TODO: Add support for grouping sets and group ids.
 
   aggregationNode_.reset();
+}
+
+uint64_t CudfGroupby::projectedIntermediateBytesPerRow(
+    const core::AggregationNode& aggregationNode) const {
+  VELOX_CHECK_NOT_NULL(bufferedResultType_);
+  const auto numKeys = aggregationNode.groupingKeys().size();
+  VELOX_CHECK_GE(bufferedResultType_->size(), numKeys + numAggregates_);
+
+  uint64_t projectedBytes = 0;
+  for (size_t i = 0; i < numKeys; ++i) {
+    projectedBytes = saturatedAdd(
+        projectedBytes,
+        conservativePhysicalBytesPerRow(bufferedResultType_->childAt(i)));
+  }
+
+  const auto& functionPrefix = CudfConfig::getInstance().functionNamePrefix;
+  for (size_t i = 0; i < numAggregates_; ++i) {
+    const auto& aggregate = aggregationNode.aggregates()[i];
+    const auto functionName = getOriginalName(aggregate.call->name());
+    const bool isDecimalState = aggregate.rawInputTypes.size() == 1 &&
+        aggregate.rawInputTypes.front()->isDecimal() &&
+        (functionName.rfind(functionPrefix + "sum", 0) == 0 ||
+         functionName.rfind(functionPrefix + "avg", 0) == 0);
+    projectedBytes = saturatedAdd(
+        projectedBytes,
+        isDecimalState ? kDecimalAggregateStateWorkBytes
+                       : conservativePhysicalBytesPerRow(
+                             bufferedResultType_->childAt(numKeys + i)));
+  }
+  return std::max<uint64_t>(projectedBytes, 1);
+}
+
+uint64_t CudfGroupby::inputSliceTargetRows(const CudfVector& input) const {
+  VELOX_CHECK_GT(input.size(), 0);
+  VELOX_CHECK_GT(groupbyInputSliceTargetBytes_, 0);
+  VELOX_CHECK_GT(projectedIntermediateBytesPerRow_, 0);
+
+  const auto inputRows = static_cast<uint64_t>(input.size());
+  const auto actualInputBytesPerRow = std::max<uint64_t>(
+      ceilingDivide(std::max<uint64_t>(input.estimateFlatSize(), 1), inputRows),
+      1);
+  // The source owner remains resident while its zero-copy views drain. Sum
+  // the input and projected state widths anyway to leave room for cuDF's
+  // casts, hash table, and result allocations. This is a conservative work
+  // budget for fixed-width aggregates, not worker-wide admission control.
+  const auto workBytesPerRow =
+      saturatedAdd(actualInputBytesPerRow, projectedIntermediateBytesPerRow_);
+  uint64_t targetRows =
+      std::max<uint64_t>(groupbyInputSliceTargetBytes_ / workBytesPerRow, 1);
+
+  const auto& config = CudfConfig::getInstance();
+  if (config.batchSizeMaxThreshold.has_value()) {
+    VELOX_CHECK_GT(
+        config.batchSizeMaxThreshold.value(),
+        0,
+        "cuDF max batch size must be positive");
+    targetRows = std::min<uint64_t>(
+        targetRows,
+        static_cast<uint64_t>(config.batchSizeMaxThreshold.value()));
+  }
+  return std::min<uint64_t>(
+      targetRows,
+      static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max()));
+}
+
+void CudfGroupby::installPendingInput(CudfVectorPtr input) {
+  VELOX_CHECK_NOT_NULL(input);
+  VELOX_CHECK_GT(input->size(), 0);
+  VELOX_CHECK_NULL(pendingInput_);
+  VELOX_CHECK_EQ(pendingInputOffset_, 0);
+  VELOX_CHECK_EQ(pendingInputSliceRows_, 0);
+
+  const auto targetRows = inputSliceTargetRows(*input);
+  VELOX_CHECK_GT(targetRows, 0);
+  pendingInputSliceRows_ = static_cast<vector_size_t>(
+      std::min<uint64_t>(targetRows, static_cast<uint64_t>(input->size())));
+  pendingInput_ = std::move(input);
+}
+
+bool CudfGroupby::shouldFlushBeforeNextPendingInputSlice() const {
+  if (!bufferedResult_ || !pendingInput_) {
+    return false;
+  }
+
+  const auto remainingRows =
+      static_cast<uint64_t>(pendingInput_->size() - pendingInputOffset_);
+  const auto nextSliceRows = std::min<uint64_t>(
+      remainingRows, static_cast<uint64_t>(pendingInputSliceRows_));
+  const auto projectedNextStateBytes =
+      saturatedMultiply(nextSliceRows, projectedIntermediateBytesPerRow_);
+  return saturatedAdd(
+             bufferedResult_->estimateFlatSize(), projectedNextStateBytes) >
+      static_cast<uint64_t>(partialAggregationFlushThresholdBytes_);
+}
+
+void CudfGroupby::processNextPendingInputSlice() {
+  VELOX_CHECK_NOT_NULL(pendingInput_);
+  VELOX_CHECK_GT(pendingInputSliceRows_, 0);
+
+  const auto ownerRows = pendingInput_->size();
+  VELOX_CHECK_LT(pendingInputOffset_, ownerRows);
+  const auto begin = pendingInputOffset_;
+  const auto end = static_cast<vector_size_t>(std::min<int64_t>(
+      static_cast<int64_t>(ownerRows),
+      static_cast<int64_t>(begin) + pendingInputSliceRows_));
+  const auto sliceRows = end - begin;
+  VELOX_CHECK_GT(sliceRows, 0);
+
+  CudfVectorPtr slice;
+  if (begin == 0 && end == ownerRows) {
+    slice = std::move(pendingInput_);
+  } else {
+    const auto ownerFlatSize = pendingInput_->estimateFlatSize();
+    const auto flatBytesPerRow = ownerFlatSize / ownerRows;
+    const auto flatByteRemainder = ownerFlatSize % ownerRows;
+    const auto flatSizeAtRow = [&](uint64_t row) {
+      return flatBytesPerRow * row + std::min(row, flatByteRemainder);
+    };
+    auto views = cudf::slice(
+        pendingInput_->getTableView(),
+        {static_cast<cudf::size_type>(begin),
+         static_cast<cudf::size_type>(end)},
+        pendingInput_->stream());
+    VELOX_CHECK_EQ(views.size(), 1);
+    slice = std::make_shared<CudfVector>(
+        pool(),
+        pendingInput_->type(),
+        sliceRows,
+        views.front(),
+        CudfVector::ViewOwner{pendingInput_},
+        pendingInput_->stream(),
+        flatSizeAtRow(end) - flatSizeAtRow(begin));
+  }
+
+  pendingInputOffset_ = end;
+  if (end == ownerRows) {
+    pendingInput_.reset();
+    pendingInputOffset_ = 0;
+    pendingInputSliceRows_ = 0;
+  }
+
+  numInputRows_ += sliceRows;
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("cudfGroupbyInputSlices", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfGroupbyInputSliceRows", RuntimeCounter(sliceRows));
+    lockedStats->addRuntimeStat(
+        "cudfGroupbyMaxInputSliceRows", RuntimeCounter(sliceRows));
+  }
+
+  VELOX_CHECK(isPartialOutput_);
+  computePartialGroupbyStreaming(std::move(slice));
 }
 
 void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
@@ -1954,25 +2162,37 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
   }
-  numInputRows_ += input->size();
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
   if (streamingEnabled_) {
     if (isPartialOutput_) {
-      computePartialGroupbyStreaming(cudfInput);
-      return;
-    } else if (isSingleStep_) {
-      computeSingleGroupbyStreaming(cudfInput);
-      return;
-    } else {
-      computeFinalGroupbyStreaming(cudfInput);
+      // Install a one-owner cursor. Process its first slice now unless the
+      // prior partial state must be emitted first; getOutput() advances the
+      // remaining slices while needsInput() stays false.
+      installPendingInput(std::move(cudfInput));
+      if (shouldFlushBeforeNextPendingInputSlice()) {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfPartialAggregationDeferredInput", RuntimeCounter(1));
+      } else {
+        processNextPendingInputSlice();
+      }
       return;
     }
+    if (isSingleStep_) {
+      numInputRows_ += cudfInput->size();
+      computeSingleGroupbyStreaming(std::move(cudfInput));
+      return;
+    }
+    numInputRows_ += cudfInput->size();
+    computeFinalGroupbyStreaming(std::move(cudfInput));
+    return;
   }
 
   // Handle non-streaming cases.
+  numInputRows_ += cudfInput->size();
   inputs_.push_back(std::move(cudfInput));
 }
 
@@ -2064,36 +2284,82 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   return std::move(bufferedResult_);
 }
 
-RowVectorPtr CudfGroupby::doGetOutput() {
-  // Handle partial streaming groupby.
-  if (isPartialOutput_ && streamingEnabled_) {
-    if (flushGroupIdPartialInput_ && bufferedResult_) {
-      return releaseAndResetBufferedResult();
+CudfVectorPtr CudfGroupby::getPartialAggregationOutput() {
+  VELOX_CHECK(isPartialOutput_ && streamingEnabled_);
+
+  const auto releaseBufferedResult = [&](bool lastOutput) {
+    auto output = releaseAndResetBufferedResult();
+    if (lastOutput) {
+      finished_ = true;
     }
-    if (pendingPartialResult_) {
-      VELOX_CHECK_NOT_NULL(bufferedResult_);
-      VELOX_CHECK_GT(pendingPartialInputRows_, 0);
-      VELOX_CHECK_GE(numInputRows_, pendingPartialInputRows_);
-      numInputRows_ -= pendingPartialInputRows_;
-      auto output = releaseAndResetBufferedResult();
-      bufferedResult_ = std::move(pendingPartialResult_);
-      numInputRows_ = std::exchange(pendingPartialInputRows_, 0);
+    return output;
+  };
+  const auto isLastBufferedOutput = [&]() {
+    return noMoreInput_ && !pendingInput_ && !pendingPartialResult_;
+  };
+
+  // GroupId input views must be reduced and emitted independently. The next
+  // cursor slice is not processed until this result has left the operator.
+  if (flushGroupIdPartialInput_ && bufferedResult_) {
+    return releaseBufferedResult(isLastBufferedOutput());
+  }
+
+  if (pendingPartialResult_) {
+    VELOX_CHECK_NOT_NULL(bufferedResult_);
+    VELOX_CHECK_GT(pendingPartialInputRows_, 0);
+    VELOX_CHECK_GE(numInputRows_, pendingPartialInputRows_);
+    numInputRows_ -= pendingPartialInputRows_;
+    auto output = releaseAndResetBufferedResult();
+    bufferedResult_ = std::move(pendingPartialResult_);
+    numInputRows_ = std::exchange(pendingPartialInputRows_, 0);
+    return output;
+  }
+
+  if (bufferedResult_ &&
+      bufferedResult_->estimateFlatSize() >
+          partialAggregationFlushThresholdBytes_) {
+    return releaseBufferedResult(isLastBufferedOutput());
+  }
+
+  if (shouldFlushBeforeNextPendingInputSlice()) {
+    // Do not retain the previous state while launching the next slice's
+    // group-by when their projected outputs already exceed the budget.
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfPartialAggregationPreSliceFlush", RuntimeCounter(1));
+    }
+    return releaseBufferedResult(false);
+  }
+
+  // noMoreInput() may be called directly while a sliced owner is pending.
+  // Retain the current partial state until every slice has been processed.
+  if (!noMoreInput_ || pendingInput_) {
+    return nullptr;
+  }
+
+  if (!bufferedResult_) {
+    finished_ = true;
+    return nullptr;
+  }
+  return releaseBufferedResult(true);
+}
+
+RowVectorPtr CudfGroupby::doGetOutput() {
+  // Partial output has priority over advancing the input cursor. This bounds
+  // both retained state and GroupId expansion before another slice is reduced.
+  if (isPartialOutput_ && streamingEnabled_) {
+    if (auto output = getPartialAggregationOutput()) {
       return output;
     }
-    if (bufferedResult_ &&
-        bufferedResult_->estimateFlatSize() >
-            partialAggregationFlushThresholdBytes_) {
-      return releaseAndResetBufferedResult();
-    }
-    if (not noMoreInput_) {
-      // Don't produce output if the partial output hasn't reached memory limit
-      // and there's more batches to come.
+    if (finished_) {
       return nullptr;
     }
-    if (!bufferedResult_ && finished_) {
-      return nullptr;
+    if (pendingInput_) {
+      processNextPendingInputSlice();
+      return getPartialAggregationOutput();
     }
-    return releaseAndResetBufferedResult();
+    return nullptr;
   }
 
   if (finished_) {
@@ -2156,13 +2422,17 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
 void CudfGroupby::doNoMoreInput() {
   Operator::noMoreInput();
-  if (isPartialOutput_ && inputs_.empty()) {
+  if (isPartialOutput_ && inputs_.empty() && !pendingInput_ &&
+      !pendingPartialResult_ && !bufferedResult_) {
     finished_ = true;
   }
 }
 
 void CudfGroupby::doClose() {
   inputs_.clear();
+  pendingInput_.reset();
+  pendingInputOffset_ = 0;
+  pendingInputSliceRows_ = 0;
   pendingGroupbyStates_.clear();
   finalAggregationBuckets_.clear();
   pendingPartialResult_.reset();

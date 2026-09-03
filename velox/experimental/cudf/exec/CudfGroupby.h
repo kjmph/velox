@@ -150,8 +150,11 @@ class CudfGroupby : public CudfOperatorBase {
   void initialize() override;
 
   bool needsInput() const override {
-    return !noMoreInput_ &&
+    return !noMoreInput_ && pendingInput_ == nullptr &&
         !(flushGroupIdPartialInput_ && bufferedResult_ != nullptr) &&
+        !(isPartialOutput_ && streamingEnabled_ && bufferedResult_ != nullptr &&
+          bufferedResult_->estimateFlatSize() >
+              partialAggregationFlushThresholdBytes_) &&
         pendingPartialResult_ == nullptr;
   }
 
@@ -190,6 +193,13 @@ class CudfGroupby : public CudfOperatorBase {
   void computePartialGroupbyStreaming(CudfVectorPtr tbl);
   void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
   void computeSingleGroupbyStreaming(CudfVectorPtr tbl);
+  void installPendingInput(CudfVectorPtr input);
+  void processNextPendingInputSlice();
+  bool shouldFlushBeforeNextPendingInputSlice() const;
+  uint64_t inputSliceTargetRows(const CudfVector& input) const;
+  uint64_t projectedIntermediateBytesPerRow(
+      const core::AggregationNode& aggregationNode) const;
+  CudfVectorPtr getPartialAggregationOutput();
   void addPendingGroupbyState(
       CudfVectorPtr state,
       bool projectAggregationInputs);
@@ -259,6 +269,8 @@ class CudfGroupby : public CudfOperatorBase {
   bool streamingEnabled_{true};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t partialAggregationFlushThresholdBytes_{0};
+  uint64_t groupbyInputSliceTargetBytes_{0};
+  uint64_t projectedIntermediateBytesPerRow_{1};
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;
@@ -266,6 +278,12 @@ class CudfGroupby : public CudfOperatorBase {
   bool ignoreNullKeys_;
 
   std::vector<CudfVectorPtr> inputs_;
+  // Streaming partial aggregation can expand one raw input row into a
+  // substantially wider intermediate state. Retain one input owner and expose
+  // only one budgeted zero-copy view to cuDF at a time.
+  CudfVectorPtr pendingInput_;
+  vector_size_t pendingInputOffset_{0};
+  vector_size_t pendingInputSliceRows_{0};
   std::vector<CudfVectorPtr> pendingGroupbyStates_;
   // A partial result that could not be compacted with bufferedResult_ without
   // crossing the flush threshold. needsInput() stays false until the buffered

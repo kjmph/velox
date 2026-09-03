@@ -967,6 +967,61 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
 }
 
+TEST_F(CudfDecimalTest, decimalPartialAggregationSlicesOversizedInput) {
+  auto& cudfConfig = CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  cudfConfig.batchSizeMaxThreshold.reset();
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  constexpr vector_size_t kRows = 29;
+  constexpr int64_t kInputWorkBytes = 512;
+  auto input = makeRowVector(
+      {"k", "d"},
+      {
+          makeFlatVector<int32_t>(kRows, [](auto row) { return row % 5; }),
+          makeFlatVector<int64_t>(
+              kRows,
+              [](auto row) { return static_cast<int64_t>((row + 1) * 100); },
+              nullptr,
+              DECIMAL(12, 2)),
+      });
+  createDuckDbTable({input});
+
+  core::PlanNodeId partialAggId;
+  auto task =
+      exec::test::AssertQueryBuilder(duckDbQueryRunner_)
+          .config(
+              core::QueryConfig::kMaxPartialAggregationMemory, kInputWorkBytes)
+          .plan(
+              exec::test::PlanBuilder()
+                  .values({input})
+                  .partialAggregation({"k"}, {"sum(d) AS s"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& partialStats = planStats.at(partialAggId);
+  EXPECT_LE(
+      partialStats.customStats.at("cudfGroupbyInputSliceTargetBytes").max,
+      kInputWorkBytes);
+  EXPECT_GE(
+      partialStats.customStats.at("cudfGroupbyProjectedIntermediateBytesPerRow")
+          .max,
+      64);
+  EXPECT_GT(partialStats.customStats.at("cudfGroupbyInputSlices").sum, 1);
+  EXPECT_EQ(
+      partialStats.customStats.at("cudfGroupbyInputSliceRows").sum, kRows);
+  EXPECT_LE(
+      partialStats.customStats.at("cudfGroupbyMaxInputSliceRows").max,
+      kInputWorkBytes / 64)
+      << "decimal SUM intermediate state requires at least 64 bytes per row";
+}
+
 TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
   auto& cudfConfig = CudfConfig::getInstance();
   const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;

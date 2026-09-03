@@ -200,9 +200,30 @@ class CudfGroupby : public CudfOperatorBase {
   uint64_t projectedIntermediateBytesPerRow(
       const core::AggregationNode& aggregationNode) const;
   CudfVectorPtr getPartialAggregationOutput();
+  void retainPendingGroupbyState(CudfVectorPtr state);
   void addPendingGroupbyState(
       CudfVectorPtr state,
       bool projectAggregationInputs);
+  bool pendingGroupbyStatesExceedFinalBucketEnvelope() const;
+  void initializeFinalAggregationBucketEnvelope(
+      uint64_t inputRows,
+      uint64_t inputBytes);
+  void startFinalAggregationCollection(bool projectAggregationInputs);
+  void collectFinalAggregationState(
+      CudfVectorPtr state,
+      bool projectAggregationInputs);
+  void routeFinalAggregationState(CudfVectorPtr state);
+  void collectFinalAggregationSlice(
+      CudfVectorPtr state,
+      bool projectAggregationInputs);
+  void compactFinalAggregationCollectionBucket(size_t bucketIndex);
+  void growFinalAggregationCollection();
+  bool finalAggregationCollectionNeedsGrowth() const;
+  CudfVectorPtr finalizeCollectedGroupbyStates();
+  void recordFinalAggregationCompactionInput(
+      uint64_t inputRows,
+      uint64_t inputBytes);
+  void recordFinalAggregationRetainedState();
   void compactPendingGroupbyStates(bool projectAggregationInputs);
   CudfVectorPtr compactGroupbyStates(
       std::vector<CudfVectorPtr>&& states,
@@ -228,7 +249,8 @@ class CudfGroupby : public CudfOperatorBase {
       uint32_t numBuckets,
       uint32_t hashSeed,
       uint32_t hashDepth,
-      std::vector<FinalAggregationBucket>& buckets);
+      std::vector<FinalAggregationBucket>& buckets,
+      bool materializeBuckets = false);
   void repartitionFinalAggregationBucket(FinalAggregationBucket&& bucket);
   FinalAggregationBucket compactSkewedFinalAggregationBucket(
       FinalAggregationBucket&& bucket);
@@ -236,6 +258,10 @@ class CudfGroupby : public CudfOperatorBase {
       CudfVectorPtr state) const;
   bool finalAggregationBucketIsOversized(
       const FinalAggregationBucket& bucket) const;
+  bool finalAggregationBucketCrossesCollectionWatermark(
+      const FinalAggregationBucket& bucket) const;
+  uint64_t finalAggregationWorkBytes(uint64_t inputRows, uint64_t inputBytes)
+      const;
   uint32_t finalAggregationPartitionCount(
       uint64_t rows,
       uint64_t bytes,
@@ -272,6 +298,9 @@ class CudfGroupby : public CudfOperatorBase {
   uint64_t groupbyInputSliceTargetBytes_{0};
   uint64_t projectedIntermediateBytesPerRow_{1};
   int64_t numInputRows_ = 0;
+  uint64_t finalAggregationReceivedInputBatches_{0};
+  uint64_t finalAggregationReceivedInputRows_{0};
+  uint64_t finalAggregationReceivedInputBytes_{0};
 
   bool finished_ = false;
   size_t numAggregates_;
@@ -304,6 +333,10 @@ class CudfGroupby : public CudfOperatorBase {
   uint64_t finalAggregationBucketTargetRows_{0};
   uint64_t finalAggregationBucketTargetBytes_{0};
   uint32_t nextFinalAggregationHashSeed_{0};
+  bool finalAggregationCollecting_{false};
+  uint32_t finalAggregationCollectionFanout_{0};
+  uint32_t finalAggregationCollectionHashSeed_{0};
+  std::vector<FinalAggregationBucket> finalAggregationCollectionBuckets_;
   std::deque<FinalAggregationBucket> finalAggregationBuckets_;
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;

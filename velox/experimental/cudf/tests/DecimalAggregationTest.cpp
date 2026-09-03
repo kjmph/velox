@@ -1052,7 +1052,31 @@ TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
                 DECIMAL(12, 2)),
         }));
   }
-  createDuckDbTable(vectors);
+
+  std::vector<int32_t> expectedKeys;
+  std::vector<int128_t> expectedSums;
+  std::vector<int64_t> expectedAverages;
+  expectedKeys.reserve(kUniqueKeys);
+  expectedSums.reserve(kUniqueKeys);
+  expectedAverages.reserve(kUniqueKeys);
+  for (int32_t key = 0; key < kUniqueKeys; ++key) {
+    const auto row = key % kRowsPerBatch;
+    expectedKeys.push_back(key);
+    if (key < kRowsPerBatch) {
+      expectedSums.push_back(400 + 2 * row);
+      expectedAverages.push_back(200 + row);
+    } else {
+      expectedSums.push_back(600 + 2 * row);
+      expectedAverages.push_back(300 + row);
+    }
+  }
+  auto expected = makeRowVector(
+      {"k", "s", "a"},
+      {
+          makeFlatVector<int32_t>(expectedKeys),
+          makeFlatVector<int128_t>(expectedSums, DECIMAL(38, 2)),
+          makeFlatVector<int64_t>(expectedAverages, DECIMAL(12, 2)),
+      });
 
   core::PlanNodeId finalAggId;
   auto task =
@@ -1064,21 +1088,21 @@ TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
                   .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
                   .finalAggregation()
                   .capturePlanNodeId(finalAggId)
+                  .orderBy({"k"}, false)
                   .planNode())
           .maxDrivers(1)
-          .assertResults(
-              "SELECT k, sum(d) AS s, avg(d) AS a FROM tmp GROUP BY k");
+          .assertResults(expected);
 
   const auto planStats = exec::toPlanStats(task->taskStats());
   const auto& finalStats = planStats.at(finalAggId);
-  EXPECT_EQ(finalStats.outputRows, kUniqueKeys);
+  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
+  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
+  EXPECT_EQ(groupbyStats->second->outputRows, kUniqueKeys);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationHashBuckets").sum, 1);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
 
-  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
-  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
   EXPECT_GT(groupbyStats->second->outputVectors, 1);
 }
 

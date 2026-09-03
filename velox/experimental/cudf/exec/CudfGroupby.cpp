@@ -33,6 +33,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/partitioning.hpp>
@@ -64,6 +65,11 @@ constexpr uint64_t kMaxFinalAggregationBucketBytes = 1ULL << 30;
 constexpr uint32_t kMaxFinalAggregationPartitionFanout = 256;
 constexpr uint32_t kMaxFinalAggregationHashDepth = 8;
 constexpr uint64_t kDecimalAggregateStateWorkBytes = 64;
+// cuDF's hash group-by needs storage beyond the flat input and output tables.
+// Reserve room for its hash set, row mapping, and associated index scratch so
+// narrow inputs cannot turn a nominally small byte bucket into a multi-GiB
+// workspace allocation.
+constexpr uint64_t kHashGroupbyWorkspaceBytesPerRow = 16;
 
 uint64_t ceilingDivide(uint64_t dividend, uint64_t divisor) {
   VELOX_CHECK_GT(divisor, 0);
@@ -1202,6 +1208,10 @@ void CudfGroupby::initialize() {
 
   partialAggregationFlushThresholdBytes_ =
       partialAggregationFlushThresholdBytes();
+  if (streamingEnabled_) {
+    projectedIntermediateBytesPerRow_ =
+        projectedIntermediateBytesPerRow(*aggregationNode_);
+  }
   if (streamingEnabled_ && isPartialOutput_) {
     // A partial group-by can expand narrow raw input into wider serialized
     // intermediate state. Use the same finite byte target for input work and
@@ -1213,9 +1223,6 @@ void CudfGroupby::initialize() {
             std::max<int64_t>(partialAggregationFlushThresholdBytes_, 1)));
     partialAggregationFlushThresholdBytes_ =
         saturateCast(groupbyInputSliceTargetBytes_);
-    projectedIntermediateBytesPerRow_ =
-        projectedIntermediateBytesPerRow(*aggregationNode_);
-
     auto lockedStats = stats_.wlock();
     lockedStats->addRuntimeStat(
         "cudfGroupbyInputSliceTargetBytes",
@@ -1589,11 +1596,16 @@ void CudfGroupby::compactPendingGroupbyStates(bool projectAggregationInputs) {
   pendingGroupbyStateBytes_ = 0;
 
   int64_t inputRows = bufferedResult_ ? bufferedResult_->size() : 0;
+  uint64_t inputBytes =
+      bufferedResult_ ? bufferedResult_->estimateFlatSize() : 0;
   for (const auto& state : states) {
     VELOX_CHECK_NOT_NULL(state);
     inputRows += state->size();
+    inputBytes = saturatedAdd(inputBytes, state->estimateFlatSize());
   }
 
+  recordFinalAggregationCompactionInput(
+      static_cast<uint64_t>(inputRows), inputBytes);
   bufferedResult_ = compactGroupbyStates(
       std::move(states), projectAggregationInputs, std::move(bufferedResult_));
   if (bufferedResult_) {
@@ -1612,20 +1624,392 @@ void CudfGroupby::compactPendingGroupbyStates(bool projectAggregationInputs) {
   }
 }
 
-void CudfGroupby::addPendingGroupbyState(
-    CudfVectorPtr state,
-    bool projectAggregationInputs) {
+void CudfGroupby::retainPendingGroupbyState(CudfVectorPtr state) {
   if (!state) {
     return;
   }
 
   pendingGroupbyStateBytes_ += state->estimateFlatSize();
   pendingGroupbyStates_.push_back(std::move(state));
+}
+
+void CudfGroupby::addPendingGroupbyState(
+    CudfVectorPtr state,
+    bool projectAggregationInputs) {
+  if (!state) {
+    return;
+  }
+  ++finalAggregationReceivedInputBatches_;
+  finalAggregationReceivedInputRows_ = saturatedAdd(
+      finalAggregationReceivedInputRows_, static_cast<uint64_t>(state->size()));
+  finalAggregationReceivedInputBytes_ = saturatedAdd(
+      finalAggregationReceivedInputBytes_, state->estimateFlatSize());
+
+  if (finalAggregationCollecting_) {
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionInputBatches", RuntimeCounter(1));
+    }
+    collectFinalAggregationState(std::move(state), projectAggregationInputs);
+    return;
+  }
+
+  retainPendingGroupbyState(std::move(state));
+
+  // This check is deliberately independent of the ordinary compaction
+  // threshold and of intermediateCompactionAbandoned_. A single narrow state
+  // can fit the flat-byte threshold while requiring a multi-GiB group-by hash
+  // workspace, and a previously observed no-reduction merge can later grow
+  // beyond the safe envelope.
+  if (!groupingKeyOutputChannels_.empty() &&
+      pendingGroupbyStatesExceedFinalBucketEnvelope()) {
+    startFinalAggregationCollection(projectAggregationInputs);
+    return;
+  }
+
   if (!intermediateCompactionAbandoned_ &&
       (bufferedResult_ || pendingGroupbyStates_.size() > 1) &&
       pendingGroupbyStateBytes_ >= maxPartialAggregationMemoryUsage_) {
     compactPendingGroupbyStates(projectAggregationInputs);
   }
+}
+
+bool CudfGroupby::pendingGroupbyStatesExceedFinalBucketEnvelope() const {
+  uint64_t rows =
+      bufferedResult_ ? static_cast<uint64_t>(bufferedResult_->size()) : 0;
+  uint64_t bytes = bufferedResult_ ? bufferedResult_->estimateFlatSize() : 0;
+  for (const auto& state : pendingGroupbyStates_) {
+    VELOX_CHECK_NOT_NULL(state);
+    rows = saturatedAdd(rows, static_cast<uint64_t>(state->size()));
+    bytes = saturatedAdd(bytes, state->estimateFlatSize());
+  }
+
+  const auto targetBytes = finalAggregationBucketTargetBytes();
+  const auto targetRows =
+      finalAggregationBucketTargetRows(rows, bytes, targetBytes);
+  return rows > targetRows ||
+      finalAggregationWorkBytes(rows, bytes) > targetBytes;
+}
+
+void CudfGroupby::initializeFinalAggregationBucketEnvelope(
+    uint64_t inputRows,
+    uint64_t inputBytes) {
+  VELOX_CHECK_EQ(finalAggregationBucketTargetRows_, 0);
+  VELOX_CHECK_EQ(finalAggregationBucketTargetBytes_, 0);
+  finalAggregationBucketTargetBytes_ = finalAggregationBucketTargetBytes();
+  finalAggregationBucketTargetRows_ = finalAggregationBucketTargetRows(
+      inputRows, inputBytes, finalAggregationBucketTargetBytes_);
+
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationBucketTargetRows",
+      RuntimeCounter(finalAggregationBucketTargetRows_));
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationBucketTargetBytes",
+      RuntimeCounter(
+          finalAggregationBucketTargetBytes_, RuntimeCounter::Unit::kBytes));
+}
+
+void CudfGroupby::recordFinalAggregationCompactionInput(
+    uint64_t inputRows,
+    uint64_t inputBytes) {
+  const auto workBytes = finalAggregationWorkBytes(inputRows, inputBytes);
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxCompactionInputRows", RuntimeCounter(inputRows));
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxCompactionInputBytes",
+      RuntimeCounter(inputBytes, RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxCompactionWorkBytes",
+      RuntimeCounter(workBytes, RuntimeCounter::Unit::kBytes));
+}
+
+void CudfGroupby::recordFinalAggregationRetainedState() {
+  uint64_t rows = 0;
+  uint64_t bytes = 0;
+  uint64_t runs = 0;
+  for (const auto& bucket : finalAggregationCollectionBuckets_) {
+    rows = saturatedAdd(rows, bucket.rows);
+    bytes = saturatedAdd(bytes, bucket.bytes);
+    runs = saturatedAdd(runs, bucket.states.size());
+  }
+
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxRetainedRows", RuntimeCounter(rows));
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxRetainedBytes",
+      RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "cudfFinalAggregationMaxRetainedRuns", RuntimeCounter(runs));
+}
+
+void CudfGroupby::startFinalAggregationCollection(
+    bool projectAggregationInputs) {
+  VELOX_CHECK(!finalAggregationCollecting_);
+  VELOX_CHECK(finalAggregationCollectionBuckets_.empty());
+  VELOX_CHECK(!groupingKeyOutputChannels_.empty());
+
+  uint64_t inputRows =
+      bufferedResult_ ? static_cast<uint64_t>(bufferedResult_->size()) : 0;
+  uint64_t inputBytes =
+      bufferedResult_ ? bufferedResult_->estimateFlatSize() : 0;
+  for (const auto& state : pendingGroupbyStates_) {
+    VELOX_CHECK_NOT_NULL(state);
+    inputRows = saturatedAdd(inputRows, static_cast<uint64_t>(state->size()));
+    inputBytes = saturatedAdd(inputBytes, state->estimateFlatSize());
+  }
+  initializeFinalAggregationBucketEnvelope(inputRows, inputBytes);
+
+  // Aim for half-full leaves. The spare half is what lets the next incoming
+  // fragment be reduced with the resident state without first crossing the
+  // hard concatenate/group-by envelope.
+  const auto leafTargetRows =
+      std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1);
+  const auto leafTargetWorkBytes =
+      std::max<uint64_t>(finalAggregationBucketTargetBytes_ / 2, 1);
+  const auto requiredFanout = std::max(
+      ceilingDivide(inputRows, leafTargetRows),
+      ceilingDivide(
+          finalAggregationWorkBytes(inputRows, inputBytes),
+          leafTargetWorkBytes));
+  finalAggregationCollectionFanout_ = roundUpToPowerOfTwo(
+      std::max<uint64_t>(requiredFanout, 2),
+      kMaxFinalAggregationPartitionFanout);
+  finalAggregationCollectionHashSeed_ =
+      advanceHashSeed(nextFinalAggregationHashSeed_);
+  finalAggregationCollectionBuckets_.resize(finalAggregationCollectionFanout_);
+  finalAggregationCollecting_ = true;
+
+  auto existingState = std::move(bufferedResult_);
+  auto states = std::move(pendingGroupbyStates_);
+  pendingGroupbyStates_.clear();
+  pendingGroupbyStateBytes_ = 0;
+
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationCollectionTransitions", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationCollectionInputBatches",
+        RuntimeCounter(finalAggregationReceivedInputBatches_));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationCollectionFanout",
+        RuntimeCounter(finalAggregationCollectionFanout_));
+    if (inputBytes > finalAggregationBucketTargetBytes_) {
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionByteTransitions", RuntimeCounter(1));
+    }
+    if (finalAggregationWorkBytes(inputRows, inputBytes) >
+        finalAggregationBucketTargetBytes_) {
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionWorkTransitions", RuntimeCounter(1));
+    }
+    if (inputRows > finalAggregationBucketTargetRows_) {
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionRowTransitions", RuntimeCounter(1));
+    }
+  }
+
+  if (existingState) {
+    collectFinalAggregationState(std::move(existingState), false);
+  }
+  for (auto& state : states) {
+    collectFinalAggregationState(std::move(state), projectAggregationInputs);
+  }
+  recordFinalAggregationRetainedState();
+}
+
+void CudfGroupby::compactFinalAggregationCollectionBucket(size_t bucketIndex) {
+  VELOX_CHECK_LT(bucketIndex, finalAggregationCollectionBuckets_.size());
+  auto& bucket = finalAggregationCollectionBuckets_[bucketIndex];
+  if (bucket.states.size() < 2) {
+    return;
+  }
+
+  VELOX_CHECK(!finalAggregationBucketIsOversized(bucket));
+  const auto hashDepth = bucket.hashDepth;
+  recordFinalAggregationCompactionInput(bucket.rows, bucket.bytes);
+  auto result = aggregateGroupbyStates(
+      std::move(bucket.states),
+      false,
+      nullptr,
+      intermediateAggregators_,
+      bufferedResultType_);
+
+  bucket = {};
+  bucket.hashDepth = hashDepth;
+  if (result) {
+    bucket.rows = static_cast<uint64_t>(result->size());
+    bucket.bytes = result->estimateFlatSize();
+    bucket.states.push_back(std::move(result));
+  }
+}
+
+bool CudfGroupby::finalAggregationCollectionNeedsGrowth() const {
+  if (finalAggregationCollectionFanout_ >=
+      kMaxFinalAggregationPartitionFanout) {
+    return false;
+  }
+  const auto leafTargetRows =
+      std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1);
+  return std::ranges::any_of(
+      finalAggregationCollectionBuckets_, [&](const auto& bucket) {
+        return bucket.rows > leafTargetRows ||
+            finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
+            finalAggregationBucketTargetBytes_ / 2;
+      });
+}
+
+void CudfGroupby::growFinalAggregationCollection() {
+  VELOX_CHECK(finalAggregationCollecting_);
+  VELOX_CHECK_LT(
+      finalAggregationCollectionFanout_, kMaxFinalAggregationPartitionFanout);
+
+  auto oldBuckets = std::move(finalAggregationCollectionBuckets_);
+  finalAggregationCollectionFanout_ = std::min<uint32_t>(
+      finalAggregationCollectionFanout_ * 2,
+      kMaxFinalAggregationPartitionFanout);
+  finalAggregationCollectionBuckets_.clear();
+  finalAggregationCollectionBuckets_.resize(finalAggregationCollectionFanout_);
+
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationCollectionGrows", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationCollectionFanout",
+        RuntimeCounter(finalAggregationCollectionFanout_));
+  }
+
+  // Rehash one owning reduced state at a time. This bounds the transient copy
+  // during fanout growth and preserves the reduction already achieved across
+  // earlier input batches.
+  for (auto& bucket : oldBuckets) {
+    for (auto& state : bucket.states) {
+      routeFinalAggregationState(std::move(state));
+    }
+  }
+  recordFinalAggregationRetainedState();
+}
+
+void CudfGroupby::collectFinalAggregationSlice(
+    CudfVectorPtr state,
+    bool projectAggregationInputs) {
+  VELOX_CHECK(finalAggregationCollecting_);
+  VELOX_CHECK_NOT_NULL(state);
+  VELOX_CHECK_LE(
+      static_cast<uint64_t>(state->size()), finalAggregationBucketTargetRows_);
+  VELOX_CHECK_LE(
+      finalAggregationWorkBytes(
+          static_cast<uint64_t>(state->size()), state->estimateFlatSize()),
+      finalAggregationBucketTargetBytes_);
+
+  std::vector<FinalAggregationBucket> incoming(
+      finalAggregationCollectionFanout_);
+  hashPartitionFinalState(
+      std::move(state),
+      projectAggregationInputs,
+      finalAggregationCollectionFanout_,
+      finalAggregationCollectionHashSeed_,
+      0,
+      incoming,
+      true);
+
+  bool needsGrowth = false;
+  for (size_t i = 0; i < incoming.size(); ++i) {
+    const auto combinedRows = saturatedAdd(
+        finalAggregationCollectionBuckets_[i].rows, incoming[i].rows);
+    const auto combinedBytes = saturatedAdd(
+        finalAggregationCollectionBuckets_[i].bytes, incoming[i].bytes);
+    if (combinedRows > finalAggregationBucketTargetRows_ ||
+        finalAggregationWorkBytes(combinedRows, combinedBytes) >
+            finalAggregationBucketTargetBytes_) {
+      needsGrowth = true;
+      break;
+    }
+  }
+
+  if (needsGrowth &&
+      finalAggregationCollectionFanout_ < kMaxFinalAggregationPartitionFanout) {
+    growFinalAggregationCollection();
+    for (auto& bucket : incoming) {
+      for (auto& incomingState : bucket.states) {
+        routeFinalAggregationState(std::move(incomingState));
+      }
+    }
+    return;
+  }
+
+  std::vector<size_t> bucketsToCompact;
+  for (size_t i = 0; i < incoming.size(); ++i) {
+    auto& incomingBucket = incoming[i];
+    if (incomingBucket.states.empty()) {
+      continue;
+    }
+    auto& resident = finalAggregationCollectionBuckets_[i];
+    const auto combinedRows = saturatedAdd(resident.rows, incomingBucket.rows);
+    const auto combinedBytes =
+        saturatedAdd(resident.bytes, incomingBucket.bytes);
+
+    if (combinedRows > finalAggregationBucketTargetRows_ ||
+        finalAggregationWorkBytes(combinedRows, combinedBytes) >
+            finalAggregationBucketTargetBytes_) {
+      // At the flat fanout cap, retain bounded, independently reduced runs.
+      // Drain-time recursive partitioning can refine this one key domain with
+      // a new seed without ever launching the oversized merge here.
+      resident.rows = combinedRows;
+      resident.bytes = combinedBytes;
+      for (auto& incomingState : incomingBucket.states) {
+        resident.states.push_back(std::move(incomingState));
+      }
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionSealedRuns", RuntimeCounter(1));
+      continue;
+    }
+
+    resident.rows = combinedRows;
+    resident.bytes = combinedBytes;
+    resident.hashDepth = incomingBucket.hashDepth;
+    for (auto& incomingState : incomingBucket.states) {
+      resident.states.push_back(std::move(incomingState));
+    }
+
+    if (resident.states.size() > 1 &&
+        finalAggregationBucketCrossesCollectionWatermark(resident)) {
+      bucketsToCompact.push_back(i);
+    }
+  }
+
+  for (const auto bucketIndex : bucketsToCompact) {
+    compactFinalAggregationCollectionBucket(bucketIndex);
+  }
+
+  if (finalAggregationCollectionNeedsGrowth()) {
+    growFinalAggregationCollection();
+  } else {
+    recordFinalAggregationRetainedState();
+  }
+}
+
+void CudfGroupby::collectFinalAggregationState(
+    CudfVectorPtr state,
+    bool projectAggregationInputs) {
+  VELOX_CHECK(finalAggregationCollecting_);
+  if (!state) {
+    return;
+  }
+  auto slices = splitFinalAggregationState(std::move(state));
+  for (auto& slice : slices) {
+    collectFinalAggregationSlice(std::move(slice), projectAggregationInputs);
+  }
+}
+
+void CudfGroupby::routeFinalAggregationState(CudfVectorPtr state) {
+  collectFinalAggregationState(std::move(state), false);
 }
 
 void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
@@ -1670,6 +2054,8 @@ uint64_t CudfGroupby::finalAggregationBucketTargetRows(
   if (inputRows > 0 && inputBytes > 0) {
     bytesPerRow = std::max<uint64_t>(ceilingDivide(inputBytes, inputRows), 1);
   }
+  bytesPerRow = saturatedAdd(bytesPerRow, projectedIntermediateBytesPerRow_);
+  bytesPerRow = saturatedAdd(bytesPerRow, kHashGroupbyWorkspaceBytesPerRow);
 
   uint64_t targetRows = std::max<uint64_t>(targetBytes / bytesPerRow, 1);
   const auto& config = CudfConfig::getInstance();
@@ -1687,6 +2073,15 @@ uint64_t CudfGroupby::finalAggregationBucketTargetRows(
       static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max()));
 }
 
+uint64_t CudfGroupby::finalAggregationWorkBytes(
+    uint64_t inputRows,
+    uint64_t inputBytes) const {
+  const auto perRowWorkBytes = saturatedAdd(
+      projectedIntermediateBytesPerRow_, kHashGroupbyWorkspaceBytesPerRow);
+  return saturatedAdd(
+      inputBytes, saturatedMultiply(inputRows, perRowWorkBytes));
+}
+
 uint32_t CudfGroupby::finalAggregationPartitionCount(
     uint64_t rows,
     uint64_t bytes,
@@ -1695,7 +2090,9 @@ uint32_t CudfGroupby::finalAggregationPartitionCount(
   VELOX_CHECK_GT(finalAggregationBucketTargetBytes_, 0);
   auto partitions = std::max(
       ceilingDivide(rows, finalAggregationBucketTargetRows_),
-      ceilingDivide(bytes, finalAggregationBucketTargetBytes_));
+      ceilingDivide(
+          finalAggregationWorkBytes(rows, bytes),
+          finalAggregationBucketTargetBytes_));
   if (requireSplit) {
     partitions = std::max<uint64_t>(partitions, 2);
   }
@@ -1706,7 +2103,16 @@ uint32_t CudfGroupby::finalAggregationPartitionCount(
 bool CudfGroupby::finalAggregationBucketIsOversized(
     const FinalAggregationBucket& bucket) const {
   return bucket.rows > finalAggregationBucketTargetRows_ ||
-      bucket.bytes > finalAggregationBucketTargetBytes_;
+      finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
+      finalAggregationBucketTargetBytes_;
+}
+
+bool CudfGroupby::finalAggregationBucketCrossesCollectionWatermark(
+    const FinalAggregationBucket& bucket) const {
+  return bucket.rows >
+      std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1) ||
+      finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
+      std::max<uint64_t>(finalAggregationBucketTargetBytes_ / 2, 1);
 }
 
 std::vector<CudfVectorPtr> CudfGroupby::splitFinalAggregationState(
@@ -1720,13 +2126,21 @@ std::vector<CudfVectorPtr> CudfGroupby::splitFinalAggregationState(
     return {};
   }
   const auto bytes = state->estimateFlatSize();
-  const auto bytesPerRow =
+  const auto estimatedFlatBytesPerRow =
       std::max<uint64_t>(ceilingDivide(std::max<uint64_t>(bytes, 1), rows), 1);
-  const auto rowsByBytes =
-      std::max<uint64_t>(finalAggregationBucketTargetBytes_ / bytesPerRow, 1);
+  const auto workBytesPerRow = saturatedAdd(
+      estimatedFlatBytesPerRow,
+      saturatedAdd(
+          projectedIntermediateBytesPerRow_, kHashGroupbyWorkspaceBytesPerRow));
+  const auto rowsByBytes = std::max<uint64_t>(
+      finalAggregationBucketTargetBytes_ / workBytesPerRow, 1);
   const auto rowsPerSlice =
       std::min(finalAggregationBucketTargetRows_, rowsByBytes);
   if (rows <= rowsPerSlice) {
+    VELOX_CHECK_LE(
+        finalAggregationWorkBytes(rows, bytes),
+        finalAggregationBucketTargetBytes_,
+        "A single final-aggregation row exceeds the bounded work envelope");
     std::vector<CudfVectorPtr> result;
     result.push_back(std::move(state));
     return result;
@@ -1759,6 +2173,11 @@ std::vector<CudfVectorPtr> CudfGroupby::splitFinalAggregationState(
             CudfVector::ViewOwner{state},
             state->stream(),
             flatSizeAtRow(end) - flatSizeAtRow(start)));
+    VELOX_CHECK_LE(
+        finalAggregationWorkBytes(
+            end - start, flatSizeAtRow(end) - flatSizeAtRow(start)),
+        finalAggregationBucketTargetBytes_,
+        "A single final-aggregation row exceeds the bounded work envelope");
   }
   return slices;
 }
@@ -1769,7 +2188,8 @@ void CudfGroupby::hashPartitionFinalState(
     uint32_t numBuckets,
     uint32_t hashSeed,
     uint32_t hashDepth,
-    std::vector<FinalAggregationBucket>& buckets) {
+    std::vector<FinalAggregationBucket>& buckets,
+    bool materializeBuckets) {
   VELOX_CHECK_NOT_NULL(state);
   VELOX_CHECK_GT(numBuckets, 1);
   VELOX_CHECK_EQ(buckets.size(), numBuckets);
@@ -1798,6 +2218,43 @@ void CudfGroupby::hashPartitionFinalState(
         get_output_mr());
     VELOX_CHECK_NOT_NULL(partitionedTable);
     VELOX_CHECK_EQ(offsets.size(), numBuckets + 1);
+
+    if (materializeBuckets) {
+      // Bucket views into one partitioned table keep every sibling alive. A
+      // later compaction of one bucket would then accumulate reduced output
+      // while retaining all of the source partitions. Give persistent
+      // collector buckets independent packed ownership so each source run is
+      // reclaimable as soon as its own bucket is compacted.
+      boundedState.reset();
+      std::vector<cudf::size_type> splitOffsets(
+          offsets.begin() + 1, offsets.end() - 1);
+      auto packedTables = cudf::contiguous_split(
+          partitionedTable->view(), splitOffsets, stream, get_output_mr());
+      VELOX_CHECK_EQ(packedTables.size(), numBuckets);
+      partitionedTable.reset();
+
+      for (uint32_t bucketIndex = 0; bucketIndex < numBuckets; ++bucketIndex) {
+        auto packedTable = std::make_unique<cudf::packed_table>(
+            std::move(packedTables[bucketIndex]));
+        const auto bucketRows =
+            static_cast<uint64_t>(packedTable->table.num_rows());
+        if (bucketRows == 0) {
+          continue;
+        }
+        auto state = std::make_shared<CudfVector>(
+            pool(),
+            bufferedResultType_,
+            static_cast<vector_size_t>(bucketRows),
+            std::move(packedTable),
+            stream);
+        auto& bucket = buckets[bucketIndex];
+        bucket.rows = saturatedAdd(bucket.rows, bucketRows);
+        bucket.bytes = saturatedAdd(bucket.bytes, state->estimateFlatSize());
+        bucket.hashDepth = hashDepth;
+        bucket.states.push_back(std::move(state));
+      }
+      continue;
+    }
 
     auto partitioned = std::make_shared<CudfVector>(
         pool(),
@@ -1909,6 +2366,7 @@ CudfGroupby::compactSkewedFinalAggregationBucket(
     if (chunk.empty()) {
       return;
     }
+    recordFinalAggregationCompactionInput(chunkRows, chunkBytes);
     auto result = aggregateGroupbyStates(
         std::exchange(chunk, {}),
         false,
@@ -1931,11 +2389,12 @@ CudfGroupby::compactSkewedFinalAggregationBucket(
     for (auto& slice : slices) {
       const auto rows = static_cast<uint64_t>(slice->size());
       const auto bytes = slice->estimateFlatSize();
+      const auto combinedRows = saturatedAdd(chunkRows, rows);
+      const auto combinedBytes = saturatedAdd(chunkBytes, bytes);
       const bool crossesLimit = !chunk.empty() &&
-          (rows > finalAggregationBucketTargetRows_ -
-                   std::min(chunkRows, finalAggregationBucketTargetRows_) ||
-           bytes > finalAggregationBucketTargetBytes_ -
-                   std::min(chunkBytes, finalAggregationBucketTargetBytes_));
+          (combinedRows > finalAggregationBucketTargetRows_ ||
+           finalAggregationWorkBytes(combinedRows, combinedBytes) >
+               finalAggregationBucketTargetBytes_);
       if (crossesLimit) {
         flushChunk();
       }
@@ -2052,6 +2511,7 @@ CudfVectorPtr CudfGroupby::getNextFinalAggregationBucket() {
     }
 
     auto& finalAggregators = isSingleStep_ ? finalAggregators_ : aggregators_;
+    recordFinalAggregationCompactionInput(bucket.rows, bucket.bytes);
     auto result = aggregateGroupbyStates(
         std::move(bucket.states),
         false,
@@ -2069,11 +2529,67 @@ CudfVectorPtr CudfGroupby::getNextFinalAggregationBucket() {
   return nullptr;
 }
 
+CudfVectorPtr CudfGroupby::finalizeCollectedGroupbyStates() {
+  VELOX_CHECK(finalAggregationCollecting_);
+  VELOX_CHECK(finalAggregationBuckets_.empty());
+  hashBucketFinalization_ = true;
+
+  uint64_t inputBatches = 0;
+  uint64_t inputRows = 0;
+  uint64_t inputBytes = 0;
+  uint64_t maxBucketRows = 0;
+  uint64_t nonEmptyBuckets = 0;
+  for (auto& bucket : finalAggregationCollectionBuckets_) {
+    if (bucket.states.empty()) {
+      continue;
+    }
+    inputBatches = saturatedAdd(inputBatches, bucket.states.size());
+    inputRows = saturatedAdd(inputRows, bucket.rows);
+    inputBytes = saturatedAdd(inputBytes, bucket.bytes);
+    maxBucketRows = std::max(maxBucketRows, bucket.rows);
+    ++nonEmptyBuckets;
+    finalAggregationBuckets_.push_back(std::move(bucket));
+  }
+  finalAggregationCollectionBuckets_.clear();
+  finalAggregationCollecting_ = false;
+
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputBatches",
+        RuntimeCounter(finalAggregationReceivedInputBatches_));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputRows",
+        RuntimeCounter(finalAggregationReceivedInputRows_));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputBytes",
+        RuntimeCounter(
+            finalAggregationReceivedInputBytes_, RuntimeCounter::Unit::kBytes));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationRetainedInputBatches",
+        RuntimeCounter(inputBatches));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationRetainedInputRows", RuntimeCounter(inputRows));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationRetainedInputBytes",
+        RuntimeCounter(inputBytes, RuntimeCounter::Unit::kBytes));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHashBuckets", RuntimeCounter(nonEmptyBuckets));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationMaxBucketRows", RuntimeCounter(maxBucketRows));
+  }
+  return getNextFinalAggregationBucket();
+}
+
 CudfVectorPtr CudfGroupby::finalizePendingGroupbyStates() {
+  finalAggregationInitialized_ = true;
+  if (finalAggregationCollecting_) {
+    return finalizeCollectedGroupbyStates();
+  }
+
   auto states = std::move(pendingGroupbyStates_);
   pendingGroupbyStates_.clear();
   pendingGroupbyStateBytes_ = 0;
-  finalAggregationInitialized_ = true;
 
   if (!bufferedResult_ && states.empty()) {
     return nullptr;
@@ -2101,22 +2617,13 @@ CudfVectorPtr CudfGroupby::finalizePendingGroupbyStates() {
         RuntimeCounter(inputBytes, RuntimeCounter::Unit::kBytes));
   }
 
-  finalAggregationBucketTargetBytes_ = finalAggregationBucketTargetBytes();
-  finalAggregationBucketTargetRows_ = finalAggregationBucketTargetRows(
-      inputRows, inputBytes, finalAggregationBucketTargetBytes_);
-  {
-    auto lockedStats = stats_.wlock();
-    lockedStats->addRuntimeStat(
-        "cudfFinalAggregationBucketTargetRows",
-        RuntimeCounter(finalAggregationBucketTargetRows_));
-    lockedStats->addRuntimeStat(
-        "cudfFinalAggregationBucketTargetBytes",
-        RuntimeCounter(
-            finalAggregationBucketTargetBytes_, RuntimeCounter::Unit::kBytes));
-  }
+  initializeFinalAggregationBucketEnvelope(inputRows, inputBytes);
   const bool requiresHashBuckets = !groupingKeyOutputChannels_.empty() &&
       (static_cast<uint64_t>(inputRows) > finalAggregationBucketTargetRows_ ||
-       static_cast<uint64_t>(inputBytes) > finalAggregationBucketTargetBytes_);
+       finalAggregationWorkBytes(
+           static_cast<uint64_t>(inputRows),
+           static_cast<uint64_t>(inputBytes)) >
+           finalAggregationBucketTargetBytes_);
   if (requiresHashBuckets) {
     initializeFinalAggregationBuckets(
         std::move(states),
@@ -2128,6 +2635,8 @@ CudfVectorPtr CudfGroupby::finalizePendingGroupbyStates() {
   }
 
   auto& finalAggregators = isSingleStep_ ? finalAggregators_ : aggregators_;
+  recordFinalAggregationCompactionInput(
+      static_cast<uint64_t>(inputRows), static_cast<uint64_t>(inputBytes));
   return aggregateGroupbyStates(
       std::move(states),
       !isSingleStep_,
@@ -2434,6 +2943,7 @@ void CudfGroupby::doClose() {
   pendingInputOffset_ = 0;
   pendingInputSliceRows_ = 0;
   pendingGroupbyStates_.clear();
+  finalAggregationCollectionBuckets_.clear();
   finalAggregationBuckets_.clear();
   pendingPartialResult_.reset();
   bufferedResult_.reset();

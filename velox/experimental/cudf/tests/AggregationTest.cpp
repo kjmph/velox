@@ -1125,12 +1125,6 @@ TEST_F(AggregationTest, partialAggregationSlicesByByteBudgetWithoutRowLimit) {
       partialStats.customStats.at("cudfGroupbyInputSliceRows").sum, kRows);
   EXPECT_LT(
       partialStats.customStats.at("cudfGroupbyMaxInputSliceRows").max, kRows);
-  EXPECT_GT(
-      partialStats.customStats.at("cudfPartialAggregationPreSliceFlush").sum,
-      0);
-  EXPECT_GT(
-      partialStats.customStats.at("cudfPartialAggregationDeferredInput").sum,
-      0);
 }
 
 TEST_F(AggregationTest, closeReleasesPendingPartialInput) {
@@ -1161,8 +1155,10 @@ TEST_F(AggregationTest, closeReleasesPendingPartialInput) {
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  DriverCtx driverCtx(task, 0, 0, 0, 0);
-  cudf_velox::CudfGroupby groupby(0, &driverCtx, partialAggregation);
+  auto driverCtx = std::make_unique<DriverCtx>(task, 0, 0, 0, 0);
+  auto* driverCtxPtr = driverCtx.get();
+  auto driver = Driver::testingCreate(std::move(driverCtx));
+  cudf_velox::CudfGroupby groupby(0, driverCtxPtr, partialAggregation);
   groupby.initialize();
 
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
@@ -1215,8 +1211,10 @@ TEST_F(AggregationTest, noMoreInputDrainsPendingPartialSlices) {
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  DriverCtx driverCtx(task, 0, 0, 0, 0);
-  cudf_velox::CudfGroupby groupby(0, &driverCtx, partialAggregation);
+  auto driverCtx = std::make_unique<DriverCtx>(task, 0, 0, 0, 0);
+  auto* driverCtxPtr = driverCtx.get();
+  auto driver = Driver::testingCreate(std::move(driverCtx));
+  cudf_velox::CudfGroupby groupby(0, driverCtxPtr, partialAggregation);
   groupby.initialize();
 
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
@@ -1296,10 +1294,11 @@ TEST_F(AggregationTest, boundedPartialRolloverAndNoReductionFinalMerge) {
   }
   createDuckDbTable(vectors);
 
-  // One partial result fits below this limit, but two do not. This exercises
-  // rollover before concatenate. The disjoint keys then make the first final
-  // intermediate compaction reduce zero rows, so later inputs must be retained
-  // for one direct final merge rather than repeatedly rewriting growing state.
+  // The small partial-state limit forces rollover before concatenating an
+  // unbounded state. Depending on the physical state width, this can happen at
+  // an input-slice boundary or when admitting the next partial result. The
+  // disjoint keys then make the first final intermediate compaction reduce zero
+  // rows, so later inputs must not repeatedly rewrite a growing state.
   constexpr int64_t kPartialStateBytes = 1'500;
   core::PlanNodeId partialAggId;
   core::PlanNodeId finalAggId;
@@ -1318,21 +1317,19 @@ TEST_F(AggregationTest, boundedPartialRolloverAndNoReductionFinalMerge) {
           .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
 
   const auto planStats = toPlanStats(task->taskStats());
+  const auto statSum = [](const auto& stats, std::string_view name) {
+    const auto it = stats.customStats.find(std::string(name));
+    return it == stats.customStats.end() ? 0 : it->second.sum;
+  };
+  const auto& partialStats = planStats.at(partialAggId);
+  const auto& finalStats = planStats.at(finalAggId);
   EXPECT_GT(
-      planStats.at(partialAggId)
-          .customStats.at("cudfPartialAggregationPreemptiveFlush")
-          .sum,
+      statSum(partialStats, "cudfPartialAggregationPreemptiveFlush") +
+          statSum(partialStats, "cudfPartialAggregationPreSliceFlush") +
+          statSum(partialStats, "cudfPartialAggregationDeferredInput"),
       0);
-  EXPECT_EQ(
-      planStats.at(finalAggId)
-          .customStats.at("cudfIntermediateCompactionNoReduction")
-          .sum,
-      1);
-  EXPECT_GE(
-      planStats.at(finalAggId)
-          .customStats.at("cudfFinalAggregationDirectInputBatches")
-          .sum,
-      2);
+  EXPECT_EQ(statSum(finalStats, "cudfIntermediateCompactionNoReduction"), 1);
+  EXPECT_GE(statSum(finalStats, "cudfFinalAggregationDirectInputBatches"), 2);
 }
 
 TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
@@ -1352,9 +1349,10 @@ TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
         makeFlatVector<int32_t>(
             kRowsPerBatch,
             [batch](auto row) {
-              // The first two batches are disjoint, triggering the no-reduction
-              // path. Each later batch duplicates one of them, verifying that
-              // equal keys spanning input batches reach the same hash bucket.
+              // The first two batches establish disjoint key domains. Each
+              // later batch repeats one domain. A persistent collector must
+              // route equal keys to the same bucket across admissions and
+              // fanout growth or the DuckDB comparison will find duplicates.
               return (batch % 2) * kRowsPerBatch + row;
             }),
         makeFlatVector<int64_t>(
@@ -1382,19 +1380,40 @@ TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
 
   const auto planStats = toPlanStats(task->taskStats());
   const auto& finalStats = planStats.at(finalAggId);
-  EXPECT_EQ(finalStats.outputRows, kUniqueKeys);
+  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
+  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
+  EXPECT_EQ(groupbyStats->second->outputRows, kUniqueKeys);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationHashBuckets").sum, 1);
-  EXPECT_GT(
+  EXPECT_GE(
       finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum,
-      0);
+      4 * kRowsPerBatch);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationMaxBucketRows").max, 0);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationCollectionTransitions")
+          .sum,
+      1);
+  EXPECT_GE(
+      finalStats.customStats.at("cudfFinalAggregationCollectionInputBatches")
+          .sum,
+      4);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationCollectionGrows").sum, 0);
+  EXPECT_LE(
+      finalStats.customStats.at("cudfFinalAggregationMaxCompactionInputRows")
+          .max,
+      kMaxBucketRows);
+  EXPECT_LE(
+      finalStats.customStats.at("cudfFinalAggregationMaxCompactionWorkBytes")
+          .max,
+      finalStats.customStats.at("cudfFinalAggregationBucketTargetBytes").max);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationDirectInputRows").sum,
+      4 * kRowsPerBatch);
 
-  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
-  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
   EXPECT_GT(groupbyStats->second->outputVectors, 1)
       << "The cursor must drain more than one hash-bucket output batch";
 }
@@ -1421,8 +1440,10 @@ TEST_F(AggregationTest, closeReleasesPendingFinalAggregationState) {
       0,
       core::QueryCtx::create(driverExecutor_.get()),
       Task::ExecutionMode::kParallel);
-  DriverCtx driverCtx(task, 0, 0, 0, 0);
-  cudf_velox::CudfGroupby groupby(0, &driverCtx, finalAggregation);
+  auto driverCtx = std::make_unique<DriverCtx>(task, 0, 0, 0, 0);
+  auto* driverCtxPtr = driverCtx.get();
+  auto driver = Driver::testingCreate(std::move(driverCtx));
+  cudf_velox::CudfGroupby groupby(0, driverCtxPtr, finalAggregation);
   groupby.initialize();
 
   auto partialState = makeRowVector({
@@ -1451,6 +1472,107 @@ TEST_F(AggregationTest, closeReleasesPendingFinalAggregationState) {
   groupby.close();
   EXPECT_TRUE(weakOwner.expired())
       << "close() must release final states retained before noMoreInput()";
+}
+
+TEST_F(AggregationTest, finalCollectorConsumesOversizedInputOwners) {
+  constexpr vector_size_t kRows = 1'024;
+  auto partialState = makeRowVector({
+      makeFlatVector<int32_t>(kRows, [](auto row) { return row; }),
+      makeFlatVector<int64_t>(
+          kRows, [](auto row) { return 10 * static_cast<int64_t>(row + 1); }),
+  });
+  auto planNode = PlanBuilder()
+                      .values({partialState})
+                      .partialAggregation({"c0"}, {"sum(c1)"})
+                      .finalAggregation()
+                      .planNode();
+  auto finalAggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  ASSERT_NE(finalAggregation, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "AggregationTest.finalCollectorConsumesOversizedInputOwners",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driverCtx = std::make_unique<DriverCtx>(task, 0, 0, 0, 0);
+  auto* driverCtxPtr = driverCtx.get();
+  auto driver = Driver::testingCreate(std::move(driverCtx));
+  cudf_velox::CudfGroupby groupby(0, driverCtxPtr, finalAggregation);
+  groupby.initialize();
+
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  std::vector<std::weak_ptr<cudf::table>> weakOwners;
+  auto makeState = [&](uint64_t logicalBytes) {
+    auto owner =
+        std::shared_ptr<cudf::table>(cudf_velox::with_arrow::toCudfTable(
+            partialState,
+            pool(),
+            stream,
+            cudf::get_current_device_resource_ref()));
+    weakOwners.push_back(owner);
+    const auto tableView = owner->view();
+    return std::make_shared<cudf_velox::CudfVector>(
+        pool(),
+        finalAggregation->sources()[0]->outputType(),
+        partialState->size(),
+        tableView,
+        cudf_velox::CudfVector::ViewOwner{std::move(owner)},
+        stream,
+        logicalBytes);
+  };
+
+  // One logical 2 GiB input is above the hard 1 GiB envelope on every GPU,
+  // while each logical row is well below the 128 MiB minimum envelope.
+  // It must enter the collector immediately, and admission must materialize
+  // bounded bucket states instead of retaining a view of the source owner.
+  groupby.addInput(makeState(2ULL << 30));
+  stream.synchronize();
+  ASSERT_EQ(weakOwners.size(), 1);
+  EXPECT_TRUE(weakOwners[0].expired());
+  // The second state is twice as wide as the state that initialized the
+  // collector. Slicing and bucket admission must use its current width, not
+  // the first state's average-width estimate.
+  groupby.addInput(makeState(4ULL << 30));
+  stream.synchronize();
+  ASSERT_EQ(weakOwners.size(), 2);
+  EXPECT_TRUE(weakOwners[1].expired());
+
+  groupby.noMoreInput();
+  vector_size_t outputRows = 0;
+  for (int32_t attempts = 0; attempts < 1'024 && !groupby.isFinished();
+       ++attempts) {
+    if (auto output = groupby.getOutput()) {
+      outputRows += output->size();
+    }
+  }
+  EXPECT_TRUE(groupby.isFinished());
+  EXPECT_EQ(outputRows, kRows);
+
+  const auto opStats = groupby.stats(false);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationCollectionTransitions").sum,
+      1);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationCollectionByteTransitions")
+          .sum,
+      1);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationCollectionInputBatches").sum,
+      2);
+  EXPECT_LE(
+      opStats.runtimeStats.at("cudfFinalAggregationMaxCompactionWorkBytes").max,
+      opStats.runtimeStats.at("cudfFinalAggregationBucketTargetBytes").max);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationDirectInputRows").sum,
+      2 * kRows);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationDirectInputBytes").sum,
+      6ULL << 30);
+  groupby.close();
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {

@@ -1056,6 +1056,61 @@ TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
   const auto planStats = toPlanStats(task->taskStats());
   EXPECT_GT(planStats.at(partialAggId).customStats.at("flushRowCount").sum, 0);
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
+  EXPECT_GT(
+      planStats.at(finalAggId)
+          .customStats.at("cudfFinalAggregationDirectInputBatches")
+          .sum,
+      0);
+}
+
+TEST_F(AggregationTest, boundedPartialRolloverAndNoReductionFinalMerge) {
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int32_t>(
+            100, [batch](auto row) { return batch * 100 + row; }),
+        makeFlatVector<int64_t>(100, [](auto /*row*/) { return 1; }),
+    }));
+  }
+  createDuckDbTable(vectors);
+
+  // One partial result fits below this limit, but two do not. This exercises
+  // rollover before concatenate. The disjoint keys then make the first final
+  // intermediate compaction reduce zero rows, so later inputs must be retained
+  // for one direct final merge rather than repeatedly rewriting growing state.
+  constexpr int64_t kPartialStateBytes = 1'500;
+  core::PlanNodeId partialAggId;
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, kPartialStateBytes)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  EXPECT_GT(
+      planStats.at(partialAggId)
+          .customStats.at("cudfPartialAggregationPreemptiveFlush")
+          .sum,
+      0);
+  EXPECT_EQ(
+      planStats.at(finalAggId)
+          .customStats.at("cudfIntermediateCompactionNoReduction")
+          .sum,
+      1);
+  EXPECT_GE(
+      planStats.at(finalAggId)
+          .customStats.at("cudfFinalAggregationDirectInputBatches")
+          .sum,
+      2);
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {

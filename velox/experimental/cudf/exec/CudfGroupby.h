@@ -97,6 +97,13 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) = 0;
 
+  // Some aggregate requests reference temporary input columns owned by the
+  // aggregator (for example decoded decimal state). The requests no longer
+  // need these columns after cudf::groupby::aggregate returns. Releasing them
+  // before output conversion lets the stream-ordered memory resource reuse
+  // their storage for result serialization.
+  virtual void releaseRequestInputs() {}
+
   virtual ~GroupbyAggregator() = default;
 
  protected:
@@ -143,7 +150,8 @@ class CudfGroupby : public CudfOperatorBase {
 
   bool needsInput() const override {
     return !noMoreInput_ &&
-        !(flushGroupIdPartialInput_ && bufferedResult_ != nullptr);
+        !(flushGroupIdPartialInput_ && bufferedResult_ != nullptr) &&
+        pendingPartialResult_ == nullptr;
   }
 
   exec::BlockingReason isBlocked(ContinueFuture* /* unused */) override {
@@ -158,6 +166,8 @@ class CudfGroupby : public CudfOperatorBase {
   RowVectorPtr doGetOutput() override;
 
   void doNoMoreInput() override;
+
+  void doClose() override;
 
  private:
   CudfVectorPtr doGroupByAggregation(
@@ -180,6 +190,13 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<CudfVectorPtr>&& states,
       bool projectAggregationInputs,
       CudfVectorPtr existingState = nullptr);
+  CudfVectorPtr aggregateGroupbyStates(
+      std::vector<CudfVectorPtr>&& states,
+      bool projectAggregationInputs,
+      CudfVectorPtr existingState,
+      std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
+      const TypePtr& outputType);
+  CudfVectorPtr finalizePendingGroupbyStates();
   int64_t partialAggregationFlushThresholdBytes() const;
 
   std::vector<column_index_t> groupingKeyInputChannels_;
@@ -212,7 +229,16 @@ class CudfGroupby : public CudfOperatorBase {
 
   std::vector<CudfVectorPtr> inputs_;
   std::vector<CudfVectorPtr> pendingGroupbyStates_;
+  // A partial result that could not be compacted with bufferedResult_ without
+  // crossing the flush threshold. needsInput() stays false until the buffered
+  // result has been returned and this becomes the next buffered result.
+  CudfVectorPtr pendingPartialResult_;
+  int64_t pendingPartialInputRows_{0};
   int64_t pendingGroupbyStateBytes_{0};
+  // Set after an intermediate compaction observes no duplicate-key reduction.
+  // Further compactions would only rewrite an ever-growing state; retain the
+  // bounded input batches and merge them once with the final aggregators.
+  bool intermediateCompactionAbandoned_{false};
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;

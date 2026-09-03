@@ -284,6 +284,12 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
     return col;
   }
 
+  void releaseRequestInputs() override {
+    decodedSum_.reset();
+    decodedCount_.reset();
+    castedInput_.reset();
+  }
+
  private:
   GroupbyAggregationResultRef sumRef_;
   GroupbyAggregationResultRef countRef_;
@@ -365,6 +371,12 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           get_output_mr());
     }
     VELOX_UNREACHABLE();
+  }
+
+  void releaseRequestInputs() override {
+    decodedSum_.reset();
+    decodedCount_.reset();
+    castedInput_.reset();
   }
 
  private:
@@ -1155,6 +1167,10 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
       bufferedResultType_,
       inputTableStream);
 
+  if (!groupbyOnInput) {
+    return;
+  }
+
   if (flushGroupIdPartialInput_) {
     VELOX_CHECK_NULL(bufferedResult_);
     bufferedResult_ = std::move(groupbyOnInput);
@@ -1163,12 +1179,33 @@ void CudfGroupby::computePartialGroupbyStreaming(CudfVectorPtr tbl) {
 
   // If we already have partial output, concatenate the new results with it.
   if (bufferedResult_) {
+    const uint64_t bufferedBytes = bufferedResult_->estimateFlatSize();
+    const uint64_t newBytes = groupbyOnInput->estimateFlatSize();
+    const uint64_t flushThreshold =
+        std::max<int64_t>(partialAggregationFlushThresholdBytes_, 0);
+    const auto wouldCrossFlushThreshold = bufferedBytes > flushThreshold ||
+        newBytes > flushThreshold - std::min(bufferedBytes, flushThreshold);
+    if (wouldCrossFlushThreshold) {
+      // addInput() cannot return the existing result. Retain the new result
+      // separately and stop accepting input until getOutput() flushes the old
+      // result. Checking before concatenate avoids a transient allocation
+      // proportional to both states merely to discover after compaction that
+      // the result exceeded the limit.
+      VELOX_CHECK_NULL(pendingPartialResult_);
+      pendingPartialResult_ = std::move(groupbyOnInput);
+      pendingPartialInputRows_ = tbl->size();
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfPartialAggregationPreemptiveFlush", RuntimeCounter(1));
+      return;
+    }
+
     auto partialOutputStream = bufferedResult_->stream();
     std::vector<CudfVectorPtr> tablesToConcat;
-    tablesToConcat.push_back(bufferedResult_);
-    tablesToConcat.push_back(groupbyOnInput);
+    tablesToConcat.push_back(std::move(bufferedResult_));
+    tablesToConcat.push_back(std::move(groupbyOnInput));
     auto concatenatedTable = getConcatenatedTable(
-        std::move(tablesToConcat),
+        std::exchange(tablesToConcat, {}),
         bufferedResultType_,
         partialOutputStream,
         get_output_mr());
@@ -1218,6 +1255,22 @@ CudfVectorPtr CudfGroupby::compactGroupbyStates(
         stream);
   }
 
+  return aggregateGroupbyStates(
+      std::move(states),
+      projectAggregationInputs,
+      std::move(existingState),
+      intermediateAggregators_,
+      bufferedResultType_);
+}
+
+CudfVectorPtr CudfGroupby::aggregateGroupbyStates(
+    std::vector<CudfVectorPtr>&& states,
+    bool projectAggregationInputs,
+    CudfVectorPtr existingState,
+    std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
+    const TypePtr& outputType) {
+  VELOX_CHECK(existingState || !states.empty());
+
   const bool hasExistingState = existingState != nullptr;
   std::vector<CudfVectorPtr> allVectors;
   allVectors.reserve(states.size() + (hasExistingState ? 1 : 0));
@@ -1226,6 +1279,18 @@ CudfVectorPtr CudfGroupby::compactGroupbyStates(
   }
   for (auto& state : states) {
     allVectors.push_back(std::move(state));
+  }
+
+  if (allVectors.size() == 1) {
+    auto input = std::move(allVectors.front());
+    auto stream = input->stream();
+    auto inputView = input->getTableView();
+    if (!hasExistingState && projectAggregationInputs) {
+      inputView = inputView.select(
+          aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+    }
+    return doGroupByAggregation(
+        inputView, groupingKeyOutputChannels_, aggregators, outputType, stream);
   }
 
   std::vector<cudf::table_view> tableViews;
@@ -1257,11 +1322,20 @@ CudfVectorPtr CudfGroupby::compactGroupbyStates(
           inputStreams.data(), inputStreams.size()),
       stream);
 
+  // concatenate has copied all input columns and the deallocation ordering is
+  // established. Release the source states before groupby allocates decoded
+  // decimal columns, hash tables, and result columns. With an async memory
+  // resource this queues the frees on 'stream', allowing those allocations to
+  // reuse the source storage instead of overlapping it for the entire
+  // aggregation.
+  tableViews.clear();
+  allVectors.clear();
+
   return doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
-      intermediateAggregators_,
-      bufferedResultType_,
+      aggregators,
+      outputType,
       stream);
 }
 
@@ -1270,10 +1344,27 @@ void CudfGroupby::compactPendingGroupbyStates(bool projectAggregationInputs) {
   pendingGroupbyStates_.clear();
   pendingGroupbyStateBytes_ = 0;
 
+  int64_t inputRows = bufferedResult_ ? bufferedResult_->size() : 0;
+  for (const auto& state : states) {
+    VELOX_CHECK_NOT_NULL(state);
+    inputRows += state->size();
+  }
+
   bufferedResult_ = compactGroupbyStates(
       std::move(states), projectAggregationInputs, std::move(bufferedResult_));
   if (bufferedResult_) {
     pendingGroupbyStateBytes_ = bufferedResult_->estimateFlatSize();
+    if (inputRows > 0 && bufferedResult_->size() == inputRows) {
+      // There were no duplicate grouping keys to eliminate. Repeating this
+      // intermediate compaction against an ever-growing state only adds a
+      // concatenate, hash table, and result allocation on each input batch.
+      // Keep subsequent states separate and combine them directly in the one
+      // final aggregation at noMoreInput().
+      intermediateCompactionAbandoned_ = true;
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfIntermediateCompactionNoReduction", RuntimeCounter(1));
+    }
   }
 }
 
@@ -1286,7 +1377,8 @@ void CudfGroupby::addPendingGroupbyState(
 
   pendingGroupbyStateBytes_ += state->estimateFlatSize();
   pendingGroupbyStates_.push_back(std::move(state));
-  if ((bufferedResult_ || pendingGroupbyStates_.size() > 1) &&
+  if (!intermediateCompactionAbandoned_ &&
+      (bufferedResult_ || pendingGroupbyStates_.size() > 1) &&
       pendingGroupbyStateBytes_ >= maxPartialAggregationMemoryUsage_) {
     compactPendingGroupbyStates(projectAggregationInputs);
   }
@@ -1308,6 +1400,46 @@ void CudfGroupby::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
       inputTableStream);
 
   addPendingGroupbyState(std::move(groupbyOnInput), false);
+}
+
+CudfVectorPtr CudfGroupby::finalizePendingGroupbyStates() {
+  auto states = std::move(pendingGroupbyStates_);
+  pendingGroupbyStates_.clear();
+  pendingGroupbyStateBytes_ = 0;
+
+  if (!bufferedResult_ && states.empty()) {
+    return nullptr;
+  }
+
+  int64_t inputBatches = bufferedResult_ ? 1 : 0;
+  int64_t inputRows = bufferedResult_ ? bufferedResult_->size() : 0;
+  int64_t inputBytes = bufferedResult_
+      ? static_cast<int64_t>(bufferedResult_->estimateFlatSize())
+      : 0;
+  for (const auto& state : states) {
+    VELOX_CHECK_NOT_NULL(state);
+    ++inputBatches;
+    inputRows += state->size();
+    inputBytes += static_cast<int64_t>(state->estimateFlatSize());
+  }
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputBatches", RuntimeCounter(inputBatches));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputRows", RuntimeCounter(inputRows));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationDirectInputBytes",
+        RuntimeCounter(inputBytes, RuntimeCounter::Unit::kBytes));
+  }
+
+  auto& finalAggregators = isSingleStep_ ? finalAggregators_ : aggregators_;
+  return aggregateGroupbyStates(
+      std::move(states),
+      !isSingleStep_,
+      std::move(bufferedResult_),
+      finalAggregators,
+      outputType_);
 }
 
 int64_t CudfGroupby::partialAggregationFlushThresholdBytes() const {
@@ -1380,8 +1512,21 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     aggregator->addGroupbyRequest(builder);
   }
 
-  auto [groupKeys, results] =
-      groupByOwner.aggregate(requests, stream, get_output_mr());
+  auto releaseRequestInputs = [&]() {
+    for (auto& aggregator : aggregators) {
+      aggregator->releaseRequestInputs();
+    }
+  };
+  auto aggregateResult = [&]() {
+    try {
+      return groupByOwner.aggregate(requests, stream, get_output_mr());
+    } catch (...) {
+      releaseRequestInputs();
+      throw;
+    }
+  }();
+  releaseRequestInputs();
+  auto [groupKeys, results] = std::move(aggregateResult);
   // flatten the results
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
 
@@ -1439,6 +1584,16 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     if (flushGroupIdPartialInput_ && bufferedResult_) {
       return releaseAndResetBufferedResult();
     }
+    if (pendingPartialResult_) {
+      VELOX_CHECK_NOT_NULL(bufferedResult_);
+      VELOX_CHECK_GT(pendingPartialInputRows_, 0);
+      VELOX_CHECK_GE(numInputRows_, pendingPartialInputRows_);
+      numInputRows_ -= pendingPartialInputRows_;
+      auto output = releaseAndResetBufferedResult();
+      bufferedResult_ = std::move(pendingPartialResult_);
+      numInputRows_ = std::exchange(pendingPartialInputRows_, 0);
+      return output;
+    }
     if (bufferedResult_ &&
         bufferedResult_->estimateFlatSize() >
             partialAggregationFlushThresholdBytes_) {
@@ -1471,22 +1626,12 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   // is true (guarded by the check above).
   if (streamingEnabled_) {
     finished_ = true;
-    if (!pendingGroupbyStates_.empty()) {
-      compactPendingGroupbyStates(!isSingleStep_);
-    }
-    if (!bufferedResult_) {
+    auto result = finalizePendingGroupbyStates();
+    if (!result) {
       return nullptr;
     }
-    auto& aggs = isSingleStep_ ? finalAggregators_ : aggregators_;
-    auto stream = bufferedResult_->stream();
-    auto result = doGroupByAggregation(
-        bufferedResult_->getTableView(),
-        groupingKeyOutputChannels_,
-        aggs,
-        outputType_,
-        stream);
+    auto stream = result->stream();
     stream.synchronize();
-    bufferedResult_.reset();
     return result;
   }
 
@@ -1524,6 +1669,18 @@ void CudfGroupby::doNoMoreInput() {
   if (isPartialOutput_ && inputs_.empty()) {
     finished_ = true;
   }
+}
+
+void CudfGroupby::doClose() {
+  inputs_.clear();
+  pendingGroupbyStates_.clear();
+  pendingPartialResult_.reset();
+  bufferedResult_.reset();
+  aggregators_.clear();
+  intermediateAggregators_.clear();
+  partialAggregators_.clear();
+  finalAggregators_.clear();
+  Operator::close();
 }
 
 bool CudfGroupby::isFinished() {

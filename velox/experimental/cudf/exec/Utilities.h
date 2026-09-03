@@ -20,9 +20,9 @@
 
 #include <cudf/table/table.hpp>
 
-#include <cuda_runtime_api.h>
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <memory>
 #include <span>
@@ -99,9 +99,12 @@ getConcatenatedTableBatched(
 /**
  * @brief Concatenates multiple CudfVectors into CudfVector output batches.
  *
- * This wraps getConcatenatedTableBatched for column-bearing tables and
- * preserves logical row counts from CudfVector::size() for zero-column tables,
- * whose cuDF table views cannot represent the row count.
+ * Column-bearing inputs no larger than the configured maximum are concatenated
+ * in runs. An individually oversized input is instead returned as bounded
+ * zero-copy slices which retain that CudfVector as their shared owner; this
+ * avoids materializing a second full-sized table merely to enforce the row
+ * limit. Logical row counts from CudfVector::size() are preserved for
+ * zero-column tables, whose cuDF table views cannot represent the row count.
  */
 [[nodiscard]] std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
     memory::MemoryPool* pool,

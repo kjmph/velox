@@ -21,6 +21,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -173,20 +174,35 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
 
   auto inputStreams = std::vector<rmm::cuda_stream_view>();
   auto tableViews = std::vector<cudf::table_view>();
+  const auto maxRows = maxBatchRows();
 
   inputStreams.reserve(tables.size());
   tableViews.reserve(tables.size());
 
   for (const auto& table : tables) {
     VELOX_CHECK_NOT_NULL(table);
-    tableViews.push_back(table->getTableView());
+    const auto tableView = table->getTableView();
+    const auto numRows = static_cast<size_t>(tableView.num_rows());
+    if (numRows <= maxRows) {
+      tableViews.push_back(tableView);
+    } else {
+      for (size_t start = 0; start < numRows; start += maxRows) {
+        const auto end = std::min(start + maxRows, numRows);
+        auto slices = cudf::slice(
+            tableView,
+            {static_cast<cudf::size_type>(start),
+             static_cast<cudf::size_type>(end)},
+            stream);
+        VELOX_CHECK_EQ(slices.size(), 1);
+        tableViews.push_back(slices.front());
+      }
+    }
     inputStreams.push_back(table->stream());
   }
 
   cudf::detail::join_streams(inputStreams, stream);
 
   std::vector<std::unique_ptr<cudf::table>> outputTables;
-  auto const maxRows = maxBatchRows();
   size_t startpos = 0;
   size_t runningRows = 0;
   for (size_t i = 0; i < tableViews.size(); ++i) {
@@ -230,17 +246,83 @@ std::vector<CudfVectorPtr> getConcatenatedCudfVectorsBatched(
 
   std::vector<CudfVectorPtr> outputVectors;
   if (tableType->size() > 0) {
-    auto tables =
-        getConcatenatedTableBatched(std::move(vectors), tableType, stream, mr);
-    outputVectors.reserve(tables.size());
-    for (auto& table : tables) {
-      VELOX_CHECK_NOT_NULL(table);
-      const auto rowCount =
-          checkedVectorSize(static_cast<size_t>(table->num_rows()));
+    if (vectors.empty()) {
       outputVectors.push_back(
           std::make_shared<CudfVector>(
-              pool, tableType, rowCount, std::move(table), stream));
+              pool, tableType, 0, makeEmptyTable(tableType), stream));
+      return outputVectors;
     }
+
+    const auto maxRows = maxBatchRows();
+    std::vector<CudfVectorPtr> materializedRun;
+    materializedRun.reserve(vectors.size());
+
+    const auto flushMaterializedRun = [&]() {
+      if (materializedRun.empty()) {
+        return;
+      }
+
+      auto tables = getConcatenatedTableBatched(
+          std::exchange(materializedRun, {}), tableType, stream, mr);
+      outputVectors.reserve(outputVectors.size() + tables.size());
+      for (auto& table : tables) {
+        VELOX_CHECK_NOT_NULL(table);
+        const auto rowCount =
+            checkedVectorSize(static_cast<size_t>(table->num_rows()));
+        outputVectors.push_back(
+            std::make_shared<CudfVector>(
+                pool, tableType, rowCount, std::move(table), stream));
+      }
+    };
+
+    for (auto& vector : vectors) {
+      VELOX_CHECK_NOT_NULL(vector);
+      const auto rowCount = static_cast<size_t>(vector->size());
+      if (rowCount <= maxRows) {
+        materializedRun.push_back(std::move(vector));
+        continue;
+      }
+
+      // Never concatenate an oversized owner. Doing so would transiently
+      // allocate another table as large as the input before the max-row limit
+      // could take effect. Preserve order by flushing the preceding normal
+      // run, then publish bounded zero-copy views backed by this owner.
+      flushMaterializedRun();
+
+      auto owner = std::move(vector);
+      const auto ownerView = owner->getTableView();
+      VELOX_CHECK_EQ(static_cast<size_t>(ownerView.num_rows()), rowCount);
+      const auto flatSize = owner->estimateFlatSize();
+      const auto flatBytesPerRow = flatSize / rowCount;
+      const auto flatByteRemainder = flatSize % rowCount;
+      const auto flatSizeAtRow = [&](size_t row) {
+        return flatBytesPerRow * row +
+            std::min<uint64_t>(static_cast<uint64_t>(row), flatByteRemainder);
+      };
+
+      outputVectors.reserve(
+          outputVectors.size() + (rowCount + maxRows - 1) / maxRows);
+      for (size_t start = 0; start < rowCount; start += maxRows) {
+        const auto end = std::min(start + maxRows, rowCount);
+        auto slices = cudf::slice(
+            ownerView,
+            {static_cast<cudf::size_type>(start),
+             static_cast<cudf::size_type>(end)},
+            owner->stream());
+        VELOX_CHECK_EQ(slices.size(), 1);
+        outputVectors.push_back(
+            std::make_shared<CudfVector>(
+                pool,
+                tableType,
+                checkedVectorSize(end - start),
+                slices.front(),
+                CudfVector::ViewOwner{owner},
+                owner->stream(),
+                flatSizeAtRow(end) - flatSizeAtRow(start)));
+      }
+    }
+
+    flushMaterializedRun();
     return outputVectors;
   }
 

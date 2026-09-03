@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -24,6 +25,7 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <array>
 #include <optional>
 #include <utility>
 
@@ -109,6 +111,151 @@ TEST_F(CudfBatchConcatTest, rejectsZeroRowCpuInput) {
 
   VELOX_ASSERT_THROW(
       concat.addInput(input), "CudfBatchConcat expects CudfVector input");
+}
+
+TEST_F(CudfBatchConcatTest, splitsSingleOversizedInputAtMaxThreshold) {
+  constexpr vector_size_t kInputRows = 10;
+  constexpr vector_size_t kMaxRows = 4;
+  const std::array<vector_size_t, 3> expectedOutputRows{4, 4, 2};
+
+  updateCudfConfig(/*min=*/kMaxRows, /*max=*/kMaxRows);
+
+  auto input = makeRowVector(
+      {makeFlatSequence<int64_t>(0, kInputRows),
+       makeFlatVector<std::string>({
+           "zero",
+           "one",
+           "two",
+           "three",
+           "four",
+           "five",
+           "six",
+           "seven",
+           "eight",
+           "nine",
+       })});
+  auto planNode = PlanBuilder().values({input}).project({"c0"}).planNode();
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "CudfBatchConcatTest.singleOversizedInput",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  CudfBatchConcat concat(0, &driverCtx, planNode, kMaxRows);
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+  auto inputTable = with_arrow::toCudfTable(
+      input, pool(), stream, cudf::get_current_device_resource_ref());
+  auto cudfInput = std::make_shared<CudfVector>(
+      pool(), input->type(), input->size(), std::move(inputTable), stream);
+  const auto inputColumn = cudfInput->getTableView().column(0);
+  const auto* inputHead = inputColumn.head<int64_t>();
+  const auto inputOffset = inputColumn.offset();
+  const auto inputFlatSize = cudfInput->estimateFlatSize();
+
+  concat.addInput(cudfInput);
+  cudfInput.reset();
+  concat.noMoreInput();
+
+  vector_size_t outputOffset = 0;
+  uint64_t outputFlatSize = 0;
+  for (const auto expectedRows : expectedOutputRows) {
+    auto output = std::dynamic_pointer_cast<CudfVector>(concat.getOutput());
+    ASSERT_NE(output, nullptr);
+    EXPECT_EQ(output->size(), expectedRows);
+    EXPECT_LE(output->size(), kMaxRows);
+    EXPECT_EQ(output->stream().value(), stream.value());
+
+    const auto outputColumn = output->getTableView().column(0);
+    EXPECT_EQ(outputColumn.head<int64_t>(), inputHead);
+    EXPECT_EQ(outputColumn.offset(), inputOffset + outputOffset);
+    outputFlatSize += output->estimateFlatSize();
+    outputOffset += expectedRows;
+  }
+
+  EXPECT_EQ(outputOffset, kInputRows);
+  EXPECT_EQ(outputFlatSize, inputFlatSize)
+      << "Slice estimates must apportion variable-width storage instead of "
+         "counting the oversized owner's full backing data for every view";
+  EXPECT_TRUE(concat.isFinished());
+  EXPECT_EQ(concat.getOutput(), nullptr);
+}
+
+TEST_F(CudfBatchConcatTest, preservesOrderAroundOversizedInput) {
+  constexpr vector_size_t kMaxRows = 4;
+  const std::array<vector_size_t, 5> expectedOutputRows{2, 4, 4, 2, 2};
+
+  updateCudfConfig(/*min=*/100, /*max=*/kMaxRows);
+
+  auto prefix = makeRowVector({makeFlatSequence<int64_t>(0, 2)});
+  auto oversized = makeRowVector({makeFlatSequence<int64_t>(2, 10)});
+  auto suffix = makeRowVector({makeFlatSequence<int64_t>(12, 2)});
+  auto planNode = PlanBuilder().values({prefix}).project({"c0"}).planNode();
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "CudfBatchConcatTest.oversizedInputWithNeighbors",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  CudfBatchConcat concat(0, &driverCtx, planNode, 100);
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  const auto toCudfVector = [&](const RowVectorPtr& input) {
+    auto table = with_arrow::toCudfTable(input, pool(), stream, mr);
+    return std::make_shared<CudfVector>(
+        pool(), input->type(), input->size(), std::move(table), stream);
+  };
+
+  auto prefixCudf = toCudfVector(prefix);
+  auto oversizedCudf = toCudfVector(oversized);
+  auto suffixCudf = toCudfVector(suffix);
+  const auto oversizedColumn = oversizedCudf->getTableView().column(0);
+  const auto* oversizedHead = oversizedColumn.head<int64_t>();
+  const auto oversizedOffset = oversizedColumn.offset();
+
+  concat.addInput(std::move(prefixCudf));
+  concat.addInput(std::move(oversizedCudf));
+  concat.addInput(std::move(suffixCudf));
+  concat.noMoreInput();
+
+  std::vector<int64_t> actualValues;
+  for (size_t outputIndex = 0; outputIndex < expectedOutputRows.size();
+       ++outputIndex) {
+    auto output = std::dynamic_pointer_cast<CudfVector>(concat.getOutput());
+    ASSERT_NE(output, nullptr);
+    EXPECT_EQ(output->size(), expectedOutputRows[outputIndex]);
+    EXPECT_LE(output->size(), kMaxRows);
+
+    if (outputIndex >= 1 && outputIndex <= 3) {
+      const auto outputColumn = output->getTableView().column(0);
+      EXPECT_EQ(outputColumn.head<int64_t>(), oversizedHead);
+      EXPECT_EQ(
+          outputColumn.offset(),
+          oversizedOffset + static_cast<vector_size_t>((outputIndex - 1) * 4));
+    }
+
+    auto hostOutput = with_arrow::toVeloxColumn(
+        output->getTableView(), pool(), output->type(), output->stream(), mr);
+    output->stream().synchronize();
+    auto values = hostOutput->childAt(0)->asFlatVector<int64_t>();
+    for (vector_size_t row = 0; row < values->size(); ++row) {
+      actualValues.push_back(values->valueAt(row));
+    }
+  }
+
+  ASSERT_EQ(actualValues.size(), 14);
+  for (size_t row = 0; row < actualValues.size(); ++row) {
+    EXPECT_EQ(actualValues[row], static_cast<int64_t>(row));
+  }
+  EXPECT_TRUE(concat.isFinished());
+  EXPECT_EQ(concat.getOutput(), nullptr);
 }
 
 // Verifies that CudfBatchConcat is inserted before aggregation and reduces

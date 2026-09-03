@@ -21,6 +21,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/groupby.hpp>
 
+#include <deque>
 #include <memory>
 #include <unordered_map>
 
@@ -170,6 +171,13 @@ class CudfGroupby : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  struct FinalAggregationBucket {
+    std::vector<CudfVectorPtr> states;
+    uint64_t rows{0};
+    uint64_t bytes{0};
+    uint32_t hashDepth{0};
+  };
+
   CudfVectorPtr doGroupByAggregation(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
@@ -197,6 +205,36 @@ class CudfGroupby : public CudfOperatorBase {
       std::vector<std::unique_ptr<GroupbyAggregator>>& aggregators,
       const TypePtr& outputType);
   CudfVectorPtr finalizePendingGroupbyStates();
+  CudfVectorPtr getNextFinalAggregationBucket();
+  void initializeFinalAggregationBuckets(
+      std::vector<CudfVectorPtr>&& states,
+      CudfVectorPtr existingState,
+      bool projectAggregationInputs,
+      uint64_t inputRows,
+      uint64_t inputBytes);
+  void hashPartitionFinalState(
+      CudfVectorPtr state,
+      bool projectAggregationInputs,
+      uint32_t numBuckets,
+      uint32_t hashSeed,
+      uint32_t hashDepth,
+      std::vector<FinalAggregationBucket>& buckets);
+  void repartitionFinalAggregationBucket(FinalAggregationBucket&& bucket);
+  FinalAggregationBucket compactSkewedFinalAggregationBucket(
+      FinalAggregationBucket&& bucket);
+  std::vector<CudfVectorPtr> splitFinalAggregationState(
+      CudfVectorPtr state) const;
+  bool finalAggregationBucketIsOversized(
+      const FinalAggregationBucket& bucket) const;
+  uint32_t finalAggregationPartitionCount(
+      uint64_t rows,
+      uint64_t bytes,
+      bool requireSplit) const;
+  uint64_t finalAggregationBucketTargetBytes() const;
+  uint64_t finalAggregationBucketTargetRows(
+      uint64_t inputRows,
+      uint64_t inputBytes,
+      uint64_t targetBytes) const;
   int64_t partialAggregationFlushThresholdBytes() const;
 
   std::vector<column_index_t> groupingKeyInputChannels_;
@@ -239,6 +277,16 @@ class CudfGroupby : public CudfOperatorBase {
   // Further compactions would only rewrite an ever-growing state; retain the
   // bounded input batches and merge them once with the final aggregators.
   bool intermediateCompactionAbandoned_{false};
+  // A high-cardinality final aggregation cannot safely concatenate every
+  // intermediate state into one device table. Hash buckets are disjoint on
+  // the grouping keys, so each bucket can be finalized and returned before
+  // the next one is materialized.
+  bool finalAggregationInitialized_{false};
+  bool hashBucketFinalization_{false};
+  uint64_t finalAggregationBucketTargetRows_{0};
+  uint64_t finalAggregationBucketTargetBytes_{0};
+  uint32_t nextFinalAggregationHashSeed_{0};
+  std::deque<FinalAggregationBucket> finalAggregationBuckets_;
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;

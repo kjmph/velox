@@ -24,6 +24,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -39,6 +40,8 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
+
+#include <folly/ScopeGuard.h>
 
 #include <cstdlib>
 #include <limits>
@@ -962,6 +965,66 @@ TEST_F(CudfDecimalTest, decimalSumPartialFinalVarbinary) {
 
   facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT k, sum(d) AS s FROM tmp GROUP BY k");
+}
+
+TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
+  auto& cudfConfig = CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  constexpr int32_t kMaxBucketRows = 8;
+  cudfConfig.batchSizeMaxThreshold = kMaxBucketRows;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  constexpr vector_size_t kRowsPerBatch = 32;
+  constexpr vector_size_t kUniqueKeys = 2 * kRowsPerBatch;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector(
+        {"k", "d"},
+        {
+            makeFlatVector<int32_t>(
+                kRowsPerBatch,
+                [batch](auto row) {
+                  return (batch % 2) * kRowsPerBatch + row;
+                }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) {
+                  return static_cast<int64_t>((batch + 1) * 100 + row);
+                },
+                nullptr,
+                DECIMAL(12, 2)),
+        }));
+  }
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      exec::test::AssertQueryBuilder(duckDbQueryRunner_)
+          .config(core::QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(
+              exec::test::PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"k"}, {"sum(d) AS s", "avg(d) AS a"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults(
+              "SELECT k, sum(d) AS s, avg(d) AS a FROM tmp GROUP BY k");
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& finalStats = planStats.at(finalAggId);
+  EXPECT_EQ(finalStats.outputRows, kUniqueKeys);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationHashBuckets").sum, 1);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
+
+  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
+  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
+  EXPECT_GT(groupbyStats->second->outputVectors, 1);
 }
 
 TEST_F(CudfDecimalTest, decimalPartialSumVarbinaryToVeloxRoundTrip) {

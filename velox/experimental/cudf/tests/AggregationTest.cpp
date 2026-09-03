@@ -16,8 +16,11 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
+#include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -25,6 +28,8 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/type/Timestamp.h"
+
+#include <folly/ScopeGuard.h>
 
 #include <cmath>
 
@@ -1111,6 +1116,124 @@ TEST_F(AggregationTest, boundedPartialRolloverAndNoReductionFinalMerge) {
           .customStats.at("cudfFinalAggregationDirectInputBatches")
           .sum,
       2);
+}
+
+TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  constexpr int32_t kMaxBucketRows = 16;
+  cudfConfig.batchSizeMaxThreshold = kMaxBucketRows;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  constexpr vector_size_t kRowsPerBatch = 64;
+  constexpr vector_size_t kUniqueKeys = 2 * kRowsPerBatch;
+  std::vector<RowVectorPtr> vectors;
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    vectors.push_back(makeRowVector({
+        makeFlatVector<int32_t>(
+            kRowsPerBatch,
+            [batch](auto row) {
+              // The first two batches are disjoint, triggering the no-reduction
+              // path. Each later batch duplicates one of them, verifying that
+              // equal keys spanning input batches reach the same hash bucket.
+              return (batch % 2) * kRowsPerBatch + row;
+            }),
+        makeFlatVector<int64_t>(
+            kRowsPerBatch, [batch](auto /*row*/) { return batch + 1; }),
+    }));
+  }
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation(
+                      {"c0"}, {"sum(c1)", "count(c1)", "min(c1)", "max(c1)"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .maxDrivers(1)
+          .assertResults(
+              "SELECT c0, sum(c1), count(c1), min(c1), max(c1) "
+              "FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& finalStats = planStats.at(finalAggId);
+  EXPECT_EQ(finalStats.outputRows, kUniqueKeys);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationHashBuckets").sum, 1);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum,
+      0);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationMaxBucketRows").max, 0);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
+
+  const auto groupbyStats = finalStats.operatorStats.find("CudfGroupbyFINAL");
+  ASSERT_NE(groupbyStats, finalStats.operatorStats.end());
+  EXPECT_GT(groupbyStats->second->outputVectors, 1)
+      << "The cursor must drain more than one hash-bucket output batch";
+}
+
+TEST_F(AggregationTest, closeReleasesPendingFinalAggregationState) {
+  auto rawInput = makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2, 3}),
+      makeFlatVector<int64_t>({10, 20, 30, 40}),
+  });
+  auto planNode = PlanBuilder()
+                      .values({rawInput})
+                      .partialAggregation({"c0"}, {"sum(c1)"})
+                      .finalAggregation()
+                      .planNode();
+  auto finalAggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  ASSERT_NE(finalAggregation, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "AggregationTest.closePendingFinalState",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  DriverCtx driverCtx(task, 0, 0, 0, 0);
+  cudf_velox::CudfGroupby groupby(0, &driverCtx, finalAggregation);
+  groupby.initialize();
+
+  auto partialState = makeRowVector({
+      makeFlatVector<int32_t>({0, 1, 2, 3}),
+      makeFlatVector<int64_t>({10, 20, 30, 40}),
+  });
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto ownedTable =
+      std::shared_ptr<cudf::table>(cudf_velox::with_arrow::toCudfTable(
+          partialState,
+          pool(),
+          stream,
+          cudf::get_current_device_resource_ref()));
+  std::weak_ptr<cudf::table> weakOwner = ownedTable;
+  auto cudfState = std::make_shared<cudf_velox::CudfVector>(
+      pool(),
+      finalAggregation->sources()[0]->outputType(),
+      partialState->size(),
+      ownedTable->view(),
+      cudf_velox::CudfVector::ViewOwner{ownedTable},
+      stream);
+  ownedTable.reset();
+
+  groupby.addInput(std::move(cudfState));
+  EXPECT_FALSE(weakOwner.expired());
+  groupby.close();
+  EXPECT_TRUE(weakOwner.expired())
+      << "close() must release final states retained before noMoreInput()";
 }
 
 TEST_F(AggregationTest, finalAggregationStreamingMixedAggs) {

@@ -174,11 +174,25 @@ class CudfGroupby : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  struct ParkedFinalAggregationState {
+    RowVectorPtr state;
+    uint64_t deviceBytes{0};
+  };
+
   struct FinalAggregationBucket {
     std::vector<CudfVectorPtr> states;
+    std::vector<ParkedFinalAggregationState> parkedStates;
     uint64_t rows{0};
     uint64_t bytes{0};
     uint32_t hashDepth{0};
+
+    bool empty() const {
+      return states.empty() && parkedStates.empty();
+    }
+
+    size_t numStates() const {
+      return states.size() + parkedStates.size();
+    }
   };
 
   CudfVectorPtr doGroupByAggregation(
@@ -224,6 +238,12 @@ class CudfGroupby : public CudfOperatorBase {
       uint64_t inputRows,
       uint64_t inputBytes);
   void recordFinalAggregationRetainedState();
+  ParkedFinalAggregationState parkFinalAggregationState(CudfVectorPtr state);
+  CudfVectorPtr restoreFinalAggregationState(
+      ParkedFinalAggregationState state,
+      rmm::cuda_stream_view stream);
+  void parkFinalAggregationBucket(FinalAggregationBucket& bucket);
+  void restoreFinalAggregationBucket(FinalAggregationBucket& bucket);
   void compactPendingGroupbyStates(bool projectAggregationInputs);
   CudfVectorPtr compactGroupbyStates(
       std::vector<CudfVectorPtr>&& states,
@@ -338,6 +358,8 @@ class CudfGroupby : public CudfOperatorBase {
   uint32_t finalAggregationCollectionHashSeed_{0};
   std::vector<FinalAggregationBucket> finalAggregationCollectionBuckets_;
   std::deque<FinalAggregationBucket> finalAggregationBuckets_;
+  uint64_t finalAggregationHostParkedRows_{0};
+  uint64_t finalAggregationHostParkedBytes_{0};
   TypePtr inputType_;
   RowTypePtr bufferedResultType_;
   CudfVectorPtr bufferedResult_;

@@ -1413,6 +1413,17 @@ TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationDirectInputRows").sum,
       4 * kRowsPerBatch);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRuns").sum, 0);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
+      finalStats.customStats.at("cudfFinalAggregationHostRestoredRows").sum);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
+      finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationMaxHostParkedBytes").max,
+      0);
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1)
       << "The cursor must drain more than one hash-bucket output batch";
@@ -1572,6 +1583,14 @@ TEST_F(AggregationTest, finalCollectorConsumesOversizedInputOwners) {
   EXPECT_EQ(
       opStats.runtimeStats.at("cudfFinalAggregationDirectInputBytes").sum,
       6ULL << 30);
+  EXPECT_GT(
+      opStats.runtimeStats.at("cudfFinalAggregationHostParkedRuns").sum, 0);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationHostParkedRows").sum,
+      opStats.runtimeStats.at("cudfFinalAggregationHostRestoredRows").sum);
+  EXPECT_EQ(
+      opStats.runtimeStats.at("cudfFinalAggregationHostParkedBytes").sum,
+      opStats.runtimeStats.at("cudfFinalAggregationHostRestoredBytes").sum);
   groupby.close();
 }
 

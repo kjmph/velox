@@ -1102,6 +1102,14 @@ TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
       finalStats.customStats.at("cudfFinalAggregationHashBuckets").sum, 1);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRuns").sum, 0);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
+      finalStats.customStats.at("cudfFinalAggregationHostRestoredRows").sum);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
+      finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1);
 }

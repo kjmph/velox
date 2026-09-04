@@ -34,9 +34,12 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -62,6 +65,26 @@ class CudfHashJoinBridge : public exec::JoinBridge {
     std::vector<std::shared_ptr<cudf::table>> buildTables;
     std::vector<std::shared_ptr<cudf::hash_join>> hashJoins;
     std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctHashJoins;
+    // True when the build was parked on host and hydrated on first probe.
+    // Probe operators use this to stream one build-shard result at a time and
+    // to release the shared hydrated state at the last-prober barrier.
+    bool deferredHydration{false};
+  };
+
+  struct ParkedHashJoinState {
+    std::vector<RowVectorPtr> buildTables;
+    uint64_t rows{0};
+    uint64_t deviceBytes{0};
+    uint64_t hostBytes{0};
+  };
+
+  struct HashOrFutureResult {
+    std::optional<HashJoinState> hashObject;
+    // Set only for the one probe driver that atomically claims hydration.
+    std::optional<ParkedHashJoinState> parkedHashObject;
+    // True when the build is parked but this call did not claim it. This lets
+    // a probe accept input without eagerly hydrating during isBlocked().
+    bool buildParked{false};
   };
 
   // The bridge transfers all build side batches and the hash join objects
@@ -69,10 +92,19 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   /** @brief Hash tables paired with their corresponding join objects for
    * batched processing */
   using hash_type = HashJoinState;
+  using parked_hash_type = ParkedHashJoinState;
 
   void setHashTable(std::optional<hash_type> hashObject);
 
-  std::optional<hash_type> hashOrFuture(ContinueFuture* future);
+  void setParkedHashTable(parked_hash_type hashObject);
+
+  void setHydratedHashTable(hash_type hashObject);
+
+  void setHydrationError(std::exception_ptr error);
+
+  HashOrFutureResult hashOrFuture(ContinueFuture* future, bool claimHydration);
+
+  void probeFinished();
 
   // Store and retrieve the CUDA stream used for building the hash join.
   void setBuildStream(rmm::cuda_stream_view buildStream);
@@ -87,6 +119,11 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
   std::optional<hash_type> hashObject_;
+  /** @brief Host-resident build state awaiting the first real probe input. */
+  std::optional<parked_hash_type> parkedHashObject_;
+  bool hydrationStarted_{false};
+  bool probeFinished_{false};
+  std::exception_ptr hydrationError_;
   /** @brief CUDA stream used by build operator for proper synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
@@ -190,9 +227,15 @@ class CudfHashJoinProbe : public CudfOperatorBase {
  private:
   void waitForBuildReady(rmm::cuda_stream_view stream);
 
+  hash_type hydrateParkedHashTable(
+      const CudfHashJoinBridge::parked_hash_type& parkedHashObject,
+      rmm::cuda_stream_view stream);
+
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */
   std::optional<hash_type> hashObject_;
+  /** @brief Host state claimed by this driver for demand hydration. */
+  std::optional<CudfHashJoinBridge::parked_hash_type> parkedHashObject_;
 
   // Filter related members
   /** @brief Whether to use AST-based filtering (false if filter spans both
@@ -234,6 +277,9 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /** @brief Output column positions for right table columns */
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
+  bool deferredHydration_{false};
+  bool deferredProbeBarrierEntered_{false};
+  size_t nextBuildTableIndex_{0};
 
   /// True if any build table has NULL values in join key columns.
   /// Used for null-aware LEFT SEMI PROJECT to determine match column
@@ -314,6 +360,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
    * @return Vector of result tables (multiple if build data was batched)
    */
   std::vector<JoinOutput> innerJoin(
+      cudf::table_view leftTableView,
+      rmm::cuda_stream_view stream);
+
+  JoinOutput innerJoinShard(
+      size_t buildTableIndex,
       cudf::table_view leftTableView,
       rmm::cuda_stream_view stream);
   /**

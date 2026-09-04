@@ -70,6 +70,8 @@ namespace {
 constexpr size_t kDefaultMinMaxSummaryBatchRows = 100'000'000;
 constexpr uint64_t kMinHashBuildBatchTargetBytes = 128ULL << 20;
 constexpr uint64_t kMaxHashBuildBatchTargetBytes = 1ULL << 30;
+constexpr uint64_t kMinDeferredHashHydrationBytes = 1ULL << 30;
+constexpr uint64_t kMaxDeferredHashHydrationBytes = 8ULL << 30;
 constexpr uint64_t kHashBuildWorkspaceBytesPerRow =
     2 * (sizeof(cudf::hash_value_type) + sizeof(cudf::size_type));
 
@@ -137,6 +139,29 @@ uint64_t hashBuildBatchMaxRows() {
         maxRows, static_cast<uint64_t>(config.batchSizeMaxThreshold.value()));
   }
   return maxRows;
+}
+
+uint64_t deferredHashHydrationThresholdBytes() {
+  uint64_t thresholdBytes = kMaxDeferredHashHydrationBytes;
+  if (auto info = currentDeviceMemoryInfo(); info.has_value()) {
+    // A build larger than one eighth of the device is large enough to starve
+    // independent branches that execute before its probe input is ready. Cap
+    // the threshold so large-memory GPUs do not retain arbitrarily large idle
+    // builds, while keeping the resident fast path for ordinary joins.
+    thresholdBytes = info->totalBytes / 8;
+  }
+  thresholdBytes = std::clamp(
+      thresholdBytes,
+      kMinDeferredHashHydrationBytes,
+      kMaxDeferredHashHydrationBytes);
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::deferredHydrationThresholdBytes",
+      &thresholdBytes);
+  VELOX_CHECK_GT(
+      thresholdBytes,
+      0,
+      "cuDF deferred hash hydration threshold must be positive");
+  return thresholdBytes;
 }
 
 /// Creates extended table view by appending precomputed columns
@@ -272,6 +297,19 @@ bool useProbeUniqueInnerJoin(const core::HashJoinNode& joinNode) {
       joinNode.isInnerJoin() && !joinNode.filter() &&
       joinNode.leftKeysUnique() && joinNode.leftKeysNonNull() &&
       !joinNode.rightKeysUnique();
+}
+
+bool supportsDeferredHashHydration(const core::HashJoinNode& joinNode) {
+  // This first deferred-build lifecycle is intentionally narrow. Trusted
+  // unique and non-null build keys use a shared collection of distinct hashes
+  // after hydration, and an unfiltered INNER join can stream independent
+  // build-shard outputs without cross-shard match state. Other join kinds and
+  // filters retain the existing resident path.
+  return joinNode.isInnerJoin() && !joinNode.filter() &&
+      joinNode.rightKeysUnique() && joinNode.rightKeysNonNull() &&
+      joinNode.leftKeysNonNull() &&
+      CudfConfig::getInstance().distinctHashJoinEnabled &&
+      !useProbeUniqueInnerJoin(joinNode);
 }
 
 cudf::size_type countNullJoinKeys(
@@ -538,6 +576,10 @@ void CudfHashJoinProbe::doClose() {
   input_.reset();
   inputs_.clear();
   hashObject_.reset();
+  parkedHashObject_.reset();
+  deferredHydration_ = false;
+  deferredProbeBarrierEntered_ = false;
+  nextBuildTableIndex_ = 0;
   rightMatchedFlags_.clear();
   cachedRightPrecomputed_.clear();
   cachedExtendedRightViews_.clear();
@@ -564,8 +606,10 @@ void CudfHashJoinBridge::setHashTable(
   std::vector<ContinuePromise> promises;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(started_);
     VELOX_CHECK(
-        !hashObject_.has_value(),
+        !hashObject_.has_value() && !parkedHashObject_.has_value() &&
+            !probeFinished_,
         "CudfHashJoinBridge already has a hash table");
     hashObject_ = std::move(hashObject);
     promises = std::move(promises_);
@@ -573,14 +617,79 @@ void CudfHashJoinBridge::setHashTable(
   notify(std::move(promises));
 }
 
-std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
-    ContinueFuture* future) {
+void CudfHashJoinBridge::setParkedHashTable(
+    CudfHashJoinBridge::parked_hash_type hashObject) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(started_);
+    VELOX_CHECK(
+        !hashObject_.has_value() && !parkedHashObject_.has_value() &&
+            !probeFinished_,
+        "CudfHashJoinBridge already has build state");
+    VELOX_CHECK(!hashObject.buildTables.empty());
+    parkedHashObject_ = std::move(hashObject);
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
+}
+
+void CudfHashJoinBridge::setHydratedHashTable(
+    CudfHashJoinBridge::hash_type hashObject) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(started_);
+    VELOX_CHECK(hydrationStarted_);
+    VELOX_CHECK(parkedHashObject_.has_value());
+    VELOX_CHECK(!hashObject_.has_value());
+    VELOX_CHECK(!probeFinished_);
+    hashObject_ = std::move(hashObject);
+    parkedHashObject_.reset();
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
+}
+
+void CudfHashJoinBridge::setHydrationError(std::exception_ptr error) {
+  VELOX_CHECK(error != nullptr);
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    VELOX_CHECK(started_);
+    VELOX_CHECK(hydrationStarted_);
+    hydrationError_ = std::move(error);
+    parkedHashObject_.reset();
+    promises = std::move(promises_);
+  }
+  notify(std::move(promises));
+}
+
+CudfHashJoinBridge::HashOrFutureResult CudfHashJoinBridge::hashOrFuture(
+    ContinueFuture* future,
+    bool claimHydration) {
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture";
   }
   std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(started_);
+  VELOX_CHECK(!cancelled_, "Getting hash table after join is aborted");
+  VELOX_CHECK(!probeFinished_, "Getting hash table after probe finished");
+  if (hydrationError_ != nullptr) {
+    std::rethrow_exception(hydrationError_);
+  }
   if (hashObject_.has_value()) {
-    return hashObject_;
+    return {.hashObject = hashObject_};
+  }
+  if (parkedHashObject_.has_value() && !hydrationStarted_) {
+    if (!claimHydration) {
+      return {.buildParked = true};
+    }
+    hydrationStarted_ = true;
+    return {
+        .parkedHashObject = parkedHashObject_,
+        .buildParked = true,
+    };
   }
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture constructing promise";
@@ -591,9 +700,20 @@ std::optional<CudfHashJoinBridge::hash_type> CudfHashJoinBridge::hashOrFuture(
   }
   *future = promises_.back().getSemiFuture();
   if (CudfConfig::getInstance().debugEnabled) {
-    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning nullopt";
+    VLOG(2) << "Calling CudfHashJoinBridge::hashOrFuture returning future";
   }
-  return std::nullopt;
+  return {};
+}
+
+void CudfHashJoinBridge::probeFinished() {
+  std::lock_guard<std::mutex> l(mutex_);
+  VELOX_CHECK(started_);
+  VELOX_CHECK(!probeFinished_);
+  probeFinished_ = true;
+  hashObject_.reset();
+  parkedHashObject_.reset();
+  buildReadyEvent_.reset();
+  buildStream_.reset();
 }
 
 void CudfHashJoinBridge::setBuildStream(rmm::cuda_stream_view buildStream) {
@@ -781,6 +901,12 @@ void CudfHashJoinBuild::doNoMoreInput() {
   std::vector<std::shared_ptr<cudf::table>> sharedTables;
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctHashObjects;
+  std::vector<RowVectorPtr> parkedBuildTables;
+  uint64_t parkedBuildRows = 0;
+  uint64_t parkedBuildDeviceBytes = 0;
+  uint64_t parkedBuildHostBytes = 0;
+  bool deferHashHydration = false;
+  const auto buildType = asRowType(joinNode_->sources()[1]->outputType());
 
   const auto recordDeviceMemory = [&](const char* freeBytesName,
                                       const char* poolUsedBytesName,
@@ -811,8 +937,60 @@ void CudfHashJoinBuild::doNoMoreInput() {
 
   const auto appendBuildTable = [&](std::unique_ptr<cudf::table> table) {
     VELOX_CHECK_NOT_NULL(table);
-    const auto tableIndex = sharedTables.size();
     const auto tableRows = static_cast<uint64_t>(table->num_rows());
+    const auto tableDeviceBytes = static_cast<uint64_t>(table->alloc_size());
+
+    if (deferHashHydration) {
+      VELOX_CHECK(preferDistinctHashJoin);
+      auto hostTable = with_arrow::toVeloxColumn(
+          table->view(), pool(), buildType, "", stream, get_temp_mr());
+      VELOX_CHECK_NOT_NULL(hostTable);
+      hostTable->setType(buildType);
+      const auto tableHostBytes = hostTable->estimateFlatSize();
+
+      // The D2H conversion has completed. Drain the stream-ordered free before
+      // materializing the next run so an idle future join cannot retain device
+      // payload while an independent branch is still executing.
+      table.reset();
+      stream.synchronize();
+
+      parkedBuildRows = saturatedAdd(parkedBuildRows, tableRows);
+      parkedBuildDeviceBytes =
+          saturatedAdd(parkedBuildDeviceBytes, tableDeviceBytes);
+      parkedBuildHostBytes = saturatedAdd(parkedBuildHostBytes, tableHostBytes);
+      parkedBuildTables.push_back(std::move(hostTable));
+
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildTables", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildTableRows",
+            RuntimeCounter(saturateRuntimeCounter(tableRows)));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildHostParkedTables", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildHostParkedRows",
+            RuntimeCounter(saturateRuntimeCounter(tableRows)));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildHostParkedDeviceBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(tableDeviceBytes),
+                RuntimeCounter::Unit::kBytes));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildHostStorageBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(tableHostBytes),
+                RuntimeCounter::Unit::kBytes));
+      }
+      recordDeviceMemory(
+          "cudfHashJoinBuildPostParkDeviceFreeBytes",
+          "cudfHashJoinBuildPostParkPoolUsedBytes",
+          "cudfHashJoinBuildPostParkPoolReusableBytes");
+      return;
+    }
+
+    const auto tableIndex = sharedTables.size();
     auto sharedTable = std::shared_ptr<cudf::table>(std::move(table));
     auto buildKeyView = sharedTable->view().select(hashBuildKeyIndices);
     bool buildKeysHaveNulls = false;
@@ -909,6 +1087,14 @@ void CudfHashJoinBuild::doNoMoreInput() {
         ? hashBuildBatchTargetBytes()
         : std::numeric_limits<uint64_t>::max();
     const auto maxRows = hashBuildBatchMaxRows();
+    const auto deferredHydrationEligible =
+        supportsDeferredHashHydration(*joinNode_);
+    const auto deferredHydrationThreshold = deferredHydrationEligible
+        ? deferredHashHydrationThresholdBytes()
+        : std::numeric_limits<uint64_t>::max();
+    deferHashHydration = deferredHydrationEligible &&
+        hashBuildBatchWorkBytes(inputRows, inputBytes) >
+            deferredHydrationThreshold;
     {
       auto lockedStats = stats_.wlock();
       lockedStats->addRuntimeStat(
@@ -930,6 +1116,17 @@ void CudfHashJoinBuild::doNoMoreInput() {
             RuntimeCounter(
                 saturateRuntimeCounter(targetBytes),
                 RuntimeCounter::Unit::kBytes));
+      }
+      if (deferredHydrationEligible) {
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildDeferredHydrationThresholdBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(deferredHydrationThreshold),
+                RuntimeCounter::Unit::kBytes));
+      }
+      if (deferHashHydration) {
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildDeferredBuilds", RuntimeCounter(1));
       }
     }
 
@@ -1126,38 +1323,56 @@ void CudfHashJoinBuild::doNoMoreInput() {
     }
     flushRun();
 
-    if (sharedTables.empty()) {
+    if (sharedTables.empty() && parkedBuildTables.empty()) {
       appendBuildTable(makeEmptyTable(joinNode_->sources()[1]->outputType()));
     }
     VELOX_CHECK_EQ(retainedSourceBatches, 0);
   }
 
-  if (CudfConfig::getInstance().debugEnabled && !sharedTables.empty()) {
-    VLOG(1) << "Build table number of columns: "
-            << sharedTables[0]->num_columns();
-    for (auto i = 0; i < sharedTables.size(); i++) {
-      VLOG(1) << "Build table " << i
-              << ": number of rows: " << sharedTables[i]->num_rows();
+  if (CudfConfig::getInstance().debugEnabled) {
+    if (!sharedTables.empty()) {
+      VLOG(1) << "Build table number of columns: "
+              << sharedTables[0]->num_columns();
+      for (auto i = 0; i < sharedTables.size(); i++) {
+        VLOG(1) << "Build table " << i
+                << ": number of rows: " << sharedTables[i]->num_rows();
+      }
+    } else if (!parkedBuildTables.empty()) {
+      VLOG(1) << "Deferred " << parkedBuildTables.size()
+              << " build tables on host with " << parkedBuildRows << " rows";
     }
   }
-
-  auto buildReadyEvent = std::make_shared<CudaEvent>(cudaEventDisableTiming);
-  buildReadyEvent->recordFrom(stream);
 
   // set hash table to CudfHashJoinBridge
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
   auto cudfHashJoinBridge =
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+  VELOX_CHECK_NOT_NULL(cudfHashJoinBridge);
 
-  cudfHashJoinBridge->setBuildStream(stream);
-  cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
-  cudfHashJoinBridge->setHashTable(
-      std::make_optional(
-          CudfHashJoinBridge::HashJoinState{
-              std::move(sharedTables),
-              std::move(hashObjects),
-              std::move(distinctHashObjects)}));
+  if (deferHashHydration) {
+    VELOX_CHECK(sharedTables.empty());
+    VELOX_CHECK(hashObjects.empty());
+    VELOX_CHECK(distinctHashObjects.empty());
+    cudfHashJoinBridge->setParkedHashTable(
+        CudfHashJoinBridge::ParkedHashJoinState{
+            std::move(parkedBuildTables),
+            parkedBuildRows,
+            parkedBuildDeviceBytes,
+            parkedBuildHostBytes});
+  } else {
+    auto buildReadyEvent = std::make_shared<CudaEvent>(cudaEventDisableTiming);
+    buildReadyEvent->recordFrom(stream);
+    cudfHashJoinBridge->setBuildStream(stream);
+    cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
+    cudfHashJoinBridge->setHashTable(
+        std::make_optional(
+            CudfHashJoinBridge::HashJoinState{
+                std::move(sharedTables),
+                std::move(hashObjects),
+                std::move(distinctHashObjects),
+                false}));
+  }
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -1282,6 +1497,89 @@ void CudfHashJoinProbe::waitForBuildReady(rmm::cuda_stream_view stream) {
   }
 }
 
+CudfHashJoinProbe::hash_type CudfHashJoinProbe::hydrateParkedHashTable(
+    const CudfHashJoinBridge::parked_hash_type& parkedHashObject,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK(supportsDeferredHashHydration(*joinNode_));
+  VELOX_CHECK(!parkedHashObject.buildTables.empty());
+
+  hash_type hydrated;
+  hydrated.deferredHydration = true;
+  hydrated.buildTables.reserve(parkedHashObject.buildTables.size());
+  hydrated.hashJoins.reserve(parkedHashObject.buildTables.size());
+  hydrated.distinctHashJoins.reserve(parkedHashObject.buildTables.size());
+
+  uint64_t hydratedRows = 0;
+  uint64_t hydratedBytes = 0;
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeHydrationClaims", RuntimeCounter(1));
+  }
+
+  for (const auto& hostTable : parkedHashObject.buildTables) {
+    VELOX_CHECK_NOT_NULL(hostTable);
+    auto table =
+        with_arrow::toCudfTable(hostTable, pool(), stream, get_output_mr());
+    VELOX_CHECK_NOT_NULL(table);
+    const auto rows = static_cast<uint64_t>(table->num_rows());
+    const auto bytes = static_cast<uint64_t>(table->alloc_size());
+    auto sharedTable = std::shared_ptr<cudf::table>(std::move(table));
+    auto buildKeyView = sharedTable->view().select(rightKeyIndices_);
+    auto distinctHash = std::make_shared<cudf::distinct_hash_join>(
+        buildKeyView, cudf::null_equality::UNEQUAL, 0.5, stream);
+    VELOX_CHECK_NOT_NULL(distinctHash);
+
+    hydratedRows = saturatedAdd(hydratedRows, rows);
+    hydratedBytes = saturatedAdd(hydratedBytes, bytes);
+    hydrated.buildTables.push_back(std::move(sharedTable));
+    hydrated.hashJoins.push_back(nullptr);
+    hydrated.distinctHashJoins.push_back(std::move(distinctHash));
+
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeHydratedTables", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeHydratedRows",
+        RuntimeCounter(saturateRuntimeCounter(rows)));
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeHydratedBytes",
+        RuntimeCounter(
+            saturateRuntimeCounter(bytes), RuntimeCounter::Unit::kBytes));
+  }
+
+  VELOX_CHECK_EQ(hydratedRows, parkedHashObject.rows);
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeHydratedTotalBytes",
+        RuntimeCounter(
+            saturateRuntimeCounter(hydratedBytes),
+            RuntimeCounter::Unit::kBytes));
+  }
+  if (auto info = currentDeviceMemoryInfo(); info.has_value()) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbePostHydrationDeviceFreeBytes",
+        RuntimeCounter(
+            saturateRuntimeCounter(info->freeBytes),
+            RuntimeCounter::Unit::kBytes));
+    if (info->hasPoolStats) {
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinProbePostHydrationPoolUsedBytes",
+          RuntimeCounter(
+              saturateRuntimeCounter(info->poolUsedBytes),
+              RuntimeCounter::Unit::kBytes));
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinProbePostHydrationPoolReusableBytes",
+          RuntimeCounter(
+              saturateRuntimeCounter(info->poolReusableBytes),
+              RuntimeCounter::Unit::kBytes));
+    }
+  }
+  return hydrated;
+}
+
 void CudfHashJoinProbe::initialize() {
   Operator::initialize();
 
@@ -1374,6 +1672,10 @@ bool CudfHashJoinProbe::needsInput() const {
 }
 
 void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
+  VELOX_CHECK_EQ(
+      nextBuildTableIndex_,
+      0,
+      "Cannot accept a new probe input while deferred build shards remain");
   if (skipInput_) {
     VELOX_CHECK_NULL(input_);
     return;
@@ -1402,10 +1704,13 @@ void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
 
 void CudfHashJoinProbe::doNoMoreInput() {
   Operator::noMoreInput();
+  const bool deferredInnerJoin = deferredHydration_ ||
+      (hashObject_.has_value() && hashObject_->deferredHydration);
   if (!joinNode_->isRightJoin() && !joinNode_->isRightSemiFilterJoin() &&
-      !joinNode_->isFullJoin()) {
+      !joinNode_->isFullJoin() && !deferredInnerJoin) {
     return;
   }
+  deferredProbeBarrierEntered_ = deferredInnerJoin;
   std::vector<ContinuePromise> promises;
   std::vector<std::shared_ptr<exec::Driver>> peers;
   // Only last driver collects all answers
@@ -1422,6 +1727,19 @@ void CudfHashJoinProbe::doNoMoreInput() {
       promise.setValue();
     }
   };
+
+  if (deferredInnerJoin) {
+    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+        operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+    auto cudfJoinBridge =
+        std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+    VELOX_CHECK_NOT_NULL(cudfJoinBridge);
+    cudfJoinBridge->probeFinished();
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfHashJoinProbeBridgeReleases", RuntimeCounter(1));
+    return;
+  }
 
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
     isLastDriver_ = true;
@@ -1762,6 +2080,46 @@ CudfHashJoinProbe::computeProbeUniqueInnerJoinIndices(
       probeHashJoin.inner_join(rightKeyView, stream, get_temp_mr());
   return std::make_pair(
       std::move(leftJoinIndices), std::move(rightJoinIndices));
+}
+
+CudfHashJoinProbe::JoinOutput CudfHashJoinProbe::innerJoinShard(
+    size_t buildTableIndex,
+    cudf::table_view leftTableView,
+    rmm::cuda_stream_view stream) {
+  VELOX_CHECK(!joinNode_->filter());
+  VELOX_CHECK(!useProbeUniqueInnerJoin(*joinNode_));
+  auto& state = hashObject_.value();
+  VELOX_CHECK_LT(buildTableIndex, state.buildTables.size());
+  auto& rightTable = state.buildTables[buildTableIndex];
+  VELOX_CHECK_NOT_NULL(rightTable);
+  auto rightTableView = rightTable->view();
+
+  if (joinNode_->leftKeysCoveredByRightKeys() &&
+      state.buildTables.size() == 1 &&
+      state.distinctHashJoins[buildTableIndex] != nullptr) {
+    auto rightJoinIndices = state.distinctHashJoins[buildTableIndex]->left_join(
+        leftTableView.select(leftKeyIndices_), stream, get_temp_mr());
+    auto rightIndicesSpan =
+        cudf::device_span<cudf::size_type const>{*rightJoinIndices};
+    return unfilteredOutputWithIdentityLeft(
+        leftTableView,
+        rightTableView,
+        cudf::column_view{rightIndicesSpan},
+        stream);
+  }
+
+  auto [leftJoinIndices, rightJoinIndices] = computeInnerJoinIndices(
+      buildTableIndex, leftTableView.select(leftKeyIndices_), stream);
+  auto leftIndicesSpan =
+      cudf::device_span<cudf::size_type const>{*leftJoinIndices};
+  auto rightIndicesSpan =
+      cudf::device_span<cudf::size_type const>{*rightJoinIndices};
+  return unfilteredOutput(
+      leftTableView,
+      cudf::column_view{leftIndicesSpan},
+      rightTableView,
+      cudf::column_view{rightIndicesSpan},
+      stream);
 }
 
 std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::innerJoin(
@@ -3168,7 +3526,37 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
 }
 
 RowVectorPtr CudfHashJoinProbe::doGetOutput() {
-  if (finished_ or !hashObject_.has_value()) {
+  if (finished_) {
+    return nullptr;
+  }
+  if (parkedHashObject_.has_value()) {
+    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
+    VELOX_CHECK_NOT_NULL(cudfInput);
+    auto hydrationStream = cudfInput->stream();
+    auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
+        operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+    auto cudfJoinBridge =
+        std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
+    VELOX_CHECK_NOT_NULL(cudfJoinBridge);
+    try {
+      auto hydrated =
+          hydrateParkedHashTable(parkedHashObject_.value(), hydrationStream);
+      auto buildReadyEvent =
+          std::make_shared<CudaEvent>(cudaEventDisableTiming);
+      buildReadyEvent->recordFrom(hydrationStream);
+      cudfJoinBridge->setBuildStream(hydrationStream);
+      cudfJoinBridge->setBuildReadyEvent(buildReadyEvent);
+      cudfJoinBridge->setHydratedHashTable(hydrated);
+      hashObject_ = std::move(hydrated);
+      buildStream_ = hydrationStream;
+      buildReadyEvent_ = std::move(buildReadyEvent);
+      parkedHashObject_.reset();
+    } catch (...) {
+      cudfJoinBridge->setHydrationError(std::current_exception());
+      throw;
+    }
+  }
+  if (!hashObject_.has_value()) {
     return nullptr;
   }
   if (!input_) {
@@ -3265,6 +3653,46 @@ RowVectorPtr CudfHashJoinProbe::doGetOutput() {
     VLOG(1) << "Probe table number of rows: " << leftTableView.num_rows();
   }
 
+  if (hashObject_->deferredHydration) {
+    VELOX_CHECK(joinNode_->isInnerJoin());
+    auto& buildTables = hashObject_->buildTables;
+    VELOX_CHECK(!buildTables.empty());
+    while (nextBuildTableIndex_ < buildTables.size()) {
+      const auto buildTableIndex = nextBuildTableIndex_++;
+      auto output = innerJoinShard(buildTableIndex, leftTableView, stream);
+      const auto outputRows = output.numRows;
+      const bool inputComplete = nextBuildTableIndex_ == buildTables.size();
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinProbeBuildShardProbes", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinProbeStreamedOutputRows", RuntimeCounter(outputRows));
+      }
+
+      if (inputComplete) {
+        // unfilteredOutput synchronizes its gathered result, so the returned
+        // table is independent of both the probe input and build shard.
+        cudfInput.reset();
+        input_.reset();
+        nextBuildTableIndex_ = 0;
+        finished_ = noMoreInput_;
+      }
+
+      const auto size =
+          outputType_->size() == 0 ? outputRows : output.table->num_rows();
+      if (size == 0) {
+        if (inputComplete) {
+          return nullptr;
+        }
+        continue;
+      }
+      return std::make_shared<CudfVector>(
+          pool(), outputType_, size, std::move(output.table), stream);
+    }
+    VELOX_UNREACHABLE();
+  }
+
   auto& rightTables = hashObject_.value().buildTables;
   auto& hashJoins = hashObject_.value().hashJoins;
   auto& distinctHashJoins = hashObject_.value().distinctHashJoins;
@@ -3359,6 +3787,20 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
+  if (deferredHydration_ && future_.valid()) {
+    *future = std::move(future_);
+    return exec::BlockingReason::kWaitForJoinProbe;
+  }
+  if (deferredProbeBarrierEntered_) {
+    // The last probe releases the bridge before waking its peers. A peer that
+    // received no probe rows has no local hash object, but is nevertheless
+    // terminal after crossing this barrier and must not query the released
+    // bridge when the Driver polls isBlocked() before isFinished().
+    return exec::BlockingReason::kNotBlocked;
+  }
+  if (parkedHashObject_.has_value()) {
+    return exec::BlockingReason::kNotBlocked;
+  }
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&
       hashObject_.has_value()) {
@@ -3379,17 +3821,29 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       std::dynamic_pointer_cast<CudfHashJoinBridge>(joinBridge);
   VELOX_CHECK_NOT_NULL(cudfJoinBridge);
   VELOX_CHECK_NOT_NULL(future);
-  auto hashObject = cudfJoinBridge->hashOrFuture(future);
+  auto hashResult = cudfJoinBridge->hashOrFuture(future, input_ != nullptr);
 
-  if (!hashObject.has_value()) {
+  if (hashResult.parkedHashObject.has_value()) {
+    deferredHydration_ = true;
+    parkedHashObject_ = std::move(hashResult.parkedHashObject);
+    return exec::BlockingReason::kNotBlocked;
+  } else if (hashResult.hashObject.has_value()) {
+    hashObject_ = std::move(hashResult.hashObject);
+    deferredHydration_ = hashObject_->deferredHydration;
+    buildStream_ = cudfJoinBridge->getBuildStream();
+    buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+  } else if (hashResult.buildParked) {
+    // Do not hydrate merely because the driver polls isBlocked(). Accept one
+    // real probe input first; the next poll atomically elects its hydrator.
+    deferredHydration_ = true;
+    return exec::BlockingReason::kNotBlocked;
+  } else {
     if (CudfConfig::getInstance().debugEnabled) {
-      VLOG(2) << "CudfHashJoinProbe is blocked, waiting for join build";
+      VLOG(2) << "CudfHashJoinProbe is blocked, waiting for join build or "
+                 "deferred hydration";
     }
     return exec::BlockingReason::kWaitForJoinBuild;
   }
-  hashObject_ = std::move(hashObject);
-  buildStream_ = cudfJoinBridge->getBuildStream();
-  buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
@@ -3479,7 +3933,10 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ || (noMoreInput_ && input_ == nullptr);
+  const auto outputDrained = finished_ ||
+      (noMoreInput_ && input_ == nullptr && nextBuildTableIndex_ == 0);
+  const auto isFinished =
+      deferredHydration_ ? outputDrained && !future_.valid() : outputDrained;
 
   // Release hashObject_ if finished
   if (isFinished) {

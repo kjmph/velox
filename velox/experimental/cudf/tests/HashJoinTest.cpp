@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
 
@@ -42,6 +43,7 @@
 #include <re2/re2.h>
 
 #include <atomic>
+#include <stdexcept>
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -470,6 +472,361 @@ DEBUG_ONLY_TEST_F(
       stats.at("cudfHashJoinBuildMaxMaterializationWorkBytes").max,
       kTargetBytes);
   EXPECT_EQ(stats.count("cudfHashJoinBuildGenericHashTables"), 0);
+}
+
+TEST_F(HashJoinTest, deferredHydrationBridgeLifecycle) {
+  using Bridge = cudf_velox::CudfHashJoinBridge;
+
+  Bridge bridge;
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  VELOX_ASSERT_THROW(bridge.hashOrFuture(&future, false), "");
+
+  bridge.start();
+  auto parkedTable =
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  bridge.setParkedHashTable(
+      Bridge::ParkedHashJoinState{{parkedTable}, 3, 24, 24});
+
+  auto unclaimed = bridge.hashOrFuture(&future, false);
+  EXPECT_TRUE(unclaimed.buildParked);
+  EXPECT_FALSE(unclaimed.hashObject.has_value());
+  EXPECT_FALSE(unclaimed.parkedHashObject.has_value());
+  EXPECT_FALSE(future.valid());
+
+  auto claimed = bridge.hashOrFuture(&future, true);
+  ASSERT_TRUE(claimed.parkedHashObject.has_value());
+  EXPECT_TRUE(claimed.buildParked);
+  EXPECT_EQ(claimed.parkedHashObject->rows, 3);
+
+  ContinueFuture waiter = ContinueFuture::makeEmpty();
+  auto pending = bridge.hashOrFuture(&waiter, true);
+  EXPECT_FALSE(pending.hashObject.has_value());
+  EXPECT_FALSE(pending.parkedHashObject.has_value());
+  EXPECT_FALSE(pending.buildParked);
+  ASSERT_TRUE(waiter.valid());
+
+  Bridge::HashJoinState hydrated;
+  hydrated.deferredHydration = true;
+  bridge.setHydratedHashTable(std::move(hydrated));
+  waiter.wait();
+
+  auto ready = bridge.hashOrFuture(&future, false);
+  ASSERT_TRUE(ready.hashObject.has_value());
+  EXPECT_TRUE(ready.hashObject->deferredHydration);
+  EXPECT_FALSE(future.valid());
+
+  bridge.probeFinished();
+  VELOX_ASSERT_THROW(
+      bridge.hashOrFuture(&future, false), "after probe finished");
+
+  Bridge cancelledBridge;
+  cancelledBridge.start();
+  cancelledBridge.cancel();
+  VELOX_ASSERT_THROW(
+      cancelledBridge.hashOrFuture(&future, false),
+      "Getting hash table after join is aborted");
+
+  Bridge unprobedBridge;
+  unprobedBridge.start();
+  unprobedBridge.setParkedHashTable(
+      Bridge::ParkedHashJoinState{{parkedTable}, 3, 24, 24});
+  auto stillParked = unprobedBridge.hashOrFuture(&future, false);
+  EXPECT_TRUE(stillParked.buildParked);
+  unprobedBridge.probeFinished();
+  VELOX_ASSERT_THROW(
+      unprobedBridge.hashOrFuture(&future, false), "after probe finished");
+
+  Bridge failedBridge;
+  failedBridge.start();
+  failedBridge.setParkedHashTable(
+      Bridge::ParkedHashJoinState{{parkedTable}, 3, 24, 24});
+  auto failedClaim = failedBridge.hashOrFuture(&future, true);
+  ASSERT_TRUE(failedClaim.parkedHashObject.has_value());
+  ContinueFuture failedWaiter = ContinueFuture::makeEmpty();
+  auto failedPending = failedBridge.hashOrFuture(&failedWaiter, true);
+  EXPECT_FALSE(failedPending.hashObject.has_value());
+  ASSERT_TRUE(failedWaiter.valid());
+  failedBridge.setHydrationError(
+      std::make_exception_ptr(std::runtime_error("test hydration failed")));
+  failedWaiter.wait();
+  EXPECT_THROW(failedBridge.hashOrFuture(&future, false), std::runtime_error);
+}
+
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    deferredHydrationParksLargeTrustedUniqueBuildUntilFirstProbe) {
+  constexpr vector_size_t kRowsPerBatch = 24;
+  constexpr int32_t kBuildBatches = 6;
+  constexpr int32_t kProbeBatches = 8;
+  constexpr int32_t kProbeDrivers = 2;
+  constexpr uint64_t kMaterializationTargetBytes = 2'048;
+  constexpr uint64_t kDeferredHydrationThresholdBytes = 1;
+  constexpr int64_t kBuildRows = kRowsPerBatch * kBuildBatches;
+  constexpr int64_t kExpectedRows = kBuildRows * kProbeDrivers;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedMax = config.batchSizeMaxThreshold;
+  const auto savedDistinct = config.distinctHashJoinEnabled;
+  config.batchSizeMaxThreshold = std::nullopt;
+  config.distinctHashJoinEnabled = true;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+    config.distinctHashJoinEnabled = savedDistinct;
+  };
+
+  std::vector<RowVectorPtr> probeVectors;
+  std::vector<RowVectorPtr> buildVectors;
+  probeVectors.reserve(kProbeBatches);
+  buildVectors.reserve(kBuildBatches);
+  for (int32_t batch = 0; batch < kProbeBatches; ++batch) {
+    probeVectors.push_back(makeRowVector(
+        {"p_key", "p_value", "p_text"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) {
+                  return batch * kRowsPerBatch + row - kRowsPerBatch;
+                }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 10'000 + batch * 100 + row; }),
+            makeFlatVector<std::string>(
+                kRowsPerBatch,
+                [batch](auto row) {
+                  return std::string(19 + (batch + row) % 17, 'p');
+                }),
+        }));
+  }
+  for (int32_t batch = 0; batch < kBuildBatches; ++batch) {
+    buildVectors.push_back(makeRowVector(
+        {"b_key", "b_value", "b_text"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return batch * kRowsPerBatch + row; }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 20'000 + batch * 100 + row; }),
+            makeFlatVector<std::string>(
+                kRowsPerBatch,
+                [batch](auto row) {
+                  return std::string(47 + (batch * 3 + row) % 29, 'b');
+                }),
+        }));
+  }
+  createDuckDbTable("t", probeVectors);
+  createDuckDbTable("u", buildVectors);
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::materializationTargetBytes",
+      std::function<void(uint64_t*)>([](uint64_t* targetBytes) {
+        *targetBytes = kMaterializationTargetBytes;
+      }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::deferredHydrationThresholdBytes",
+      std::function<void(uint64_t*)>([](uint64_t* thresholdBytes) {
+        *thresholdBytes = kDeferredHydrationThresholdBytes;
+      }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(
+      PlanBuilder(planNodeIdGenerator)
+          .values(probeVectors, true)
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values(buildVectors).planNode(),
+              "",
+              {"p_key", "p_value", "p_text", "b_key", "b_value", "b_text"},
+              core::JoinType::kInner)
+          .planNode());
+  ASSERT_NE(join, nullptr);
+  auto trustedJoin = core::HashJoinNode::Builder(*join)
+                         .leftKeysNonNull(true)
+                         .rightKeysUnique(true)
+                         .rightKeysNonNull(true)
+                         .build();
+
+  const auto expected =
+      "SELECT t.p_key, t.p_value, t.p_text, "
+      "u.b_key, u.b_value, u.b_text "
+      "FROM t JOIN u ON t.p_key = u.b_key";
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(trustedJoin)
+          .config(
+              cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+              std::to_string(kRowsPerBatch))
+          .maxDrivers(kProbeDrivers)
+          .assertResults(fmt::format("{} UNION ALL {}", expected, expected));
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(trustedJoin->id()).customStats;
+  for (const auto* name :
+       {"cudfHashJoinBuildDeferredBuilds",
+        "cudfHashJoinBuildDeferredHydrationThresholdBytes",
+        "cudfHashJoinBuildHostParkedTables",
+        "cudfHashJoinBuildHostParkedRows",
+        "cudfHashJoinBuildHostParkedDeviceBytes",
+        "cudfHashJoinBuildHostStorageBytes",
+        "cudfHashJoinProbeHydrationClaims",
+        "cudfHashJoinProbeHydratedTables",
+        "cudfHashJoinProbeHydratedRows",
+        "cudfHashJoinProbeHydratedBytes",
+        "cudfHashJoinProbeBuildShardProbes",
+        "cudfHashJoinProbeStreamedOutputRows",
+        "cudfHashJoinProbeBridgeReleases"}) {
+    ASSERT_EQ(stats.count(name), 1) << "Missing runtime metric: " << name;
+  }
+  ASSERT_EQ(stats.at("cudfHashJoinBuildDeferredBuilds").sum, 1);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildDeferredHydrationThresholdBytes").max,
+      kDeferredHydrationThresholdBytes);
+  ASSERT_EQ(stats.at("cudfHashJoinProbeHydrationClaims").sum, 1);
+
+  const auto parkedTables = stats.at("cudfHashJoinBuildHostParkedTables").sum;
+  const auto hydratedTables = stats.at("cudfHashJoinProbeHydratedTables").sum;
+  EXPECT_GT(parkedTables, 1);
+  EXPECT_EQ(hydratedTables, parkedTables);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildHostParkedRows").sum, kBuildRows);
+  EXPECT_EQ(stats.at("cudfHashJoinProbeHydratedRows").sum, kBuildRows);
+  EXPECT_GT(stats.at("cudfHashJoinBuildHostParkedDeviceBytes").sum, 0);
+  EXPECT_GT(stats.at("cudfHashJoinBuildHostStorageBytes").sum, 0);
+  EXPECT_GT(stats.at("cudfHashJoinProbeHydratedBytes").sum, 0);
+  EXPECT_GT(stats.at("cudfHashJoinProbeBuildShardProbes").sum, parkedTables);
+  EXPECT_EQ(stats.at("cudfHashJoinProbeStreamedOutputRows").sum, kExpectedRows);
+  EXPECT_EQ(stats.at("cudfHashJoinProbeBridgeReleases").sum, 1);
+
+  EXPECT_EQ(stats.at("cudfHashJoinBuildMaterializedBatches").sum, parkedTables);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildMaterializedRows").sum, kBuildRows);
+}
+
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    deferredHydrationReleasesUnprobedBuildAfterEmptyProbe) {
+  constexpr uint64_t kDeferredHydrationThresholdBytes = 1;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedDistinct = config.distinctHashJoinEnabled;
+  config.distinctHashJoinEnabled = true;
+  SCOPE_EXIT {
+    config.distinctHashJoinEnabled = savedDistinct;
+  };
+
+  auto probe = makeRowVector(
+      {"p_key", "p_value"},
+      {
+          makeFlatVector<int64_t>({}),
+          makeFlatVector<int64_t>({}),
+      });
+  auto build = makeRowVector(
+      {"b_key", "b_value"},
+      {
+          makeFlatVector<int64_t>({1, 2, 3, 4}),
+          makeFlatVector<int64_t>({10, 20, 30, 40}),
+      });
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::deferredHydrationThresholdBytes",
+      std::function<void(uint64_t*)>([](uint64_t* thresholdBytes) {
+        *thresholdBytes = kDeferredHydrationThresholdBytes;
+      }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe}, true)
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "",
+              {"p_key", "p_value", "b_key", "b_value"},
+              core::JoinType::kInner)
+          .planNode());
+  ASSERT_NE(join, nullptr);
+  auto trustedJoin = core::HashJoinNode::Builder(*join)
+                         .leftKeysNonNull(true)
+                         .rightKeysUnique(true)
+                         .rightKeysNonNull(true)
+                         .build();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(trustedJoin)
+                  .maxDrivers(2)
+                  .assertResults(
+                      "SELECT t.p_key, t.p_value, u.b_key, u.b_value "
+                      "FROM t JOIN u ON t.p_key = u.b_key");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(trustedJoin->id()).customStats;
+  EXPECT_EQ(stats.at("cudfHashJoinBuildDeferredBuilds").sum, 1);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildHostParkedRows").sum, build->size());
+  EXPECT_EQ(stats.count("cudfHashJoinProbeHydrationClaims"), 0);
+  EXPECT_EQ(stats.at("cudfHashJoinProbeBridgeReleases").sum, 1);
+}
+
+DEBUG_ONLY_TEST_F(HashJoinTest, deferredHydrationRejectsFilteredJoin) {
+  auto probe = makeRowVector(
+      {"p_key", "p_value"},
+      {
+          makeFlatVector<int64_t>({1, 2, 3, 4}),
+          makeFlatVector<int64_t>({10, 20, 30, 40}),
+      });
+  auto build = makeRowVector(
+      {"b_key", "b_value", "b_text"},
+      {
+          makeFlatVector<int64_t>({1, 2, 3, 4}),
+          makeFlatVector<int64_t>({100, 200, 300, 400}),
+          makeFlatVector<std::string>({"one", "two", "three", "four"}),
+      });
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::deferredHydrationThresholdBytes",
+      std::function<void(uint64_t*)>(
+          [](uint64_t* thresholdBytes) { *thresholdBytes = 1; }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "p_value < b_value",
+              {"p_key", "p_value", "b_key", "b_value", "b_text"},
+              core::JoinType::kInner)
+          .planNode());
+  ASSERT_NE(join, nullptr);
+  auto trustedJoin = core::HashJoinNode::Builder(*join)
+                         .leftKeysNonNull(true)
+                         .rightKeysUnique(true)
+                         .rightKeysNonNull(true)
+                         .build();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(trustedJoin)
+                  .maxDrivers(1)
+                  .assertResults(
+                      "SELECT t.p_key, t.p_value, u.b_key, u.b_value, u.b_text "
+                      "FROM t JOIN u ON t.p_key = u.b_key "
+                      "WHERE t.p_value < u.b_value");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(trustedJoin->id()).customStats;
+  EXPECT_EQ(stats.count("cudfHashJoinBuildDeferredBuilds"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinBuildHostParkedTables"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinBuildHostParkedRows"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinBuildHostParkedDeviceBytes"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinProbeHydrationClaims"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinProbeHydratedTables"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinProbeHydratedRows"), 0);
+  EXPECT_EQ(stats.count("cudfHashJoinProbeHydratedBytes"), 0);
 }
 
 DEBUG_ONLY_TEST_F(

@@ -61,12 +61,83 @@
 #include <array>
 #include <functional>
 #include <iterator>
+#include <limits>
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
 
 constexpr size_t kDefaultMinMaxSummaryBatchRows = 100'000'000;
+constexpr uint64_t kMinHashBuildBatchTargetBytes = 128ULL << 20;
+constexpr uint64_t kMaxHashBuildBatchTargetBytes = 1ULL << 30;
+constexpr uint64_t kHashBuildWorkspaceBytesPerRow =
+    2 * (sizeof(cudf::hash_value_type) + sizeof(cudf::size_type));
+
+uint64_t saturatedAdd(uint64_t lhs, uint64_t rhs) {
+  if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return lhs + rhs;
+}
+
+uint64_t saturatedMultiply(uint64_t lhs, uint64_t rhs) {
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return lhs * rhs;
+}
+
+uint64_t ceilingDivide(uint64_t dividend, uint64_t divisor) {
+  VELOX_CHECK_GT(divisor, 0);
+  return dividend / divisor + (dividend % divisor != 0);
+}
+
+int64_t saturateRuntimeCounter(uint64_t value) {
+  return static_cast<int64_t>(std::min<uint64_t>(
+      value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+}
+
+uint64_t hashBuildBatchTargetBytes() {
+  uint64_t targetBytes = kMaxHashBuildBatchTargetBytes;
+  if (auto info = currentDeviceMemoryInfo(); info.has_value()) {
+    targetBytes = info->totalBytes / 64;
+  }
+  targetBytes = std::clamp(
+      targetBytes,
+      kMinHashBuildBatchTargetBytes,
+      kMaxHashBuildBatchTargetBytes);
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::materializationTargetBytes",
+      &targetBytes);
+  VELOX_CHECK_GT(
+      targetBytes, 0, "cuDF hash-build byte target must be positive");
+  return targetBytes;
+}
+
+uint64_t hashBuildBatchWorkBytes(uint64_t rows, uint64_t flatBytes) {
+  // During materialization, the source and concatenated copy overlap. Once
+  // the source is released, the copy overlaps the hash table, whose 0.5 load
+  // factor requires about two hash/index slots per row.
+  return std::max(
+      saturatedMultiply(flatBytes, 2),
+      saturatedAdd(
+          flatBytes, saturatedMultiply(rows, kHashBuildWorkspaceBytesPerRow)));
+}
+
+uint64_t hashBuildBatchMaxRows() {
+  uint64_t maxRows =
+      static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  const auto& config = CudfConfig::getInstance();
+  if (config.batchSizeMaxThreshold.has_value()) {
+    VELOX_CHECK_GT(
+        config.batchSizeMaxThreshold.value(),
+        0,
+        "cuDF max batch size must be positive");
+    maxRows = std::min<uint64_t>(
+        maxRows, static_cast<uint64_t>(config.batchSizeMaxThreshold.value()));
+  }
+  return maxRows;
+}
 
 /// Creates extended table view by appending precomputed columns
 cudf::table_view createExtendedTableView(
@@ -184,6 +255,15 @@ bool usesPrebuiltCudfHashJoin(const core::HashJoinNode& joinNode) {
   return joinNode.isInnerJoin() || joinNode.isLeftJoin() ||
       joinNode.isRightJoin() || joinNode.isFullJoin() ||
       (joinNode.isLeftSemiProjectJoin() && joinNode.filter());
+}
+
+bool supportsByteBoundedHashBuild(const core::HashJoinNode& joinNode) {
+  // Inner and left joins already combine matches across multiple build
+  // tables. Other join kinds still contain single-build assumptions or drain
+  // unmatched build rows through one final concatenation. Preserve their
+  // existing row-limit batching until those probe paths support routine
+  // byte-driven fanout.
+  return joinNode.isInnerJoin() || joinNode.isLeftJoin();
 }
 
 bool useProbeUniqueInnerJoin(const core::HashJoinNode& joinNode) {
@@ -606,12 +686,13 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
               inputStreams.data(), inputStreams.size()),
           stream);
       if (summaryRows > 0) {
-        minMaxSummaryInputs_.push_back(std::make_shared<CudfVector>(
-            pool(),
-            minMaxSummaryType_,
-            static_cast<vector_size_t>(summaryRows),
-            std::move(summary),
-            stream));
+        minMaxSummaryInputs_.push_back(
+            std::make_shared<CudfVector>(
+                pool(),
+                minMaxSummaryType_,
+                static_cast<vector_size_t>(summaryRows),
+                std::move(summary),
+                stream));
       }
       return;
     }
@@ -683,34 +764,7 @@ void CudfHashJoinBuild::doNoMoreInput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
-  std::vector<std::unique_ptr<cudf::table>> tbls;
   auto hashBuildKeyIndices = buildKeyIndices_;
-  if (simpleNotEqual_.has_value()) {
-    VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
-    int64_t summaryRows = 0;
-    tbls = compactMinMaxSummaryVectorsBatched(
-        std::exchange(minMaxSummaryInputs_, {}),
-        minMaxSummaryType_,
-        static_cast<cudf::size_type>(buildKeyIndices_.size()),
-        stream,
-        summaryRows);
-    hashBuildKeyIndices =
-        sequenceIndices(static_cast<cudf::size_type>(buildKeyIndices_.size()));
-  } else {
-    // Using output_mr here to allow spilling queued up large tables.
-    tbls = getConcatenatedTableBatched(
-        std::exchange(inputs_, {}),
-        joinNode_->sources()[1]->outputType(),
-        stream,
-        get_output_mr());
-  }
-  if (CudfConfig::getInstance().debugEnabled && !tbls.empty()) {
-    VLOG(1) << "Build table number of columns: " << tbls[0]->num_columns();
-    for (auto i = 0; i < tbls.size(); i++) {
-      VLOG(1) << "Build table " << i
-              << ": number of rows: " << tbls[i]->num_rows();
-    }
-  }
 
   // Construct hash_join object for join types that use hb->inner_join() or
   // hb->left_join(). Semi filter, anti joins, and left semi project joins use
@@ -724,10 +778,43 @@ void CudfHashJoinBuild::doNoMoreInput() {
   const bool preferProbeUniqueInnerJoin =
       buildHashJoin && useProbeUniqueInnerJoin(*joinNode_);
 
+  std::vector<std::shared_ptr<cudf::table>> sharedTables;
   std::vector<std::shared_ptr<cudf::hash_join>> hashObjects;
   std::vector<std::shared_ptr<cudf::distinct_hash_join>> distinctHashObjects;
-  for (auto i = 0; i < tbls.size(); i++) {
-    auto buildKeyView = tbls[i]->view().select(hashBuildKeyIndices);
+
+  const auto recordDeviceMemory = [&](const char* freeBytesName,
+                                      const char* poolUsedBytesName,
+                                      const char* poolReusableBytesName) {
+    const auto info = currentDeviceMemoryInfo();
+    if (!info.has_value()) {
+      return;
+    }
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        freeBytesName,
+        RuntimeCounter(
+            saturateRuntimeCounter(info->freeBytes),
+            RuntimeCounter::Unit::kBytes));
+    if (info->hasPoolStats) {
+      lockedStats->addRuntimeStat(
+          poolUsedBytesName,
+          RuntimeCounter(
+              saturateRuntimeCounter(info->poolUsedBytes),
+              RuntimeCounter::Unit::kBytes));
+      lockedStats->addRuntimeStat(
+          poolReusableBytesName,
+          RuntimeCounter(
+              saturateRuntimeCounter(info->poolReusableBytes),
+              RuntimeCounter::Unit::kBytes));
+    }
+  };
+
+  const auto appendBuildTable = [&](std::unique_ptr<cudf::table> table) {
+    VELOX_CHECK_NOT_NULL(table);
+    const auto tableIndex = sharedTables.size();
+    const auto tableRows = static_cast<uint64_t>(table->num_rows());
+    auto sharedTable = std::shared_ptr<cudf::table>(std::move(table));
+    auto buildKeyView = sharedTable->view().select(hashBuildKeyIndices);
     bool buildKeysHaveNulls = false;
     if (preferDistinctHashJoin && !joinNode_->rightKeysNonNull()) {
       buildKeysHaveNulls = cudf::has_nulls(buildKeyView);
@@ -735,43 +822,328 @@ void CudfHashJoinBuild::doNoMoreInput() {
     const bool useDistinctHashJoin =
         preferDistinctHashJoin && !buildKeysHaveNulls;
 
+    sharedTables.push_back(std::move(sharedTable));
     if (useDistinctHashJoin) {
       hashObjects.push_back(nullptr);
-      distinctHashObjects.push_back(std::make_shared<cudf::distinct_hash_join>(
-          buildKeyView, cudf::null_equality::UNEQUAL, 0.5, stream));
+      distinctHashObjects.push_back(
+          std::make_shared<cudf::distinct_hash_join>(
+              buildKeyView, cudf::null_equality::UNEQUAL, 0.5, stream));
       VELOX_CHECK_NOT_NULL(distinctHashObjects.back());
     } else if (preferProbeUniqueInnerJoin) {
       hashObjects.push_back(nullptr);
       distinctHashObjects.push_back(nullptr);
     } else if (buildHashJoin) {
-      hashObjects.push_back(std::make_shared<cudf::hash_join>(
-          buildKeyView, cudf::null_equality::UNEQUAL, stream));
+      hashObjects.push_back(
+          std::make_shared<cudf::hash_join>(
+              buildKeyView, cudf::null_equality::UNEQUAL, stream));
       distinctHashObjects.push_back(nullptr);
       VELOX_CHECK_NOT_NULL(hashObjects.back());
     } else {
       hashObjects.push_back(nullptr);
       distinctHashObjects.push_back(nullptr);
     }
+
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat("cudfHashJoinBuildTables", RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinBuildTableRows",
+          RuntimeCounter(saturateRuntimeCounter(tableRows)));
+      if (distinctHashObjects.back() != nullptr) {
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildDistinctHashTables", RuntimeCounter(1));
+      } else if (hashObjects.back() != nullptr) {
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildGenericHashTables", RuntimeCounter(1));
+      }
+    }
+
+    recordDeviceMemory(
+        "cudfHashJoinBuildPostHashDeviceFreeBytes",
+        "cudfHashJoinBuildPostHashPoolUsedBytes",
+        "cudfHashJoinBuildPostHashPoolReusableBytes");
+
     if (CudfConfig::getInstance().debugEnabled) {
       if (distinctHashObjects.back() != nullptr) {
-        VLOG(2) << "distinctHashObject " << i << " is not nullptr "
+        VLOG(2) << "distinctHashObject " << tableIndex << " is not nullptr "
                 << distinctHashObjects.back().get() << "\n";
       } else if (hashObjects.back() != nullptr) {
-        VLOG(2) << "hashObject " << i << " is not nullptr "
+        VLOG(2) << "hashObject " << tableIndex << " is not nullptr "
                 << hashObjects.back().get() << "\n";
       } else {
-        VLOG(2) << "hashObject " << i << " is *** nullptr\n";
+        VLOG(2) << "hashObject " << tableIndex << " is *** nullptr\n";
       }
+    }
+  };
+
+  if (simpleNotEqual_.has_value()) {
+    VELOX_CHECK_NOT_NULL(minMaxSummaryType_);
+    int64_t summaryRows = 0;
+    auto tables = compactMinMaxSummaryVectorsBatched(
+        std::exchange(minMaxSummaryInputs_, {}),
+        minMaxSummaryType_,
+        static_cast<cudf::size_type>(buildKeyIndices_.size()),
+        stream,
+        summaryRows);
+    hashBuildKeyIndices =
+        sequenceIndices(static_cast<cudf::size_type>(buildKeyIndices_.size()));
+    for (auto& table : tables) {
+      appendBuildTable(std::move(table));
+    }
+  } else {
+    auto sourceInputs = std::exchange(inputs_, {});
+    common::testutil::TestValue::adjust(
+        "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::collectedBuildInputs",
+        &sourceInputs);
+
+    uint64_t inputRows = 0;
+    uint64_t inputBytes = 0;
+    for (const auto& input : sourceInputs) {
+      VELOX_CHECK_NOT_NULL(input);
+      inputRows = saturatedAdd(inputRows, static_cast<uint64_t>(input->size()));
+      inputBytes = saturatedAdd(inputBytes, input->estimateFlatSize());
+    }
+
+    const auto byteBoundedBuild = supportsByteBoundedHashBuild(*joinNode_);
+    const auto targetBytes = byteBoundedBuild
+        ? hashBuildBatchTargetBytes()
+        : std::numeric_limits<uint64_t>::max();
+    const auto maxRows = hashBuildBatchMaxRows();
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinBuildInputBatches",
+          RuntimeCounter(saturateRuntimeCounter(sourceInputs.size())));
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinBuildInputRows",
+          RuntimeCounter(saturateRuntimeCounter(inputRows)));
+      lockedStats->addRuntimeStat(
+          "cudfHashJoinBuildInputBytes",
+          RuntimeCounter(
+              saturateRuntimeCounter(inputBytes),
+              RuntimeCounter::Unit::kBytes));
+      if (byteBoundedBuild) {
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildByteBoundedJoins", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildBatchTargetBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(targetBytes),
+                RuntimeCounter::Unit::kBytes));
+      }
+    }
+
+    std::vector<CudfVectorPtr> run;
+    uint64_t runRows = 0;
+    uint64_t runBytes = 0;
+    size_t runSourceBatches = 0;
+    size_t retainedSourceBatches = sourceInputs.size();
+
+    const auto reportRetainedSourceBatches = [&]() {
+      auto retained = retainedSourceBatches;
+      common::testutil::TestValue::adjust(
+          "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::retainedInputBatchesAfterMaterializedRun",
+          &retained);
+    };
+
+    const auto flushRun = [&]() {
+      if (run.empty()) {
+        return;
+      }
+
+      const auto materializedRows = runRows;
+      const auto materializedBytes = runBytes;
+      const auto materializedWorkBytes =
+          hashBuildBatchWorkBytes(materializedRows, materializedBytes);
+      {
+        // Record the attempted envelope before allocating so failed builds
+        // retain enough evidence to identify the next memory peak.
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaterializationAttempts", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaxMaterializationRows",
+            RuntimeCounter(saturateRuntimeCounter(materializedRows)));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaxMaterializationInputBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(materializedBytes),
+                RuntimeCounter::Unit::kBytes));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaxMaterializationWorkBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(materializedWorkBytes),
+                RuntimeCounter::Unit::kBytes));
+      }
+      recordDeviceMemory(
+          "cudfHashJoinBuildPreMaterializationDeviceFreeBytes",
+          "cudfHashJoinBuildPreMaterializationPoolUsedBytes",
+          "cudfHashJoinBuildPreMaterializationPoolReusableBytes");
+
+      // getConcatenatedTable joins all producer streams, copies on the build
+      // stream, and rebinds owned inputs so their frees are ordered after that
+      // copy. Consuming one run at a time lets the async pool reuse those
+      // source allocations before the next run is admitted.
+      auto materialized = getConcatenatedTable(
+          std::exchange(run, {}),
+          joinNode_->sources()[1]->outputType(),
+          stream,
+          get_output_mr());
+      VELOX_CHECK_NOT_NULL(materialized);
+      VELOX_CHECK_EQ(
+          static_cast<uint64_t>(materialized->num_rows()), materializedRows);
+      recordDeviceMemory(
+          "cudfHashJoinBuildPostMaterializationDeviceFreeBytes",
+          "cudfHashJoinBuildPostMaterializationPoolUsedBytes",
+          "cudfHashJoinBuildPostMaterializationPoolReusableBytes");
+
+      VELOX_CHECK_GE(retainedSourceBatches, runSourceBatches);
+      retainedSourceBatches -= runSourceBatches;
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaterializedBatches", RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaterializedRows",
+            RuntimeCounter(saturateRuntimeCounter(materializedRows)));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildMaterializedBytes",
+            RuntimeCounter(
+                saturateRuntimeCounter(materialized->alloc_size()),
+                RuntimeCounter::Unit::kBytes));
+        lockedStats->addRuntimeStat(
+            "cudfHashJoinBuildSourceBatchesConsumed",
+            RuntimeCounter(saturateRuntimeCounter(runSourceBatches)));
+      }
+
+      appendBuildTable(std::move(materialized));
+      reportRetainedSourceBatches();
+      runRows = 0;
+      runBytes = 0;
+      runSourceBatches = 0;
+    };
+
+    for (auto& input : sourceInputs) {
+      VELOX_CHECK_NOT_NULL(input);
+      const auto rows = static_cast<uint64_t>(input->size());
+      const auto bytes = input->estimateFlatSize();
+      const auto workBytes = hashBuildBatchWorkBytes(rows, bytes);
+
+      if (rows > maxRows || workBytes > targetBytes) {
+        flushRun();
+
+        // Bound an individually oversized owner with one zero-copy slice at a
+        // time. The original allocation cannot be released until its final
+        // slice, but no individual concatenate or hash table can scale to the
+        // full owner.
+        auto owner = std::move(input);
+        const auto ownerView = owner->getTableView();
+        const auto ownerFlatSize = owner->estimateFlatSize();
+        const auto workBytesPerRow = std::max(
+            saturatedMultiply(
+                ceilingDivide(std::max<uint64_t>(ownerFlatSize, 1), rows), 2),
+            saturatedAdd(
+                ceilingDivide(std::max<uint64_t>(ownerFlatSize, 1), rows),
+                kHashBuildWorkspaceBytesPerRow));
+        // Leave additional room for row-size skew in variable-width columns.
+        // A single row can still exceed the target, but ordinary skew must not
+        // turn one oversized owner into another target-sized allocation.
+        const auto conservativeWorkBytesPerRow =
+            saturatedMultiply(workBytesPerRow, 2);
+        const auto rowsPerSlice = std::min<uint64_t>(
+            maxRows,
+            std::max<uint64_t>(targetBytes / conservativeWorkBytesPerRow, 1));
+        const auto flatBytesPerRow = ownerFlatSize / rows;
+        const auto flatByteRemainder = ownerFlatSize % rows;
+        const auto flatSizeAtRow = [&](uint64_t row) {
+          return saturatedAdd(
+              saturatedMultiply(flatBytesPerRow, row),
+              std::min<uint64_t>(row, flatByteRemainder));
+        };
+
+        for (uint64_t start = 0; start < rows;) {
+          const auto end = std::min(start + rowsPerSlice, rows);
+          const auto sliceRows = end - start;
+          auto slices = cudf::slice(
+              ownerView,
+              {static_cast<cudf::size_type>(start),
+               static_cast<cudf::size_type>(end)},
+              owner->stream());
+          VELOX_CHECK_EQ(slices.size(), 1);
+
+          // cuDF slices of nested and variable-width columns retain unsliced
+          // child buffers. Account the owner's logical flat size across its
+          // slices explicitly; recursively measuring the view would count the
+          // complete child allocation for every slice.
+          const auto sliceBytes = flatSizeAtRow(end) - flatSizeAtRow(start);
+          auto slice = std::make_shared<CudfVector>(
+              pool(),
+              owner->type(),
+              static_cast<vector_size_t>(sliceRows),
+              slices.front(),
+              CudfVector::ViewOwner{owner},
+              owner->stream(),
+              sliceBytes);
+
+          runRows = sliceRows;
+          runBytes = sliceBytes;
+          run.push_back(std::move(slice));
+          runSourceBatches = 0;
+          {
+            auto lockedStats = stats_.wlock();
+            lockedStats->addRuntimeStat(
+                "cudfHashJoinBuildOversizedInputSlices", RuntimeCounter(1));
+          }
+          flushRun();
+          start = end;
+        }
+
+        owner.reset();
+        VELOX_CHECK_GT(retainedSourceBatches, 0);
+        --retainedSourceBatches;
+        {
+          auto lockedStats = stats_.wlock();
+          lockedStats->addRuntimeStat(
+              "cudfHashJoinBuildSourceBatchesConsumed", RuntimeCounter(1));
+        }
+        reportRetainedSourceBatches();
+        continue;
+      }
+
+      const auto candidateRows = saturatedAdd(runRows, rows);
+      const auto candidateBytes = saturatedAdd(runBytes, bytes);
+      if (!run.empty() &&
+          (candidateRows > maxRows ||
+           hashBuildBatchWorkBytes(candidateRows, candidateBytes) >
+               targetBytes)) {
+        flushRun();
+      }
+
+      run.push_back(std::move(input));
+      runRows = saturatedAdd(runRows, rows);
+      runBytes = saturatedAdd(runBytes, bytes);
+      ++runSourceBatches;
+    }
+    flushRun();
+
+    if (sharedTables.empty()) {
+      appendBuildTable(makeEmptyTable(joinNode_->sources()[1]->outputType()));
+    }
+    VELOX_CHECK_EQ(retainedSourceBatches, 0);
+  }
+
+  if (CudfConfig::getInstance().debugEnabled && !sharedTables.empty()) {
+    VLOG(1) << "Build table number of columns: "
+            << sharedTables[0]->num_columns();
+    for (auto i = 0; i < sharedTables.size(); i++) {
+      VLOG(1) << "Build table " << i
+              << ": number of rows: " << sharedTables[i]->num_rows();
     }
   }
 
   auto buildReadyEvent = std::make_shared<CudaEvent>(cudaEventDisableTiming);
   buildReadyEvent->recordFrom(stream);
 
-  std::vector<std::shared_ptr<cudf::table>> shared_tbls;
-  for (auto& tbl : tbls) {
-    shared_tbls.push_back(std::move(tbl));
-  }
   // set hash table to CudfHashJoinBridge
   auto joinBridge = operatorCtx_->task()->getCustomJoinBridge(
       operatorCtx_->driverCtx()->splitGroupId, planNodeId());
@@ -781,10 +1153,11 @@ void CudfHashJoinBuild::doNoMoreInput() {
   cudfHashJoinBridge->setBuildStream(stream);
   cudfHashJoinBridge->setBuildReadyEvent(std::move(buildReadyEvent));
   cudfHashJoinBridge->setHashTable(
-      std::make_optional(CudfHashJoinBridge::HashJoinState{
-          std::move(shared_tbls),
-          std::move(hashObjects),
-          std::move(distinctHashObjects)}));
+      std::make_optional(
+          CudfHashJoinBridge::HashJoinState{
+              std::move(sharedTables),
+              std::move(hashObjects),
+              std::move(distinctHashObjects)}));
 }
 
 exec::BlockingReason CudfHashJoinBuild::isBlocked(ContinueFuture* future) {
@@ -1355,10 +1728,8 @@ CudfHashJoinProbe::JoinIndices CudfHashJoinProbe::computeLeftJoinIndices(
         leftKeyView, stream, get_temp_mr());
     auto leftJoinIndicesColumn = cudf::sequence(
         leftKeyView.num_rows(),
-        cudf::numeric_scalar<cudf::size_type>(
-            0, true, stream, get_temp_mr()),
-        cudf::numeric_scalar<cudf::size_type>(
-            1, true, stream, get_temp_mr()),
+        cudf::numeric_scalar<cudf::size_type>(0, true, stream, get_temp_mr()),
+        cudf::numeric_scalar<cudf::size_type>(1, true, stream, get_temp_mr()),
         stream,
         get_temp_mr());
     auto leftJoinIndices =
@@ -2333,9 +2704,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         continue;
       }
       retainedMatchIndices.push_back(std::move(matchedProbeIndices));
-      auto matchedProbeIndicesSpan =
-          cudf::device_span<cudf::size_type const>{
-              *retainedMatchIndices.back()};
+      auto matchedProbeIndicesSpan = cudf::device_span<cudf::size_type const>{
+          *retainedMatchIndices.back()};
       auto matchedProbeIndicesCol = cudf::column_view{matchedProbeIndicesSpan};
       matchCol = scatterTrueAtIndices(
           std::move(matchCol),
@@ -2348,8 +2718,7 @@ CudfHashJoinProbe::leftSemiProjectJoin(
     }
 
     // Use cached precomputed columns for right (build) table
-    cudf::table_view extendedRightView =
-        (!rightPrecomputeInstructions_.empty())
+    cudf::table_view extendedRightView = (!rightPrecomputeInstructions_.empty())
         ? cachedExtendedRightViews_[i]
         : rightTableView;
 

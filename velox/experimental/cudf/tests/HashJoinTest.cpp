@@ -336,6 +336,341 @@ DEBUG_ONLY_TEST_F(HashJoinTest, transferBuildInputOwnershipFromSourceDrivers) {
       << "Source build drivers retained input batches after transfer";
 }
 
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    byteBoundedTrustedUniqueBuildDropsInputReferencesIncrementally) {
+  constexpr vector_size_t kRowsPerBatch = 32;
+  constexpr int32_t kNumBatches = 6;
+  constexpr uint64_t kTargetBytes = 2'500;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedMax = config.batchSizeMaxThreshold;
+  const auto savedDistinct = config.distinctHashJoinEnabled;
+  config.batchSizeMaxThreshold = std::nullopt;
+  config.distinctHashJoinEnabled = true;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+    config.distinctHashJoinEnabled = savedDistinct;
+  };
+
+  std::vector<RowVectorPtr> probeVectors;
+  std::vector<RowVectorPtr> buildVectors;
+  probeVectors.reserve(kNumBatches);
+  buildVectors.reserve(kNumBatches);
+  for (int32_t batch = 0; batch < kNumBatches; ++batch) {
+    probeVectors.push_back(makeRowVector(
+        {"p_key", "p_value"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch, kRowsPerBatch](auto row) {
+                  return batch * kRowsPerBatch + row;
+                }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 10'000 + batch * 100 + row; }),
+        }));
+    buildVectors.push_back(makeRowVector(
+        {"b_key", "b_value"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch, kRowsPerBatch](auto row) {
+                  return batch * kRowsPerBatch + row;
+                }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 20'000 + batch * 100 + row; }),
+        }));
+  }
+  createDuckDbTable("t", probeVectors);
+  createDuckDbTable("u", buildVectors);
+
+  std::vector<std::weak_ptr<cudf_velox::CudfVector>> sourceOwners;
+  std::vector<size_t> retainedSourceBatches;
+  std::vector<size_t> expiredSourceBatches;
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::materializationTargetBytes",
+      std::function<void(uint64_t*)>(
+          [=](uint64_t* targetBytes) { *targetBytes = kTargetBytes; }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::collectedBuildInputs",
+      std::function<void(std::vector<cudf_velox::CudfVectorPtr>*)>(
+          [&](std::vector<cudf_velox::CudfVectorPtr>* inputs) {
+            sourceOwners.reserve(inputs->size());
+            for (const auto& input : *inputs) {
+              sourceOwners.push_back(input);
+            }
+          }));
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::retainedInputBatchesAfterMaterializedRun",
+      std::function<void(size_t*)>([&](size_t* retained) {
+        retainedSourceBatches.push_back(*retained);
+        expiredSourceBatches.push_back(
+            std::count_if(
+                sourceOwners.begin(),
+                sourceOwners.end(),
+                [](const auto& owner) { return owner.expired(); }));
+      }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(
+      PlanBuilder(planNodeIdGenerator)
+          .values(probeVectors)
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values(buildVectors).planNode(),
+              "",
+              {"p_key", "p_value", "b_key", "b_value"},
+              core::JoinType::kInner)
+          .planNode());
+  ASSERT_NE(join, nullptr);
+  auto trustedJoin = core::HashJoinNode::Builder(*join)
+                         .rightKeysUnique(true)
+                         .rightKeysNonNull(true)
+                         .build();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(trustedJoin)
+                  .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "32")
+                  .maxDrivers(1)
+                  .assertResults(
+                      "SELECT t.p_key, t.p_value, u.b_key, u.b_value "
+                      "FROM t JOIN u ON t.p_key = u.b_key");
+
+  ASSERT_GT(sourceOwners.size(), 1);
+  ASSERT_GT(retainedSourceBatches.size(), 1);
+  EXPECT_GT(expiredSourceBatches.front(), 0)
+      << "The first materialized run must release source owners before the "
+         "next run";
+  EXPECT_LT(retainedSourceBatches.front(), sourceOwners.size());
+  EXPECT_EQ(retainedSourceBatches.back(), 0);
+  EXPECT_EQ(expiredSourceBatches.back(), sourceOwners.size());
+  EXPECT_TRUE(
+      std::is_sorted(
+          retainedSourceBatches.rbegin(), retainedSourceBatches.rend()));
+  EXPECT_TRUE(
+      std::is_sorted(expiredSourceBatches.begin(), expiredSourceBatches.end()));
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(trustedJoin->id()).customStats;
+  EXPECT_EQ(stats.at("cudfHashJoinBuildBatchTargetBytes").max, kTargetBytes);
+  EXPECT_GT(stats.at("cudfHashJoinBuildMaterializedBatches").sum, 1);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildMaterializedBatches").sum,
+      stats.at("cudfHashJoinBuildDistinctHashTables").sum);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildMaterializedRows").sum,
+      stats.at("cudfHashJoinBuildInputRows").sum);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildSourceBatchesConsumed").sum,
+      stats.at("cudfHashJoinBuildInputBatches").sum);
+  EXPECT_LE(
+      stats.at("cudfHashJoinBuildMaxMaterializationWorkBytes").max,
+      kTargetBytes);
+  EXPECT_EQ(stats.count("cudfHashJoinBuildGenericHashTables"), 0);
+}
+
+DEBUG_ONLY_TEST_F(
+    HashJoinTest,
+    byteBoundsSingleOversizedVariableWidthBuildInput) {
+  constexpr vector_size_t kRows = 128;
+  constexpr uint64_t kTargetBytes = 2'048;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = std::nullopt;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probe = makeRowVector(
+      {"p_key", "p_value", "p_text"},
+      {
+          makeFlatVector<int64_t>(kRows, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(kRows, [](auto row) { return row * 3; }),
+          makeFlatVector<std::string>(
+              kRows,
+              [](auto row) { return std::string(row == 0 ? 512 : 32, 'p'); }),
+      });
+  auto build = makeRowVector(
+      {"b_key", "b_value", "b_text"},
+      {
+          makeFlatVector<int64_t>(kRows, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(kRows, [](auto row) { return row * 7; }),
+          makeFlatVector<std::string>(
+              kRows,
+              [](auto row) { return std::string(row == 0 ? 512 : 32, 'b'); }),
+      });
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::materializationTargetBytes",
+      std::function<void(uint64_t*)>(
+          [=](uint64_t* targetBytes) { *targetBytes = kTargetBytes; }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "",
+              {"p_key", "p_value", "p_text", "b_key", "b_value", "b_text"},
+              core::JoinType::kInner)
+          .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .config(
+                      cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+                      std::to_string(kRows))
+                  .maxDrivers(1)
+                  .assertResults(
+                      "SELECT t.p_key, t.p_value, t.p_text, "
+                      "u.b_key, u.b_value, u.b_text "
+                      "FROM t JOIN u ON t.p_key = u.b_key");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(plan->id()).customStats;
+  EXPECT_EQ(stats.at("cudfHashJoinBuildInputBatches").sum, 1);
+  EXPECT_GT(stats.at("cudfHashJoinBuildOversizedInputSlices").sum, 1);
+  EXPECT_LT(stats.at("cudfHashJoinBuildOversizedInputSlices").sum, kRows);
+  EXPECT_GT(stats.at("cudfHashJoinBuildMaterializedBatches").sum, 1);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildSourceBatchesConsumed").sum, 1);
+  EXPECT_LE(
+      stats.at("cudfHashJoinBuildMaxMaterializationWorkBytes").max,
+      kTargetBytes);
+}
+
+DEBUG_ONLY_TEST_F(HashJoinTest, byteBoundedBuildPreservesSingleTableJoinPaths) {
+  auto probe =
+      makeRowVector({"p_key"}, {makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto build = makeRowVector({"b_key"}, {makeFlatVector<int64_t>({2, 4})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  std::atomic_size_t targetAdjustments{0};
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::materializationTargetBytes",
+      std::function<void(uint64_t*)>([&](uint64_t* targetBytes) {
+        ++targetAdjustments;
+        *targetBytes = 1;
+      }));
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values({probe})
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+              "",
+              {"p_key"},
+              core::JoinType::kAnti)
+          .planNode();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(plan)
+                  .maxDrivers(1)
+                  .assertResults(
+                      "SELECT t.p_key FROM t WHERE NOT EXISTS "
+                      "(SELECT * FROM u WHERE u.b_key = t.p_key)");
+
+  EXPECT_EQ(targetAdjustments.load(), 0);
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(plan->id()).customStats;
+  EXPECT_EQ(stats.count("cudfHashJoinBuildByteBoundedJoins"), 0);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildMaterializedBatches").sum, 1);
+  EXPECT_EQ(stats.at("cudfHashJoinBuildTables").sum, 1);
+}
+
+TEST_F(HashJoinTest, trustedUniqueInnerJoinWithBatchedBuild) {
+  static constexpr vector_size_t kRowsPerBatch = 24;
+  constexpr int32_t kNumBatches = 4;
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto savedMax = config.batchSizeMaxThreshold;
+  const auto savedDistinct = config.distinctHashJoinEnabled;
+  config.batchSizeMaxThreshold = 32;
+  config.distinctHashJoinEnabled = true;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+    config.distinctHashJoinEnabled = savedDistinct;
+  };
+
+  std::vector<RowVectorPtr> probeVectors;
+  std::vector<RowVectorPtr> buildVectors;
+  for (int32_t batch = 0; batch < kNumBatches; ++batch) {
+    probeVectors.push_back(makeRowVector(
+        {"p_key", "p_value"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return batch * kRowsPerBatch + row; }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 1'000 + batch * 100 + row; }),
+        }));
+    buildVectors.push_back(makeRowVector(
+        {"b_key", "b_value"},
+        {
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return batch * kRowsPerBatch + row; }),
+            makeFlatVector<int64_t>(
+                kRowsPerBatch,
+                [batch](auto row) { return 2'000 + batch * 100 + row; }),
+        }));
+  }
+  createDuckDbTable("t", probeVectors);
+  createDuckDbTable("u", buildVectors);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto join = std::dynamic_pointer_cast<const core::HashJoinNode>(
+      PlanBuilder(planNodeIdGenerator)
+          .values(probeVectors)
+          .hashJoin(
+              {"p_key"},
+              {"b_key"},
+              PlanBuilder(planNodeIdGenerator).values(buildVectors).planNode(),
+              "",
+              {"p_key", "p_value", "b_key", "b_value"},
+              core::JoinType::kInner)
+          .planNode());
+  ASSERT_NE(join, nullptr);
+  auto trustedJoin = core::HashJoinNode::Builder(*join)
+                         .rightKeysUnique(true)
+                         .rightKeysNonNull(true)
+                         .build();
+
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(trustedJoin)
+                  .config(
+                      cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+                      std::to_string(kRowsPerBatch))
+                  .maxDrivers(1)
+                  .assertResults(
+                      "SELECT t.p_key, t.p_value, u.b_key, u.b_value "
+                      "FROM t JOIN u ON t.p_key = u.b_key");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(trustedJoin->id()).customStats;
+  EXPECT_GT(stats.at("cudfHashJoinBuildMaterializedBatches").sum, 1);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildMaterializedBatches").sum,
+      stats.at("cudfHashJoinBuildDistinctHashTables").sum);
+  EXPECT_EQ(
+      stats.at("cudfHashJoinBuildMaterializedRows").sum,
+      stats.at("cudfHashJoinBuildInputRows").sum);
+  EXPECT_EQ(stats.count("cudfHashJoinBuildGenericHashTables"), 0);
+}
+
 TEST_P(MultiThreadedHashJoinTest, normalizedKey) {
   HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
       .injectSpill(false)
@@ -2591,7 +2926,7 @@ TEST_F(HashJoinTest, rightJoinWithBatchConcat) {
 
   constexpr int32_t kNumDrivers = 3;
   constexpr int32_t kNumBatches = 12;
-  constexpr int32_t kRowsPerBatch = 16;
+  static constexpr int32_t kRowsPerBatch = 16;
   constexpr int32_t kNumRows = kNumBatches * kRowsPerBatch;
   auto probeVectors = makeBatches(kNumBatches, [&](int32_t batch) {
     return makeRowVector({
@@ -2645,7 +2980,9 @@ TEST_F(HashJoinTest, rightJoinWithBatchConcat) {
   const auto& concatStats = *joinStats.at("CudfBatchConcat");
   EXPECT_EQ(concatStats.numDrivers, kNumDrivers);
   EXPECT_EQ(concatStats.inputRows, kNumRows);
-  EXPECT_EQ(concatStats.inputVectors, kNumBatches * kNumDrivers);
+  // The round-robin local exchange coalesces the source batches into one
+  // vector per receiving driver before CudfBatchConcat.
+  EXPECT_EQ(concatStats.inputVectors, kNumDrivers);
   EXPECT_EQ(concatStats.outputVectors, kNumDrivers);
   const auto& probeStats = *joinStats.at("CudfHashJoinProbe");
   EXPECT_EQ(probeStats.numDrivers, kNumDrivers);

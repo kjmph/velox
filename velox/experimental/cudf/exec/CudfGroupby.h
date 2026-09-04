@@ -227,12 +227,11 @@ class CudfGroupby : public CudfOperatorBase {
       CudfVectorPtr state,
       bool projectAggregationInputs);
   void routeFinalAggregationState(CudfVectorPtr state);
+  void routeFinalAggregationBucket(FinalAggregationBucket&& bucket);
   void collectFinalAggregationSlice(
       CudfVectorPtr state,
       bool projectAggregationInputs);
-  void compactFinalAggregationCollectionBucket(size_t bucketIndex);
   void growFinalAggregationCollection();
-  bool finalAggregationCollectionNeedsGrowth() const;
   CudfVectorPtr finalizeCollectedGroupbyStates();
   void recordFinalAggregationCompactionInput(
       uint64_t inputRows,
@@ -277,8 +276,6 @@ class CudfGroupby : public CudfOperatorBase {
   std::vector<CudfVectorPtr> splitFinalAggregationState(
       CudfVectorPtr state) const;
   bool finalAggregationBucketIsOversized(
-      const FinalAggregationBucket& bucket) const;
-  bool finalAggregationBucketCrossesCollectionWatermark(
       const FinalAggregationBucket& bucket) const;
   uint64_t finalAggregationWorkBytes(uint64_t inputRows, uint64_t inputBytes)
       const;

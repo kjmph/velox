@@ -1793,6 +1793,16 @@ CudfVectorPtr CudfGroupby::restoreFinalAggregationState(
     rmm::cuda_stream_view stream) {
   VELOX_CHECK_NOT_NULL(state.state);
   const auto rows = static_cast<uint64_t>(state.state->size());
+  VELOX_CHECK_GT(finalAggregationBucketTargetRows_, 0);
+  VELOX_CHECK_GT(finalAggregationBucketTargetBytes_, 0);
+  VELOX_CHECK_LE(
+      rows,
+      finalAggregationBucketTargetRows_,
+      "A single parked final-aggregation run exceeds the row envelope");
+  VELOX_CHECK_LE(
+      finalAggregationWorkBytes(rows, state.deviceBytes),
+      finalAggregationBucketTargetBytes_,
+      "A single parked final-aggregation run exceeds the work envelope");
   auto table =
       with_arrow::toCudfTable(state.state, pool(), stream, get_temp_mr());
   state.state.reset();
@@ -1856,9 +1866,9 @@ void CudfGroupby::startFinalAggregationCollection(
   }
   initializeFinalAggregationBucketEnvelope(inputRows, inputBytes);
 
-  // Aim for half-full leaves. The spare half is what lets the next incoming
-  // fragment be reduced with the resident state without first crossing the
-  // hard concatenate/group-by envelope.
+  // Aim for half-full leaves so later fragments can be admitted without
+  // immediately growing the fanout. The hard envelope is still checked
+  // before every admission and again when each bucket drains.
   const auto leafTargetRows =
       std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1);
   const auto leafTargetWorkBytes =
@@ -1915,49 +1925,6 @@ void CudfGroupby::startFinalAggregationCollection(
   recordFinalAggregationRetainedState();
 }
 
-void CudfGroupby::compactFinalAggregationCollectionBucket(size_t bucketIndex) {
-  VELOX_CHECK_LT(bucketIndex, finalAggregationCollectionBuckets_.size());
-  auto& bucket = finalAggregationCollectionBuckets_[bucketIndex];
-  if (bucket.numStates() < 2) {
-    return;
-  }
-
-  VELOX_CHECK(!finalAggregationBucketIsOversized(bucket));
-  const auto hashDepth = bucket.hashDepth;
-  recordFinalAggregationCompactionInput(bucket.rows, bucket.bytes);
-  restoreFinalAggregationBucket(bucket);
-  auto result = aggregateGroupbyStates(
-      std::move(bucket.states),
-      false,
-      nullptr,
-      intermediateAggregators_,
-      bufferedResultType_);
-
-  bucket = {};
-  bucket.hashDepth = hashDepth;
-  if (result) {
-    bucket.rows = static_cast<uint64_t>(result->size());
-    bucket.bytes = result->estimateFlatSize();
-    bucket.states.push_back(std::move(result));
-    parkFinalAggregationBucket(bucket);
-  }
-}
-
-bool CudfGroupby::finalAggregationCollectionNeedsGrowth() const {
-  if (finalAggregationCollectionFanout_ >=
-      kMaxFinalAggregationPartitionFanout) {
-    return false;
-  }
-  const auto leafTargetRows =
-      std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1);
-  return std::ranges::any_of(
-      finalAggregationCollectionBuckets_, [&](const auto& bucket) {
-        return bucket.rows > leafTargetRows ||
-            finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
-            finalAggregationBucketTargetBytes_ / 2;
-      });
-}
-
 void CudfGroupby::growFinalAggregationCollection() {
   VELOX_CHECK(finalAggregationCollecting_);
   VELOX_CHECK_LT(
@@ -1979,14 +1946,10 @@ void CudfGroupby::growFinalAggregationCollection() {
         RuntimeCounter(finalAggregationCollectionFanout_));
   }
 
-  // Rehash one owning reduced state at a time. This bounds the transient copy
-  // during fanout growth and preserves the reduction already achieved across
-  // earlier input batches.
+  // Rehash one owning state at a time. This bounds the transient copy during
+  // fanout growth without rebuilding a complete parked bucket on the GPU.
   for (auto& bucket : oldBuckets) {
-    restoreFinalAggregationBucket(bucket);
-    for (auto& state : bucket.states) {
-      routeFinalAggregationState(std::move(state));
-    }
+    routeFinalAggregationBucket(std::move(bucket));
   }
   recordFinalAggregationRetainedState();
 }
@@ -2032,15 +1995,11 @@ void CudfGroupby::collectFinalAggregationSlice(
       finalAggregationCollectionFanout_ < kMaxFinalAggregationPartitionFanout) {
     growFinalAggregationCollection();
     for (auto& bucket : incoming) {
-      restoreFinalAggregationBucket(bucket);
-      for (auto& incomingState : bucket.states) {
-        routeFinalAggregationState(std::move(incomingState));
-      }
+      routeFinalAggregationBucket(std::move(bucket));
     }
     return;
   }
 
-  std::vector<size_t> bucketsToCompact;
   for (size_t i = 0; i < incoming.size(); ++i) {
     auto& incomingBucket = incoming[i];
     if (incomingBucket.empty()) {
@@ -2081,21 +2040,13 @@ void CudfGroupby::collectFinalAggregationSlice(
       resident.parkedStates.push_back(std::move(incomingState));
     }
 
-    if (resident.numStates() > 1 &&
-        finalAggregationBucketCrossesCollectionWatermark(resident)) {
-      bucketsToCompact.push_back(i);
-    }
+    // Do not compact an accumulating bucket here. Folding each later input
+    // into a resident state repeatedly rewrites all previously collected rows.
+    // Retain disjoint parked runs and aggregate them once when this bounded
+    // bucket drains. Pre-admission fanout growth and recursive drain-time
+    // partitioning continue to enforce the row and workspace envelope.
   }
-
-  for (const auto bucketIndex : bucketsToCompact) {
-    compactFinalAggregationCollectionBucket(bucketIndex);
-  }
-
-  if (finalAggregationCollectionNeedsGrowth()) {
-    growFinalAggregationCollection();
-  } else {
-    recordFinalAggregationRetainedState();
-  }
+  recordFinalAggregationRetainedState();
 }
 
 void CudfGroupby::collectFinalAggregationState(
@@ -2113,6 +2064,19 @@ void CudfGroupby::collectFinalAggregationState(
 
 void CudfGroupby::routeFinalAggregationState(CudfVectorPtr state) {
   collectFinalAggregationState(std::move(state), false);
+}
+
+void CudfGroupby::routeFinalAggregationBucket(FinalAggregationBucket&& bucket) {
+  VELOX_CHECK(
+      bucket.states.empty(),
+      "Final-aggregation collection buckets must remain parked between "
+      "admissions");
+  auto parkedStates = std::move(bucket.parkedStates);
+  auto restoreStream = cudfGlobalStreamPool().get_stream();
+  for (auto& state : parkedStates) {
+    routeFinalAggregationState(
+        restoreFinalAggregationState(std::move(state), restoreStream));
+  }
 }
 
 void CudfGroupby::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
@@ -2208,14 +2172,6 @@ bool CudfGroupby::finalAggregationBucketIsOversized(
   return bucket.rows > finalAggregationBucketTargetRows_ ||
       finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
       finalAggregationBucketTargetBytes_;
-}
-
-bool CudfGroupby::finalAggregationBucketCrossesCollectionWatermark(
-    const FinalAggregationBucket& bucket) const {
-  return bucket.rows >
-      std::max<uint64_t>(finalAggregationBucketTargetRows_ / 2, 1) ||
-      finalAggregationWorkBytes(bucket.rows, bucket.bytes) >
-      std::max<uint64_t>(finalAggregationBucketTargetBytes_ / 2, 1);
 }
 
 std::vector<CudfVectorPtr> CudfGroupby::splitFinalAggregationState(
@@ -2475,7 +2431,10 @@ void CudfGroupby::initializeFinalAggregationBuckets(
 CudfGroupby::FinalAggregationBucket
 CudfGroupby::compactSkewedFinalAggregationBucket(
     FinalAggregationBucket&& bucket) {
-  restoreFinalAggregationBucket(bucket);
+  VELOX_CHECK(
+      bucket.states.empty(),
+      "Oversized final-aggregation buckets must be parked before skew "
+      "compaction");
   FinalAggregationBucket compacted;
   compacted.hashDepth = bucket.hashDepth;
 
@@ -2505,7 +2464,7 @@ CudfGroupby::compactSkewedFinalAggregationBucket(
     parkFinalAggregationBucket(compacted);
   };
 
-  for (auto& state : bucket.states) {
+  auto consumeState = [&](CudfVectorPtr state) {
     auto slices = splitFinalAggregationState(std::move(state));
     for (auto& slice : slices) {
       const auto rows = static_cast<uint64_t>(slice->size());
@@ -2523,6 +2482,33 @@ CudfGroupby::compactSkewedFinalAggregationBucket(
       chunkBytes = saturatedAdd(chunkBytes, bytes);
       chunk.push_back(std::move(slice));
     }
+  };
+
+  // An oversized bucket can contain far more parked data than fits in the
+  // device envelope. Restore and consume one owning run at a time instead of
+  // reconstructing the complete bucket on the GPU before chunking it.
+  auto parkedStates = std::move(bucket.parkedStates);
+  auto restoreStream = cudfGlobalStreamPool().get_stream();
+  for (auto& state : parkedStates) {
+    VELOX_CHECK_NOT_NULL(state.state);
+    const auto rows = static_cast<uint64_t>(state.state->size());
+    VELOX_CHECK_LE(rows, finalAggregationBucketTargetRows_);
+    VELOX_CHECK_LE(
+        finalAggregationWorkBytes(rows, state.deviceBytes),
+        finalAggregationBucketTargetBytes_,
+        "A single parked final-aggregation run exceeds the bounded work "
+        "envelope");
+    if (!chunk.empty() &&
+        (saturatedAdd(chunkRows, rows) > finalAggregationBucketTargetRows_ ||
+         finalAggregationWorkBytes(
+             saturatedAdd(chunkRows, rows),
+             saturatedAdd(chunkBytes, state.deviceBytes)) >
+             finalAggregationBucketTargetBytes_)) {
+      // Flush before H2D restoration so a full parked run never overlaps a
+      // nearly full compaction chunk on the device.
+      flushChunk();
+    }
+    consumeState(restoreFinalAggregationState(std::move(state), restoreStream));
   }
   flushChunk();
 
@@ -2534,6 +2520,10 @@ CudfGroupby::compactSkewedFinalAggregationBucket(
 
 void CudfGroupby::repartitionFinalAggregationBucket(
     FinalAggregationBucket&& bucket) {
+  VELOX_CHECK(
+      bucket.states.empty(),
+      "Oversized final-aggregation buckets must be parked before "
+      "repartitioning");
   const auto originalRows = bucket.rows;
   const auto originalBytes = bucket.bytes;
   const auto originalDepth = bucket.hashDepth;
@@ -2556,13 +2546,12 @@ void CudfGroupby::repartitionFinalAggregationBucket(
         finalAggregationBucketTargetRows_,
         finalAggregationBucketTargetBytes_);
   }
-  restoreFinalAggregationBucket(bucket);
   const auto childDepth = originalDepth + 1;
   const auto numBuckets =
       finalAggregationPartitionCount(originalRows, originalBytes, true);
   std::vector<FinalAggregationBucket> children(numBuckets);
   const auto hashSeed = advanceHashSeed(nextFinalAggregationHashSeed_);
-  for (auto& state : bucket.states) {
+  auto partitionState = [&](CudfVectorPtr state) {
     hashPartitionFinalState(
         std::move(state),
         false,
@@ -2571,6 +2560,16 @@ void CudfGroupby::repartitionFinalAggregationBucket(
         childDepth,
         children,
         true);
+  };
+
+  // Repartition oversized host state one owning run at a time. Each run is
+  // released by hashPartitionFinalState before the next restore, bounding the
+  // transient H2D allocation independently of the complete bucket size.
+  auto parkedStates = std::move(bucket.parkedStates);
+  auto restoreStream = cudfGlobalStreamPool().get_stream();
+  for (auto& state : parkedStates) {
+    partitionState(
+        restoreFinalAggregationState(std::move(state), restoreStream));
   }
 
   uint64_t maxChildRows = 0;

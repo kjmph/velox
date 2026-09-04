@@ -1421,12 +1421,142 @@ TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
+      finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum)
+      << "Collection must park each partitioned row once rather than repeatedly "
+         "re-aggregating and re-parking growing buckets";
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationMaxHostParkedBytes").max,
       0);
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1)
       << "The cursor must drain more than one hash-bucket output batch";
+}
+
+TEST_F(AggregationTest, skewedFinalAggregationCompactsParkedRuns) {
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  const auto savedMaxBatchRows = cudfConfig.batchSizeMaxThreshold;
+  constexpr int32_t kMaxBucketRows = 4;
+  cudfConfig.batchSizeMaxThreshold = kMaxBucketRows;
+  SCOPE_EXIT {
+    cudfConfig.batchSizeMaxThreshold = savedMaxBatchRows;
+  };
+
+  auto rawInput = makeRowVector({
+      makeFlatVector<int32_t>({7}),
+      makeFlatVector<int64_t>({1}),
+  });
+  auto planNode = PlanBuilder()
+                      .values({rawInput})
+                      .partialAggregation({"c0"}, {"sum(c1)", "count(c1)"})
+                      .finalAggregation()
+                      .planNode();
+  auto finalAggregation =
+      std::dynamic_pointer_cast<const core::AggregationNode>(planNode);
+  ASSERT_NE(finalAggregation, nullptr);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = planNode;
+  auto task = Task::create(
+      "AggregationTest.skewedFinalAggregationCompactsParkedRuns",
+      std::move(planFragment),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+  auto driverCtx = std::make_unique<DriverCtx>(task, 0, 0, 0, 0);
+  auto* driverCtxPtr = driverCtx.get();
+  auto driver = Driver::testingCreate(std::move(driverCtx));
+  cudf_velox::CudfGroupby groupby(0, driverCtxPtr, finalAggregation);
+  groupby.initialize();
+
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto makeState = [&](vector_size_t rows) {
+    auto hostState = makeRowVector({
+        makeFlatVector<int32_t>(rows, [](auto /*row*/) { return 7; }),
+        makeFlatVector<int64_t>(rows, [](auto /*row*/) { return 1; }),
+        makeFlatVector<int64_t>(rows, [](auto /*row*/) { return 1; }),
+    });
+    auto table =
+        std::shared_ptr<cudf::table>(cudf_velox::with_arrow::toCudfTable(
+            hostState,
+            pool(),
+            stream,
+            cudf::get_current_device_resource_ref()));
+    const auto tableView = table->view();
+    return std::make_shared<cudf_velox::CudfVector>(
+        pool(),
+        finalAggregation->sources()[0]->outputType(),
+        rows,
+        tableView,
+        cudf_velox::CudfVector::ViewOwner{std::move(table)},
+        stream);
+  };
+
+  // The fifth one-row state starts collection and grows a maximally skewed
+  // bucket. The wider state is split into four bounded runs, forcing recursive
+  // repartition and two skew-compaction passes during drain.
+  for (int32_t i = 0; i < 5; ++i) {
+    groupby.addInput(makeState(1));
+  }
+  groupby.addInput(makeState(16));
+  groupby.noMoreInput();
+
+  vector_size_t outputRows = 0;
+  int64_t outputSum = 0;
+  int64_t outputCount = 0;
+  for (int32_t attempts = 0; attempts < 1'024 && !groupby.isFinished();
+       ++attempts) {
+    auto output =
+        std::dynamic_pointer_cast<cudf_velox::CudfVector>(groupby.getOutput());
+    if (!output) {
+      continue;
+    }
+    auto hostOutput = cudf_velox::with_arrow::toVeloxColumn(
+        output->getTableView(),
+        pool(),
+        output->type(),
+        output->stream(),
+        cudf::get_current_device_resource_ref());
+    output->stream().synchronize();
+    outputRows += hostOutput->size();
+    for (vector_size_t row = 0; row < hostOutput->size(); ++row) {
+      EXPECT_EQ(
+          hostOutput->childAt(0)->asFlatVector<int32_t>()->valueAt(row), 7);
+      outputSum +=
+          hostOutput->childAt(1)->asFlatVector<int64_t>()->valueAt(row);
+      outputCount +=
+          hostOutput->childAt(2)->asFlatVector<int64_t>()->valueAt(row);
+    }
+  }
+  EXPECT_TRUE(groupby.isFinished());
+  EXPECT_EQ(outputRows, 1);
+  EXPECT_EQ(outputSum, 21);
+  EXPECT_EQ(outputCount, 21);
+
+  const auto opStats = groupby.stats(false);
+  const auto statSum = [&](std::string_view name) {
+    const auto it = opStats.runtimeStats.find(std::string(name));
+    return it == opStats.runtimeStats.end() ? 0 : it->second.sum;
+  };
+  EXPECT_GT(statSum("cudfFinalAggregationCollectionGrows"), 0);
+  EXPECT_GT(statSum("cudfFinalAggregationCollectionSealedRuns"), 0);
+  EXPECT_GT(statSum("cudfFinalAggregationHashRepartitions"), 0);
+  EXPECT_GE(statSum("cudfFinalAggregationSkewCompactions"), 2);
+  EXPECT_EQ(statSum("cudfFinalAggregationSkewGuards"), 0);
+  EXPECT_LE(
+      opStats.runtimeStats.at("cudfFinalAggregationMaxCompactionInputRows").max,
+      kMaxBucketRows);
+  EXPECT_LE(
+      opStats.runtimeStats.at("cudfFinalAggregationMaxCompactionWorkBytes").max,
+      opStats.runtimeStats.at("cudfFinalAggregationBucketTargetBytes").max);
+  EXPECT_EQ(
+      statSum("cudfFinalAggregationHostParkedRows"),
+      statSum("cudfFinalAggregationHostRestoredRows"));
+  EXPECT_EQ(
+      statSum("cudfFinalAggregationHostParkedBytes"),
+      statSum("cudfFinalAggregationHostRestoredBytes"));
+  groupby.close();
 }
 
 TEST_F(AggregationTest, closeReleasesPendingFinalAggregationState) {

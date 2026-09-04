@@ -1110,6 +1110,11 @@ TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
+      finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum)
+      << "Collection must park each partitioned decimal row once rather than "
+         "re-aggregating and re-parking growing buckets";
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1);
 }

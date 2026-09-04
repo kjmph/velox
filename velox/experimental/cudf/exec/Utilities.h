@@ -88,6 +88,10 @@ namespace facebook::velox::cudf_velox {
  * @return Vector of concatenated tables (multiple if input exceeded size
  * limits)
  *
+ * Input ownership is released one output batch at a time after stream-safe
+ * deallocation ordering has been established. An individually oversized
+ * input remains alive until the batch containing its final slice is submitted.
+ *
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::table>>
 getConcatenatedTableBatched(

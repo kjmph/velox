@@ -18,14 +18,18 @@
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
 #include <utility>
 
@@ -36,6 +40,11 @@ using namespace facebook::velox::cudf_velox;
 
 class CudfBatchConcatTest : public OperatorTestBase {
  protected:
+  static void SetUpTestCase() {
+    OperatorTestBase::SetUpTestCase();
+    common::testutil::TestValue::enable();
+  }
+
   void SetUp() override {
     OperatorTestBase::SetUp();
     CudfConfig::getInstance().debugEnabled = true;
@@ -94,6 +103,80 @@ class CudfBatchConcatTest : public OperatorTestBase {
     return std::pair{opIt->second->inputVectors, opIt->second->outputVectors};
   }
 };
+
+DEBUG_ONLY_TEST_F(CudfBatchConcatTest, releasesInputOwnersByOutputBatch) {
+  constexpr vector_size_t kRowsPerInput = 10;
+  constexpr vector_size_t kMaxRows = 10;
+  updateCudfConfig(/*min=*/100, /*max=*/kMaxRows);
+
+  auto stream = cudfGlobalStreamPool().get_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto type = ROW({BIGINT()});
+  std::vector<CudfVectorPtr> inputs;
+  std::vector<std::weak_ptr<CudfVector>> inputOwners;
+  for (int32_t batch = 0; batch < 3; ++batch) {
+    auto input = makeRowVector(
+        {makeFlatSequence<int64_t>(batch * kRowsPerInput, kRowsPerInput)});
+    auto table = with_arrow::toCudfTable(input, pool(), stream, mr);
+    auto cudfInput = std::make_shared<CudfVector>(
+        pool(), type, input->size(), std::move(table), stream);
+    inputOwners.push_back(cudfInput);
+    inputs.push_back(std::move(cudfInput));
+  }
+
+  std::vector<size_t> retainedInputs;
+  std::vector<size_t> expiredInputs;
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::getConcatenatedTableBatched::retainedInputBatchesAfterBatchRelease",
+      std::function<void(size_t*)>([&](size_t* retained) {
+        retainedInputs.push_back(*retained);
+        expiredInputs.push_back(
+            std::count_if(
+                inputOwners.begin(), inputOwners.end(), [](const auto& owner) {
+                  return owner.expired();
+                }));
+      }));
+
+  auto outputs =
+      getConcatenatedTableBatched(std::move(inputs), type, stream, mr);
+  EXPECT_EQ(outputs.size(), 3);
+  EXPECT_EQ(retainedInputs, std::vector<size_t>({2, 1, 0}));
+  EXPECT_EQ(expiredInputs, std::vector<size_t>({1, 2, 3}));
+}
+
+DEBUG_ONLY_TEST_F(CudfBatchConcatTest, retainsOversizedOwnerUntilFinalSlice) {
+  constexpr vector_size_t kInputRows = 10;
+  constexpr vector_size_t kMaxRows = 4;
+  updateCudfConfig(/*min=*/100, /*max=*/kMaxRows);
+
+  auto input = makeRowVector({makeFlatSequence<int64_t>(0, kInputRows)});
+  auto stream = cudfGlobalStreamPool().get_stream();
+  const auto mr = cudf::get_current_device_resource_ref();
+  auto table = with_arrow::toCudfTable(input, pool(), stream, mr);
+  auto cudfInput = std::make_shared<CudfVector>(
+      pool(), input->type(), input->size(), std::move(table), stream);
+  std::weak_ptr<CudfVector> inputOwner = cudfInput;
+  std::vector<CudfVectorPtr> inputs;
+  inputs.push_back(std::move(cudfInput));
+
+  std::vector<size_t> retainedInputs;
+  std::vector<bool> ownerExpired;
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::getConcatenatedTableBatched::retainedInputBatchesAfterBatchRelease",
+      std::function<void(size_t*)>([&](size_t* retained) {
+        retainedInputs.push_back(*retained);
+        ownerExpired.push_back(inputOwner.expired());
+      }));
+
+  auto outputs =
+      getConcatenatedTableBatched(std::move(inputs), input->type(), stream, mr);
+  ASSERT_EQ(outputs.size(), 3);
+  EXPECT_EQ(outputs[0]->num_rows(), 4);
+  EXPECT_EQ(outputs[1]->num_rows(), 4);
+  EXPECT_EQ(outputs[2]->num_rows(), 2);
+  EXPECT_EQ(retainedInputs, std::vector<size_t>({1, 1, 0}));
+  EXPECT_EQ(ownerExpired, std::vector<bool>({false, false, true}));
+}
 
 TEST_F(CudfBatchConcatTest, rejectsZeroRowCpuInput) {
   auto input = makeRowVector({makeFlatVector<int32_t>(std::vector<int32_t>{})});

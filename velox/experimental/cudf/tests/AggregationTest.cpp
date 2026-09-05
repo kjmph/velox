@@ -1415,20 +1415,57 @@ TEST_F(AggregationTest, hashBucketedFinalAggregationAcrossInputBatches) {
       4 * kRowsPerBatch);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRuns").sum, 0);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationCollectionCompactions")
+          .sum,
+      0);
+  EXPECT_GE(
+      finalStats.customStats
+          .at("cudfFinalAggregationMaxCollectionCompactionLevel")
+          .max,
+      2)
+      << "A four-batch carry must promote reduced output beyond level one";
+  EXPECT_LE(
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionInputRows")
+          .sum,
+      4 * finalStats.customStats.at("cudfFinalAggregationDirectInputRows").sum)
+      << "Leveled carries must not repeatedly fold every new batch into "
+         "complete collection history";
+  EXPECT_LE(
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionOutputRows")
+          .sum,
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionInputRows")
+          .sum);
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredRows").sum);
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
-  EXPECT_EQ(
+  EXPECT_GE(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
       finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum)
-      << "Collection must park each partitioned row once rather than repeatedly "
-         "re-aggregating and re-parking growing buckets";
+      << "Collection compaction parks promoted outputs in addition to hash "
+         "partition outputs";
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationMaxHostParkedBytes").max,
       0);
+  EXPECT_EQ(
+      finalStats.customStats.at("cudfFinalAggregationCurrentHostPhysicalBytes")
+          .sum,
+      0);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationMaxHostPhysicalBytes").max,
+      0);
+  EXPECT_EQ(
+      finalStats.customStats
+          .at("cudfFinalAggregationHostPhysicalAllocatedBytes")
+          .sum,
+      finalStats.customStats.at("cudfFinalAggregationHostPhysicalReleasedBytes")
+          .sum);
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1)
       << "The cursor must drain more than one hash-bucket output batch";
@@ -1469,6 +1506,19 @@ TEST_F(AggregationTest, skewedFinalAggregationCompactsParkedRuns) {
   auto driver = Driver::testingCreate(std::move(driverCtx));
   cudf_velox::CudfGroupby groupby(0, driverCtxPtr, finalAggregation);
   groupby.initialize();
+
+#ifndef NDEBUG
+  uint64_t observedHostPrecharges = 0;
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::cudf_velox::CudfGroupby::"
+      "parkFinalAggregationState::afterHostPrecharge",
+      std::function<void(memory::MemoryPool*)>([&](auto* chargedPool) {
+        EXPECT_EQ(chargedPool, groupby.pool());
+        EXPECT_GT(chargedPool->usedBytes(), 0)
+            << "Arrow host allocation must happen only after pool admission";
+        ++observedHostPrecharges;
+      }));
+#endif
 
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
   auto makeState = [&](vector_size_t rows) {
@@ -1540,7 +1590,18 @@ TEST_F(AggregationTest, skewedFinalAggregationCompactsParkedRuns) {
     return it == opStats.runtimeStats.end() ? 0 : it->second.sum;
   };
   EXPECT_GT(statSum("cudfFinalAggregationCollectionGrows"), 0);
+  EXPECT_GT(statSum("cudfFinalAggregationCollectionCompactions"), 0);
+  EXPECT_GT(
+      statSum("cudfFinalAggregationCollectionCompactionInputRows"),
+      statSum("cudfFinalAggregationCollectionCompactionOutputRows"));
   EXPECT_GT(statSum("cudfFinalAggregationCollectionSealedRuns"), 0);
+  EXPECT_GT(
+      opStats.runtimeStats
+          .at("cudfFinalAggregationMaxCollectionCompactionLevel")
+          .max,
+      0)
+      << "Collection compaction must promote its output to a persistent "
+         "generation";
   EXPECT_GT(statSum("cudfFinalAggregationHashRepartitions"), 0);
   EXPECT_GE(statSum("cudfFinalAggregationSkewCompactions"), 2);
   EXPECT_EQ(statSum("cudfFinalAggregationSkewGuards"), 0);
@@ -1556,6 +1617,26 @@ TEST_F(AggregationTest, skewedFinalAggregationCompactsParkedRuns) {
   EXPECT_EQ(
       statSum("cudfFinalAggregationHostParkedBytes"),
       statSum("cudfFinalAggregationHostRestoredBytes"));
+  EXPECT_EQ(statSum("cudfFinalAggregationCurrentHostPhysicalBytes"), 0);
+  EXPECT_GT(statSum("cudfFinalAggregationMaxHostPhysicalBytes"), 0);
+  EXPECT_EQ(
+      statSum("cudfFinalAggregationHostPhysicalAllocatedBytes"),
+      statSum("cudfFinalAggregationHostPhysicalReleasedBytes"));
+  const auto poolStats = groupby.pool()->stats();
+  EXPECT_GT(poolStats.numExternalAllocs, 0);
+  EXPECT_EQ(poolStats.numExternalAllocs, poolStats.numExternalFrees);
+  EXPECT_EQ(
+      poolStats.numExternalAllocs,
+      statSum("cudfFinalAggregationHostParkedRuns"))
+      << "Hash-bucket slices sharing one Arrow owner must share one external "
+         "allocation charge";
+#ifndef NDEBUG
+  EXPECT_EQ(observedHostPrecharges, poolStats.numExternalAllocs);
+#endif
+  EXPECT_GT(poolStats.cumulativeExternalBytes, 0);
+  EXPECT_EQ(
+      poolStats.cumulativeExternalBytes,
+      statSum("cudfFinalAggregationHostParkedBytes"));
   groupby.close();
 }
 

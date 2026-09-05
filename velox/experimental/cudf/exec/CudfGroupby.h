@@ -174,9 +174,42 @@ class CudfGroupby : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  struct FinalAggregationHostAccounting {
+    uint64_t currentPhysicalBytes{0};
+    uint64_t maxPhysicalBytes{0};
+    uint64_t allocatedPhysicalBytes{0};
+    uint64_t releasedPhysicalBytes{0};
+  };
+
+  struct FinalAggregationHostAllocation {
+    FinalAggregationHostAllocation(
+        std::shared_ptr<FinalAggregationHostAccounting> accounting,
+        memory::MemoryPool* pool,
+        uint64_t physicalBytes,
+        uint64_t externalBytes);
+
+    ~FinalAggregationHostAllocation();
+
+    const std::shared_ptr<FinalAggregationHostAccounting> accounting;
+    // Tokens are private to the operator. They are destroyed when doClose()
+    // clears parked state, or with derived members before Operator (and its
+    // task-owned leaf pool) is destroyed.
+    memory::MemoryPool* const pool;
+    const uint64_t physicalBytes;
+    const uint64_t externalBytes;
+  };
+
   struct ParkedFinalAggregationState {
+    // All slices of one materialized host run share this token. The token is
+    // released only after the final slice drops its RowVector backing.
+    std::shared_ptr<FinalAggregationHostAllocation> hostAllocation;
     RowVectorPtr state;
     uint64_t deviceBytes{0};
+    // A collection compaction promotes every output regardless of how much
+    // duplicate reduction changed its physical size. This gives the run a
+    // stable LSM-style generation and prevents it from being rewritten again
+    // at the same level.
+    uint32_t collectionLevel{0};
   };
 
   struct FinalAggregationBucket {
@@ -185,6 +218,12 @@ class CudfGroupby : public CudfOperatorBase {
     uint64_t rows{0};
     uint64_t bytes{0};
     uint32_t hashDepth{0};
+    // If two peers at one generation cannot fit the GPU work envelope, stop
+    // collection-time compaction for this key domain. Drain-time recursive
+    // partitioning still bounds device work, and host-pool admission turns
+    // irreducible growth into a controlled query failure instead of an OOM
+    // kill.
+    bool collectionCompactionDisabled{false};
 
     bool empty() const {
       return states.empty() && parkedStates.empty();
@@ -225,18 +264,24 @@ class CudfGroupby : public CudfOperatorBase {
   void startFinalAggregationCollection(bool projectAggregationInputs);
   void collectFinalAggregationState(
       CudfVectorPtr state,
-      bool projectAggregationInputs);
-  void routeFinalAggregationState(CudfVectorPtr state);
+      bool projectAggregationInputs,
+      uint32_t collectionLevel = 0);
+  void routeFinalAggregationState(
+      CudfVectorPtr state,
+      uint32_t collectionLevel);
   void routeFinalAggregationBucket(FinalAggregationBucket&& bucket);
   void collectFinalAggregationSlice(
       CudfVectorPtr state,
-      bool projectAggregationInputs);
+      bool projectAggregationInputs,
+      uint32_t collectionLevel);
+  void compactFinalAggregationCollectionBucket(size_t bucketIndex);
   void growFinalAggregationCollection();
   CudfVectorPtr finalizeCollectedGroupbyStates();
   void recordFinalAggregationCompactionInput(
       uint64_t inputRows,
       uint64_t inputBytes);
   void recordFinalAggregationRetainedState();
+  void recordFinalAggregationHostPhysicalBytes();
   ParkedFinalAggregationState parkFinalAggregationState(CudfVectorPtr state);
   CudfVectorPtr restoreFinalAggregationState(
       ParkedFinalAggregationState state,
@@ -353,6 +398,11 @@ class CudfGroupby : public CudfOperatorBase {
   bool finalAggregationCollecting_{false};
   uint32_t finalAggregationCollectionFanout_{0};
   uint32_t finalAggregationCollectionHashSeed_{0};
+  // Kept independently of this operator so allocation tokens remain safe to
+  // destroy during exception unwinding and member teardown.
+  std::shared_ptr<FinalAggregationHostAccounting>
+      finalAggregationHostAccounting_{
+          std::make_shared<FinalAggregationHostAccounting>()};
   std::vector<FinalAggregationBucket> finalAggregationCollectionBuckets_;
   std::deque<FinalAggregationBucket> finalAggregationBuckets_;
   uint64_t finalAggregationHostParkedRows_{0};

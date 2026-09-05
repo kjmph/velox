@@ -1104,17 +1104,35 @@ TEST_F(CudfDecimalTest, decimalFinalHashBucketsMergeAcrossInputBatches) {
       finalStats.customStats.at("cudfFinalAggregationBucketOutputs").sum, 1);
   EXPECT_GT(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRuns").sum, 0);
+  EXPECT_GT(
+      finalStats.customStats.at("cudfFinalAggregationCollectionCompactions")
+          .sum,
+      0);
+  EXPECT_LE(
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionInputRows")
+          .sum,
+      4 * finalStats.customStats.at("cudfFinalAggregationDirectInputRows").sum)
+      << "Leveled carries must not repeatedly fold every new decimal batch "
+         "into complete collection history";
+  EXPECT_LE(
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionOutputRows")
+          .sum,
+      finalStats.customStats
+          .at("cudfFinalAggregationCollectionCompactionInputRows")
+          .sum);
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredRows").sum);
   EXPECT_EQ(
       finalStats.customStats.at("cudfFinalAggregationHostParkedBytes").sum,
       finalStats.customStats.at("cudfFinalAggregationHostRestoredBytes").sum);
-  EXPECT_EQ(
+  EXPECT_GE(
       finalStats.customStats.at("cudfFinalAggregationHostParkedRows").sum,
       finalStats.customStats.at("cudfFinalAggregationHashPartitionedRows").sum)
-      << "Collection must park each partitioned decimal row once rather than "
-         "re-aggregating and re-parking growing buckets";
+      << "Collection compaction parks promoted decimal outputs in addition to "
+         "hash partition outputs";
 
   EXPECT_GT(groupbyStats->second->outputVectors, 1);
 }

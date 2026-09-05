@@ -24,6 +24,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/HashAggregation.h"
@@ -39,6 +40,8 @@
 #include <cudf/reduction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+
+#include <folly/ScopeGuard.h>
 
 #include <algorithm>
 #include <limits>
@@ -938,6 +941,47 @@ std::unique_ptr<GroupbyAggregator> createGroupbyAggregator(
 
 namespace facebook::velox::cudf_velox {
 
+CudfGroupby::FinalAggregationHostAllocation::FinalAggregationHostAllocation(
+    std::shared_ptr<FinalAggregationHostAccounting> accounting,
+    memory::MemoryPool* pool,
+    uint64_t physicalBytes,
+    uint64_t externalBytes)
+    : accounting(std::move(accounting)),
+      pool(pool),
+      physicalBytes(physicalBytes),
+      externalBytes(externalBytes) {
+  VELOX_CHECK_NOT_NULL(this->accounting);
+  VELOX_CHECK_NOT_NULL(this->pool);
+  VELOX_CHECK_LE(this->externalBytes, this->physicalBytes);
+  VELOX_CHECK_LE(
+      this->externalBytes,
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  // parkFinalAggregationState reserves these bytes before allocating the
+  // Arrow backing. This token adopts that reservation and pairs its release
+  // with the physical backing's shared lifetime.
+  this->accounting->currentPhysicalBytes =
+      saturatedAdd(this->accounting->currentPhysicalBytes, this->physicalBytes);
+  this->accounting->maxPhysicalBytes = std::max(
+      this->accounting->maxPhysicalBytes,
+      this->accounting->currentPhysicalBytes);
+  this->accounting->allocatedPhysicalBytes = saturatedAdd(
+      this->accounting->allocatedPhysicalBytes, this->physicalBytes);
+}
+
+CudfGroupby::FinalAggregationHostAllocation::~FinalAggregationHostAllocation() {
+  // Allocation tokens can be destroyed by vector erasure, exception
+  // unwinding, or operator teardown. The RowVector member is destroyed before
+  // its token. The private token cannot escape the derived operator lifetime,
+  // so the task-owned leaf pool is also still valid here.
+  if (externalBytes > 0) {
+    pool->reportExternalFree(static_cast<int64_t>(externalBytes));
+  }
+  VELOX_DCHECK_GE(accounting->currentPhysicalBytes, physicalBytes);
+  accounting->currentPhysicalBytes -= physicalBytes;
+  accounting->releasedPhysicalBytes =
+      saturatedAdd(accounting->releasedPhysicalBytes, physicalBytes);
+}
+
 GroupbyAggregationRequestBuilder::GroupbyAggregationRequestBuilder(
     cudf::table_view const& tbl,
     std::vector<cudf::groupby::aggregation_request>& requests,
@@ -1729,10 +1773,13 @@ void CudfGroupby::recordFinalAggregationRetainedState() {
   uint64_t rows = 0;
   uint64_t bytes = 0;
   uint64_t runs = 0;
+  uint64_t disabledBuckets = 0;
   for (const auto& bucket : finalAggregationCollectionBuckets_) {
     rows = saturatedAdd(rows, bucket.rows);
     bytes = saturatedAdd(bytes, bucket.bytes);
     runs = saturatedAdd(runs, bucket.numStates());
+    disabledBuckets = saturatedAdd(
+        disabledBuckets, bucket.collectionCompactionDisabled ? 1 : 0);
   }
 
   auto lockedStats = stats_.wlock();
@@ -1743,6 +1790,40 @@ void CudfGroupby::recordFinalAggregationRetainedState() {
       RuntimeCounter(bytes, RuntimeCounter::Unit::kBytes));
   lockedStats->addRuntimeStat(
       "cudfFinalAggregationMaxRetainedRuns", RuntimeCounter(runs));
+  lockedStats->setRuntimeStat(
+      "cudfFinalAggregationCurrentCollectionCompactionDisabledBuckets",
+      RuntimeMetric(saturateCast(disabledBuckets)));
+}
+
+void CudfGroupby::recordFinalAggregationHostPhysicalBytes() {
+  VELOX_CHECK_NOT_NULL(finalAggregationHostAccounting_);
+  const auto& accounting = *finalAggregationHostAccounting_;
+  if (accounting.allocatedPhysicalBytes == 0) {
+    return;
+  }
+  auto lockedStats = stats_.wlock();
+  // These are gauges/totals, not samples. Replacing the metrics keeps the
+  // current value meaningful after a shared backing is finally released.
+  lockedStats->setRuntimeStat(
+      "cudfFinalAggregationCurrentHostPhysicalBytes",
+      RuntimeMetric(
+          saturateCast(accounting.currentPhysicalBytes),
+          RuntimeCounter::Unit::kBytes));
+  lockedStats->setRuntimeStat(
+      "cudfFinalAggregationMaxHostPhysicalBytes",
+      RuntimeMetric(
+          saturateCast(accounting.maxPhysicalBytes),
+          RuntimeCounter::Unit::kBytes));
+  lockedStats->setRuntimeStat(
+      "cudfFinalAggregationHostPhysicalAllocatedBytes",
+      RuntimeMetric(
+          saturateCast(accounting.allocatedPhysicalBytes),
+          RuntimeCounter::Unit::kBytes));
+  lockedStats->setRuntimeStat(
+      "cudfFinalAggregationHostPhysicalReleasedBytes",
+      RuntimeMetric(
+          saturateCast(accounting.releasedPhysicalBytes),
+          RuntimeCounter::Unit::kBytes));
 }
 
 CudfGroupby::ParkedFinalAggregationState CudfGroupby::parkFinalAggregationState(
@@ -1751,6 +1832,28 @@ CudfGroupby::ParkedFinalAggregationState CudfGroupby::parkFinalAggregationState(
   const auto rows = static_cast<uint64_t>(state->size());
   const auto deviceBytes = state->estimateFlatSize();
   auto stream = state->stream();
+
+  VELOX_CHECK_LE(
+      deviceBytes, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  uint64_t reportedExternalBytes = 0;
+  if (deviceBytes > 0) {
+    // Reserve before cudf::to_arrow_host allocates outside the Velox pool.
+    // This lets query arbitration reject or reclaim memory before malloc can
+    // drive a NUMA node into the kernel OOM killer.
+    pool()->reportExternalAllocation(static_cast<int64_t>(deviceBytes));
+    reportedExternalBytes = deviceBytes;
+  }
+  auto externalReservationGuard = folly::makeGuard([&]() {
+    if (reportedExternalBytes > 0) {
+      pool()->reportExternalFree(static_cast<int64_t>(reportedExternalBytes));
+    }
+  });
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfGroupby::"
+      "parkFinalAggregationState::afterHostPrecharge",
+      pool());
+
+  const auto hostPoolBytesBefore = pool()->usedBytes();
   auto hostState = with_arrow::toVeloxColumn(
       state->getTableView(),
       pool(),
@@ -1758,6 +1861,7 @@ CudfGroupby::ParkedFinalAggregationState CudfGroupby::parkFinalAggregationState(
       "",
       stream,
       get_temp_mr());
+  const auto hostPoolBytesAfter = pool()->usedBytes();
 
   // toVeloxColumn returns after its device-to-host copies complete. Publish
   // the device owner's stream-ordered frees before another driver asks the
@@ -1766,26 +1870,49 @@ CudfGroupby::ParkedFinalAggregationState CudfGroupby::parkFinalAggregationState(
   state.reset();
   stream.synchronize();
 
+  // cudf::to_arrow_host materializes every logical cuDF buffer with
+  // nanoarrow's allocator. Some of those buffers (for example string and list
+  // offsets) remain owned by the Arrow release callback but are not included
+  // in RowVector::retainedSize(). Keep the complete precharged deviceBytes as
+  // a conservative charge for that Arrow owner. Any buffers allocated by the
+  // Velox import are already charged through this leaf pool and are additional
+  // physical host memory.
+  const auto internallyAccountedBytes = static_cast<uint64_t>(
+      std::max<int64_t>(hostPoolBytesAfter - hostPoolBytesBefore, 0));
+  const auto externalBytes = deviceBytes;
+  const auto physicalBytes =
+      saturatedAdd(externalBytes, internallyAccountedBytes);
+
+  auto hostAllocation = std::make_shared<FinalAggregationHostAllocation>(
+      finalAggregationHostAccounting_, pool(), physicalBytes, externalBytes);
+  externalReservationGuard.dismiss();
+  reportedExternalBytes = 0;
+  ParkedFinalAggregationState parkedState{
+      std::move(hostAllocation), std::move(hostState), deviceBytes};
+
   finalAggregationHostParkedRows_ =
       saturatedAdd(finalAggregationHostParkedRows_, rows);
   finalAggregationHostParkedBytes_ =
       saturatedAdd(finalAggregationHostParkedBytes_, deviceBytes);
-  auto lockedStats = stats_.wlock();
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostParkedRuns", RuntimeCounter(1));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostParkedRows", RuntimeCounter(rows));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostParkedBytes",
-      RuntimeCounter(deviceBytes, RuntimeCounter::Unit::kBytes));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationMaxHostParkedRows",
-      RuntimeCounter(finalAggregationHostParkedRows_));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationMaxHostParkedBytes",
-      RuntimeCounter(
-          finalAggregationHostParkedBytes_, RuntimeCounter::Unit::kBytes));
-  return {std::move(hostState), deviceBytes};
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostParkedRuns", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostParkedRows", RuntimeCounter(rows));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostParkedBytes",
+        RuntimeCounter(deviceBytes, RuntimeCounter::Unit::kBytes));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationMaxHostParkedRows",
+        RuntimeCounter(finalAggregationHostParkedRows_));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationMaxHostParkedBytes",
+        RuntimeCounter(
+            finalAggregationHostParkedBytes_, RuntimeCounter::Unit::kBytes));
+  }
+  recordFinalAggregationHostPhysicalBytes();
+  return parkedState;
 }
 
 CudfVectorPtr CudfGroupby::restoreFinalAggregationState(
@@ -1806,19 +1933,23 @@ CudfVectorPtr CudfGroupby::restoreFinalAggregationState(
   auto table =
       with_arrow::toCudfTable(state.state, pool(), stream, get_temp_mr());
   state.state.reset();
+  state.hostAllocation.reset();
 
   VELOX_CHECK_GE(finalAggregationHostParkedRows_, rows);
   VELOX_CHECK_GE(finalAggregationHostParkedBytes_, state.deviceBytes);
   finalAggregationHostParkedRows_ -= rows;
   finalAggregationHostParkedBytes_ -= state.deviceBytes;
-  auto lockedStats = stats_.wlock();
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostRestoredRuns", RuntimeCounter(1));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostRestoredRows", RuntimeCounter(rows));
-  lockedStats->addRuntimeStat(
-      "cudfFinalAggregationHostRestoredBytes",
-      RuntimeCounter(state.deviceBytes, RuntimeCounter::Unit::kBytes));
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostRestoredRuns", RuntimeCounter(1));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostRestoredRows", RuntimeCounter(rows));
+    lockedStats->addRuntimeStat(
+        "cudfFinalAggregationHostRestoredBytes",
+        RuntimeCounter(state.deviceBytes, RuntimeCounter::Unit::kBytes));
+  }
+  recordFinalAggregationHostPhysicalBytes();
 
   return std::make_shared<CudfVector>(
       pool(),
@@ -1954,9 +2085,192 @@ void CudfGroupby::growFinalAggregationCollection() {
   recordFinalAggregationRetainedState();
 }
 
+void CudfGroupby::compactFinalAggregationCollectionBucket(size_t bucketIndex) {
+  VELOX_CHECK_LT(bucketIndex, finalAggregationCollectionBuckets_.size());
+  auto& bucket = finalAggregationCollectionBuckets_[bucketIndex];
+  VELOX_CHECK(
+      bucket.states.empty(),
+      "Final-aggregation collection buckets must remain parked between "
+      "admissions");
+  if (bucket.collectionCompactionDisabled) {
+    return;
+  }
+
+  constexpr size_t kNoRun = std::numeric_limits<size_t>::max();
+  constexpr size_t kNumLevels = std::numeric_limits<uint64_t>::digits;
+
+  for (;;) {
+    // Merge only peers from the same persistent generation. Every successful
+    // merge promotes its output even when duplicate reduction makes that
+    // output physically small, so no input row can participate more than once
+    // at each level. This is a binary LSM-style carry, not a size class that
+    // can be re-entered after reduction.
+    std::vector<std::pair<size_t, size_t>> levelRuns(
+        kNumLevels, {kNoRun, kNoRun});
+
+    for (size_t i = 0; i < bucket.parkedStates.size(); ++i) {
+      const auto& state = bucket.parkedStates[i];
+      VELOX_CHECK_NOT_NULL(state.state);
+      const auto level =
+          std::min<size_t>(state.collectionLevel, kNumLevels - 1);
+      auto& runs = levelRuns[level];
+      if (runs.first == kNoRun) {
+        runs.first = i;
+      } else if (runs.second == kNoRun) {
+        runs.second = i;
+      }
+    }
+
+    size_t inputLevel = 0;
+    std::vector<size_t> runIndices;
+    for (; inputLevel < levelRuns.size(); ++inputLevel) {
+      const auto& runs = levelRuns[inputLevel];
+      if (runs.second != kNoRun) {
+        runIndices = {runs.first, runs.second};
+        break;
+      }
+    }
+
+    if (runIndices.empty()) {
+      return;
+    }
+    if (inputLevel == kNumLevels - 1) {
+      // A fixed-width level counter cannot represent another strict
+      // promotion. This is unreachable for practical batch counts, but do not
+      // silently merge forever at the terminal level.
+      bucket.collectionCompactionDisabled = true;
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionDisables",
+          RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionLevelLimit",
+          RuntimeCounter(1));
+      return;
+    }
+
+    uint64_t inputRows = 0;
+    uint64_t inputBytes = 0;
+    for (const auto index : runIndices) {
+      const auto& state = bucket.parkedStates[index];
+      inputRows =
+          saturatedAdd(inputRows, static_cast<uint64_t>(state.state->size()));
+      inputBytes = saturatedAdd(inputBytes, state.deviceBytes);
+    }
+    if (inputRows > finalAggregationBucketTargetRows_ ||
+        finalAggregationWorkBytes(inputRows, inputBytes) >
+            finalAggregationBucketTargetBytes_) {
+      // The two individually bounded runs contain too much irreducible state
+      // to merge safely on this GPU. Do not rediscover the same failed carry
+      // on every later admission. The existing recursive drain path handles
+      // the sealed runs, while external host-memory admission ensures growth
+      // fails through the query pool rather than the kernel OOM killer.
+      bucket.collectionCompactionDisabled = true;
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionDisables",
+          RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionEnvelopeDisables",
+          RuntimeCounter(1));
+      return;
+    }
+
+    std::sort(runIndices.begin(), runIndices.end());
+    std::vector<ParkedFinalAggregationState> parkedStates;
+    parkedStates.reserve(runIndices.size());
+    for (const auto index : runIndices) {
+      auto& state = bucket.parkedStates[index];
+      parkedStates.push_back(std::move(state));
+    }
+    for (auto it = runIndices.rbegin(); it != runIndices.rend(); ++it) {
+      bucket.parkedStates.erase(bucket.parkedStates.begin() + *it);
+    }
+
+    VELOX_CHECK_GE(bucket.rows, inputRows);
+    VELOX_CHECK_GE(bucket.bytes, inputBytes);
+    bucket.rows -= inputRows;
+    bucket.bytes -= inputBytes;
+
+    recordFinalAggregationCompactionInput(inputRows, inputBytes);
+    auto stream = cudfGlobalStreamPool().get_stream();
+    std::vector<CudfVectorPtr> states;
+    states.reserve(parkedStates.size());
+    for (auto& state : parkedStates) {
+      states.push_back(restoreFinalAggregationState(std::move(state), stream));
+    }
+    auto result = aggregateGroupbyStates(
+        std::move(states),
+        false,
+        nullptr,
+        intermediateAggregators_,
+        bufferedResultType_);
+
+    uint64_t outputRows = 0;
+    uint64_t outputBytes = 0;
+    bool outputWasSplit = false;
+    if (result) {
+      auto outputStates = splitFinalAggregationState(std::move(result));
+      outputWasSplit = outputStates.size() > 1;
+      const auto outputLevel = static_cast<uint32_t>(inputLevel + 1);
+      for (auto& outputState : outputStates) {
+        const auto rows = static_cast<uint64_t>(outputState->size());
+        const auto bytes = outputState->estimateFlatSize();
+        outputRows = saturatedAdd(outputRows, rows);
+        outputBytes = saturatedAdd(outputBytes, bytes);
+        bucket.rows = saturatedAdd(bucket.rows, rows);
+        bucket.bytes = saturatedAdd(bucket.bytes, bytes);
+        auto parkedState = parkFinalAggregationState(std::move(outputState));
+        parkedState.collectionLevel = outputLevel;
+        bucket.parkedStates.push_back(std::move(parkedState));
+      }
+      if (outputWasSplit) {
+        // The siblings are disjoint slices of one already-reduced output.
+        // Recombining them cannot eliminate keys and can reconstruct the
+        // materialization that crossed the envelope. Leave them for recursive
+        // drain-time partitioning instead.
+        bucket.collectionCompactionDisabled = true;
+      }
+    }
+
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactions", RuntimeCounter(1));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionInputRows",
+          RuntimeCounter(inputRows));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionOutputRows",
+          RuntimeCounter(outputRows));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionInputBytes",
+          RuntimeCounter(inputBytes, RuntimeCounter::Unit::kBytes));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationCollectionCompactionOutputBytes",
+          RuntimeCounter(outputBytes, RuntimeCounter::Unit::kBytes));
+      lockedStats->addRuntimeStat(
+          "cudfFinalAggregationMaxCollectionCompactionLevel",
+          RuntimeCounter(inputLevel + 1));
+      if (outputWasSplit) {
+        lockedStats->addRuntimeStat(
+            "cudfFinalAggregationCollectionCompactionOutputSplits",
+            RuntimeCounter(1));
+        lockedStats->addRuntimeStat(
+            "cudfFinalAggregationCollectionCompactionDisables",
+            RuntimeCounter(1));
+      }
+    }
+    if (outputWasSplit) {
+      return;
+    }
+  }
+}
+
 void CudfGroupby::collectFinalAggregationSlice(
     CudfVectorPtr state,
-    bool projectAggregationInputs) {
+    bool projectAggregationInputs,
+    uint32_t collectionLevel) {
   VELOX_CHECK(finalAggregationCollecting_);
   VELOX_CHECK_NOT_NULL(state);
   VELOX_CHECK_LE(
@@ -1976,6 +2290,11 @@ void CudfGroupby::collectFinalAggregationSlice(
       0,
       incoming,
       true);
+  for (auto& bucket : incoming) {
+    for (auto& parkedState : bucket.parkedStates) {
+      parkedState.collectionLevel = collectionLevel;
+    }
+  }
 
   bool needsGrowth = false;
   for (size_t i = 0; i < incoming.size(); ++i) {
@@ -2024,9 +2343,12 @@ void CudfGroupby::collectFinalAggregationSlice(
       for (auto& incomingState : incomingBucket.parkedStates) {
         resident.parkedStates.push_back(std::move(incomingState));
       }
-      auto lockedStats = stats_.wlock();
-      lockedStats->addRuntimeStat(
-          "cudfFinalAggregationCollectionSealedRuns", RuntimeCounter(1));
+      {
+        auto lockedStats = stats_.wlock();
+        lockedStats->addRuntimeStat(
+            "cudfFinalAggregationCollectionSealedRuns", RuntimeCounter(1));
+      }
+      compactFinalAggregationCollectionBucket(i);
       continue;
     }
 
@@ -2040,30 +2362,36 @@ void CudfGroupby::collectFinalAggregationSlice(
       resident.parkedStates.push_back(std::move(incomingState));
     }
 
-    // Do not compact an accumulating bucket here. Folding each later input
-    // into a resident state repeatedly rewrites all previously collected rows.
-    // Retain disjoint parked runs and aggregate them once when this bounded
-    // bucket drains. Pre-admission fanout growth and recursive drain-time
-    // partitioning continue to enforce the row and workspace envelope.
+    // Merge only equal-generation runs. Unlike folding an arrival into the
+    // complete resident state, the persistent binary carry bounds rewrite
+    // amplification while still collapsing duplicate keys before they consume
+    // unbounded host memory. Pre-admission fanout growth and recursive
+    // drain-time partitioning continue to enforce the row and workspace
+    // envelope.
+    compactFinalAggregationCollectionBucket(i);
   }
   recordFinalAggregationRetainedState();
 }
 
 void CudfGroupby::collectFinalAggregationState(
     CudfVectorPtr state,
-    bool projectAggregationInputs) {
+    bool projectAggregationInputs,
+    uint32_t collectionLevel) {
   VELOX_CHECK(finalAggregationCollecting_);
   if (!state) {
     return;
   }
   auto slices = splitFinalAggregationState(std::move(state));
   for (auto& slice : slices) {
-    collectFinalAggregationSlice(std::move(slice), projectAggregationInputs);
+    collectFinalAggregationSlice(
+        std::move(slice), projectAggregationInputs, collectionLevel);
   }
 }
 
-void CudfGroupby::routeFinalAggregationState(CudfVectorPtr state) {
-  collectFinalAggregationState(std::move(state), false);
+void CudfGroupby::routeFinalAggregationState(
+    CudfVectorPtr state,
+    uint32_t collectionLevel) {
+  collectFinalAggregationState(std::move(state), false, collectionLevel);
 }
 
 void CudfGroupby::routeFinalAggregationBucket(FinalAggregationBucket&& bucket) {
@@ -2074,8 +2402,10 @@ void CudfGroupby::routeFinalAggregationBucket(FinalAggregationBucket&& bucket) {
   auto parkedStates = std::move(bucket.parkedStates);
   auto restoreStream = cudfGlobalStreamPool().get_stream();
   for (auto& state : parkedStates) {
+    const auto collectionLevel = state.collectionLevel;
     routeFinalAggregationState(
-        restoreFinalAggregationState(std::move(state), restoreStream));
+        restoreFinalAggregationState(std::move(state), restoreStream),
+        collectionLevel);
   }
 }
 
@@ -2301,6 +2631,9 @@ void CudfGroupby::hashPartitionFinalState(
       };
       auto parkedPartitioned =
           parkFinalAggregationState(std::move(partitioned));
+      // Declare the allocation before hostRun so exception unwinding releases
+      // the RowVector backing before reporting the paired external free.
+      auto hostAllocation = std::move(parkedPartitioned.hostAllocation);
       auto hostRun = std::move(parkedPartitioned.state);
 
       for (uint32_t bucketIndex = 0; bucketIndex < numBuckets; ++bucketIndex) {
@@ -2319,7 +2652,8 @@ void CudfGroupby::hashPartitionFinalState(
         bucket.rows = saturatedAdd(bucket.rows, bucketRows);
         bucket.bytes = saturatedAdd(bucket.bytes, bucketBytes);
         bucket.hashDepth = hashDepth;
-        bucket.parkedStates.push_back({std::move(hostSlice), bucketBytes});
+        bucket.parkedStates.push_back(
+            {hostAllocation, std::move(hostSlice), bucketBytes});
       }
       continue;
     }
@@ -2680,6 +3014,7 @@ CudfVectorPtr CudfGroupby::finalizeCollectedGroupbyStates() {
   }
   finalAggregationCollectionBuckets_.clear();
   finalAggregationCollecting_ = false;
+  recordFinalAggregationRetainedState();
 
   {
     auto lockedStats = stats_.wlock();
@@ -3073,6 +3408,9 @@ void CudfGroupby::doClose() {
   pendingGroupbyStates_.clear();
   finalAggregationCollectionBuckets_.clear();
   finalAggregationBuckets_.clear();
+  finalAggregationHostParkedRows_ = 0;
+  finalAggregationHostParkedBytes_ = 0;
+  recordFinalAggregationHostPhysicalBytes();
   pendingPartialResult_.reset();
   bufferedResult_.reset();
   aggregators_.clear();

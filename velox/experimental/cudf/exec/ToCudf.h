@@ -19,6 +19,8 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
+#include <functional>
+
 namespace facebook::velox::cudf_velox {
 
 class CompileState {
@@ -37,9 +39,25 @@ class CompileState {
   // cuDF equivalents. Returns true if the Driver was changed.
   bool compile(bool allow_cpu_fallback);
 
+  // Swaps a trailing [CudfToVelox, PartitionedOutput] for a sink that takes
+  // cuDF vectors, when a factory is registered. Returns true if it did.
+  bool replaceGpuOutputSink();
+
   const exec::DriverFactory& driverFactory_;
   exec::Driver& driver_;
 };
+
+/// Builds an output operator that takes cuDF vectors directly, for the sink of
+/// a driver whose chain ends on the GPU.
+using GpuOutputSinkFactory = std::function<std::unique_ptr<exec::Operator>(
+    int32_t operatorId,
+    exec::DriverCtx* ctx,
+    const core::PlanNodePtr& planNode,
+    uint32_t numTotalDrivers)>;
+
+/// Registers a factory for the sink above. Without one, a cuDF chain feeding a
+/// PartitionedOutput ends in CudfToVelox.
+void registerGpuOutputSinkFactory(GpuOutputSinkFactory factory);
 
 /// Registers adapter to add cuDF operators to Drivers.
 void registerCudf();

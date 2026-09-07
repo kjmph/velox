@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <folly/io/IOBuf.h>
 #include <rmm/cuda_stream_view.hpp>
 #include <algorithm>
 #include <cinttypes>
@@ -26,24 +27,71 @@
 
 namespace facebook::velox::ucx_exchange {
 
-/// Struct that bundles a packed_table with the CUDA stream that was used
-/// to allocate its memory. This allows the receiver to reuse the same stream
-/// for subsequent operations on the data.
+/// A received table plus its stream, held either as an owning packed_table or
+/// as a view plus whatever keeps it alive.
 struct PackedTableWithStream {
   std::unique_ptr<cudf::packed_table> packedTable;
+
+  // Set instead of 'packedTable' for the borrowed form.
+  cudf::table_view borrowedTable;
+  std::shared_ptr<void> borrowedOwner;
+  size_t borrowedBytes{0};
+
+  // Set instead of either table form when the payload arrived as host bytes.
+  // The exchange operator deserializes and uploads it.
+  std::unique_ptr<folly::IOBuf> hostPage;
+
   rmm::cuda_stream_view stream;
   int32_t numRows{0};
 
   PackedTableWithStream() = default;
+
   PackedTableWithStream(
       std::unique_ptr<cudf::packed_table>&& table,
       rmm::cuda_stream_view s,
       int32_t rows)
       : packedTable(std::move(table)), stream(s), numRows(rows) {}
 
-  /// Returns the size of the GPU data buffer, or 0 if packedTable is null.
+  PackedTableWithStream(
+      std::unique_ptr<folly::IOBuf>&& page,
+      rmm::cuda_stream_view s,
+      int32_t rows)
+      : hostPage(std::move(page)), stream(s), numRows(rows) {}
+
+  PackedTableWithStream(
+      cudf::table_view table,
+      std::shared_ptr<void> owner,
+      size_t bytes,
+      rmm::cuda_stream_view s,
+      int32_t rows)
+      : borrowedTable(table),
+        borrowedOwner(std::move(owner)),
+        borrowedBytes(bytes),
+        stream(s),
+        numRows(rows) {}
+
+  bool owns() const {
+    return packedTable != nullptr;
+  }
+
+  bool isHostPage() const {
+    return hostPage != nullptr;
+  }
+
+  cudf::table_view table() const {
+    return owns() ? packedTable->table : borrowedTable;
+  }
+
+  /// Bytes this holds, whichever form it is in. The queue charges and releases
+  /// receive accounting by this number.
   size_t gpuDataSize() const {
-    return packedTable ? packedTable->data.gpu_data->size() : 0;
+    if (owns()) {
+      return packedTable->data.gpu_data->size();
+    }
+    if (isHostPage()) {
+      return hostPage->computeChainDataLength();
+    }
+    return borrowedBytes;
   }
 };
 

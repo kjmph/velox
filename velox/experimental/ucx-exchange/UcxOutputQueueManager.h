@@ -256,11 +256,11 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
 
   std::string toString(const std::string& taskId) override;
 
- private:
-  // Retrieves the queue for a task if it exists.
-  // Returns NULL if task not found.
+  /// Retrieves the queue for a task if it exists, or NULL. Public because
+  /// useDynamicUcx() registers the task elsewhere.
   std::shared_ptr<UcxOutputQueue> getQueueIfExists(std::string_view taskId);
 
+ private:
   // Retrieves the queue for a task if it exists. Returns NULL only when the
   // task is known to have been removed; unknown task IDs still fail fast.
   std::shared_ptr<UcxOutputQueue> getQueueIfActive(std::string_view taskId);

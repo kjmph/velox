@@ -174,10 +174,11 @@ class UcxCpuRowMergeExchangeSource : public exec::MergeSource {
       const std::string& taskId,
       int destination)
       : mergeExchange_(mergeExchange),
-        client_(std::make_shared<UcxCpuRowExchangeClient>(
-            mergeExchange->taskId(),
-            destination,
-            1)) {
+        client_(
+            std::make_shared<UcxCpuRowExchangeClient>(
+                mergeExchange->taskId(),
+                destination,
+                1)) {
     client_->addRemoteTaskId(taskId);
     client_->noMoreRemoteTasks();
   }
@@ -361,8 +362,9 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         }
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
-      replacement.push_back(std::make_unique<UcxCpuRowExchange>(
-          op->operatorId(), ctx, exchangeNode, client));
+      replacement.push_back(
+          std::make_unique<UcxCpuRowExchange>(
+              op->operatorId(), ctx, exchangeNode, client));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       replacedAny = true;

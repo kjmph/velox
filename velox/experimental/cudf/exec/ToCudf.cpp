@@ -68,6 +68,56 @@ core::PlanNodePtr CompileState::getPlanNode(const core::PlanNodeId& id) const {
   return driverFactory_.consumerNode;
 }
 
+namespace {
+GpuOutputSinkFactory& gpuOutputSinkFactory() {
+  static GpuOutputSinkFactory factory;
+  return factory;
+}
+} // namespace
+
+void registerGpuOutputSinkFactory(GpuOutputSinkFactory factory) {
+  gpuOutputSinkFactory() = std::move(factory);
+}
+
+// Replaces a trailing [CudfToVelox, PartitionedOutput] with a sink that takes
+// cuDF vectors directly. The pair only exists when the chain ended on the GPU.
+bool CompileState::replaceGpuOutputSink() {
+  auto& factory = gpuOutputSinkFactory();
+  if (!factory || !driverFactory_.outputDriver) {
+    return false;
+  }
+  auto operators = driver_.operators();
+  if (operators.size() < 2) {
+    return false;
+  }
+  auto* sink = operators.back();
+  auto* toVelox = operators[operators.size() - 2];
+  if (toVelox->operatorType() != "CudfToVelox" ||
+      sink->operatorType() != "PartitionedOutput") {
+    return false;
+  }
+  auto planNode = getPlanNode(sink->planNodeId());
+  if (planNode == nullptr) {
+    return false;
+  }
+  auto replacement = factory(
+      sink->operatorId(),
+      driver_.driverCtx(),
+      planNode,
+      driverFactory_.numTotalDrivers);
+  if (replacement == nullptr) {
+    return false;
+  }
+  std::vector<std::unique_ptr<exec::Operator>> replaceOp;
+  replaceOp.push_back(std::move(replacement));
+  [[maybe_unused]] auto replaced = driverFactory_.replaceOperators(
+      driver_,
+      static_cast<int32_t>(operators.size()) - 2,
+      static_cast<int32_t>(operators.size()),
+      std::move(replaceOp));
+  return true;
+}
+
 bool CompileState::compile(bool allowCpuFallback) {
   auto operators = driver_.operators();
 
@@ -270,6 +320,8 @@ bool CompileState::compile(bool allowCpuFallback) {
                 << op->toString();
     }
   }
+
+  replacementsMade |= replaceGpuOutputSink();
 
   return replacementsMade;
 }

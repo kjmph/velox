@@ -15,6 +15,10 @@
  */
 #include "velox/experimental/ucx-exchange/UcxCudfDriverAdapter.h"
 
+#include "velox/exec/PartitionedOutput.h"
+#include "velox/experimental/ucx-exchange/DynamicUcxTransport.h"
+#include "velox/experimental/ucx-exchange/ExchangeFormatRegistry.h"
+
 #include <glog/logging.h>
 #include <atomic>
 #include <cstdint>
@@ -27,6 +31,7 @@
 #include <utility>
 
 #include "velox/core/PlanNode.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/Merge.h"
@@ -34,6 +39,7 @@
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
@@ -91,6 +97,24 @@ bool canUseCudfUcxExchange() {
         << "[CUDF-UCX] cudf.exchange is enabled, but the startup communicator "
            "is not running; keeping standard exchange operators";
   });
+  return false;
+}
+
+// Whether this pipeline's output node names the UCX transport, which decides
+// how its output operator was built.
+bool namesUcxOutput(const exec::DriverFactory& factory) {
+  for (const auto& node : factory.planNodes) {
+    if (const auto* outputNode =
+            dynamic_cast<const core::PartitionedOutputNode*>(node.get())) {
+      if (outputNode->transportKind() == core::TransportKind::kUcx) {
+        return true;
+      }
+    }
+  }
+  if (const auto* outputNode = dynamic_cast<const core::PartitionedOutputNode*>(
+          factory.consumerNode.get())) {
+    return outputNode->transportKind() == core::TransportKind::kUcx;
+  }
   return false;
 }
 
@@ -182,6 +206,56 @@ std::shared_ptr<UcxExchangeClient> getOrCreateExchangeClient(
   return client;
 }
 
+// Mirrors the rule in LocalPlanner: a partial limit upstream means flush
+// early.
+
+bool eagerFlush(const core::PlanNode& node) {
+  if (const auto* limit = dynamic_cast<const core::LimitNode*>(&node)) {
+    return limit->isPartial() && limit->offset() + limit->count() < 10'000;
+  }
+  if (node.sources().empty()) {
+    return false;
+  }
+  return eagerFlush(*node.sources()[0]);
+}
+
+std::unique_ptr<exec::Operator> makeGpuOutputSink(
+    int32_t operatorId,
+    exec::DriverCtx* ctx,
+    const core::PlanNodePtr& planNode,
+    uint32_t numTotalDrivers) {
+  if (!useDynamicUcx() || !canUseCudfUcxExchange()) {
+    return nullptr;
+  }
+  auto outputNode =
+      std::dynamic_pointer_cast<const core::PartitionedOutputNode>(planNode);
+  if (outputNode == nullptr) {
+    return nullptr;
+  }
+
+  const auto& taskId = ctx->task->taskId();
+  ExchangeFormatRegistry::instance().trackTask(taskId);
+
+  auto queueManager = UcxOutputQueueManager::getInstanceRef();
+  if (ctx->driverId == 0 && queueManager->getQueueIfExists(taskId) == nullptr) {
+    queueManager->initializeTask(
+        ctx->task,
+        outputNode->kind(),
+        outputNode->numPartitions(),
+        numTotalDrivers);
+  }
+
+  // always sink into UcxPartitionedOutput which can render Presto
+  // to any downstream Exchange automatically.
+
+  return std::make_unique<UcxPartitionedOutput>(
+      operatorId,
+      ctx,
+      outputNode,
+      eagerFlush(*outputNode),
+      std::move(queueManager));
+}
+
 bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
   const auto& config = cudf_velox::CudfConfig::getInstance();
   if (!config.enabled || !config.exchange) {
@@ -189,6 +263,14 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
   }
 
   auto* ctx = driver.driverCtx();
+
+  if (useDynamicUcx() &&
+      !ctx->queryConfig().get<bool>(
+          cudf_velox::CudfConfig::kCudfEnabled, config.enabled) &&
+      !namesUcxOutput(factory)) {
+    return false;
+  }
+
   auto operators = driver.operators();
 
   for (int32_t i = static_cast<int32_t>(operators.size()) - 1; i >= 0; --i) {
@@ -201,7 +283,10 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       auto planNode = findPlanNode(factory, op->planNodeId());
       auto mergeExchangeNode =
           std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
-      if (!mergeExchangeNode || !usesUcxTransport(*mergeExchangeNode)) {
+      if (!mergeExchangeNode) {
+        continue;
+      }
+      if (!useDynamicUcx() && !usesUcxTransport(*mergeExchangeNode)) {
         continue;
       }
 
@@ -209,14 +294,48 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
-      replacement.push_back(std::make_unique<UcxExchange>(
-          op->operatorId(), ctx, mergeExchangeNode, nullptr));
-      replacement.push_back(std::make_unique<cudf_velox::CudfOrderBy>(
-          op->operatorId(), ctx, mergeExchangeNode));
+      replacement.push_back(
+          std::make_unique<UcxExchange>(
+              op->operatorId(), ctx, mergeExchangeNode, nullptr));
+      replacement.push_back(
+          std::make_unique<cudf_velox::CudfOrderBy>(
+              op->operatorId(), ctx, mergeExchangeNode));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       VLOG(1) << "[CUDF-UCX] replacing MergeExchange at index " << i
               << " (planNodeId=" << op->planNodeId() << ")";
+      continue;
+    }
+
+    if (useDynamicUcx() && op->operatorType() == "cudfPartitionedOutput") {
+      // dynamicUcx shuffle format needs to track this task
+      // this block is only here to support the case where the transportKind is
+      // set to Ucx and could go away if we remove transportKind
+
+      auto planNode = findPlanNode(factory, op->planNodeId());
+      auto outputNode =
+          std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+              planNode);
+
+      ExchangeFormatRegistry::instance().trackTask(op->taskId());
+
+      auto bufferManager = exec::DefaultOutputBufferManager::getInstanceRef();
+      if (outputNode != nullptr && ctx->driverId == 0 &&
+          bufferManager->getBufferIfExists(op->taskId()) == nullptr) {
+        // updateOutputBuffers goes to the manager kUcx named, not to this
+        // buffer, so a broadcast task would never finish.
+
+        VELOX_USER_CHECK(
+            outputNode->kind() != core::PartitionedOutputNode::Kind::kBroadcast,
+            "A broadcast plan cannot name the '{}' transport while transport "
+            "discovery is on; leave transportKind unset",
+            core::TransportKind::kUcx);
+        bufferManager->initializeTask(
+            ctx->task,
+            outputNode->kind(),
+            outputNode->numPartitions(),
+            factory.numTotalDrivers);
+      }
       continue;
     }
 
@@ -225,7 +344,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
       auto planNode = findPlanNode(factory, op->planNodeId());
       auto exchangeNode =
           std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
-      if (!exchangeNode || !usesUcxTransport(*exchangeNode)) {
+      if (!exchangeNode) {
+        continue;
+      }
+      // Chosen because this is a cuDF plan, not because the plan named a
+      // transport. Whether the peer speaks UCX is settled when it connects.
+      if (!useDynamicUcx() && !usesUcxTransport(*exchangeNode)) {
         continue;
       }
 
@@ -233,11 +357,12 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
         continue;
       }
       std::vector<std::unique_ptr<exec::Operator>> replacement;
-      replacement.push_back(std::make_unique<UcxExchange>(
-          op->operatorId(),
-          ctx,
-          exchangeNode,
-          getOrCreateExchangeClient(exchangeOp, op, ctx)));
+      replacement.push_back(
+          std::make_unique<UcxExchange>(
+              op->operatorId(),
+              ctx,
+              exchangeNode,
+              getOrCreateExchangeClient(exchangeOp, op, ctx)));
       [[maybe_unused]] auto replaced =
           factory.replaceOperators(driver, i, i + 1, std::move(replacement));
       VLOG(1) << "[CUDF-UCX] replacing Exchange at index " << i
@@ -246,8 +371,6 @@ bool adaptDriver(const exec::DriverFactory& factory, exec::Driver& driver) {
     }
   }
 
-  // Return false intentionally: the cuDF adapter must still run after this
-  // pass to replace compute operators around the UCX exchange boundary.
   return false;
 }
 
@@ -271,6 +394,7 @@ bool startCudfUcxExchange() {
   // Register the receive adapter before advertising the output transport.
   registerCudfUcxDriverAdapter();
   registerCudfUcxOutputTransport();
+  cudf_velox::registerGpuOutputSinkFactory(&makeGpuOutputSink);
 
   std::call_once(communicatorStartedFlag, [&config]() {
     const auto port = static_cast<uint16_t>(config.exchangeServerPort);
@@ -304,11 +428,14 @@ void registerCudfUcxDriverAdapter() {
     return;
   }
 
+  // Front rather than appended: ToCudf places the host/device boundary from
+  // the operators it sees, so it must see these already substituted.
   exec::DriverAdapter adapter{
       std::string(kAdapterLabel),
       /*inspect=*/{},
       &adaptDriver};
-  exec::DriverFactory::registerAdapter(std::move(adapter));
+  exec::DriverFactory::adapters.insert(
+      exec::DriverFactory::adapters.begin(), std::move(adapter));
   LOG(INFO) << "[CUDF-UCX] DriverAdapter registered";
 }
 

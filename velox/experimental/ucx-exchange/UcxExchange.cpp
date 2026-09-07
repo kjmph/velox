@@ -14,7 +14,17 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchange.h"
+
+#include <folly/ScopeGuard.h>
+#include <rmm/cuda_stream_view.hpp>
+
+#include "velox/exec/SerializedPage.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/serializers/PrestoSerializer.h"
+#include "velox/vector/VectorStream.h"
 
 using facebook::velox::exec::Operator;
 using facebook::velox::exec::RemoteConnectorSplit;
@@ -42,6 +52,11 @@ UcxExchange::UcxExchange(
           nvtx3::rgb{0, 191, 255},
           operatorId,
           fmt::format("[{}]", planNode->id())),
+      serdeKind_(
+          std::dynamic_pointer_cast<const core::ExchangeNode>(planNode)
+              ? std::dynamic_pointer_cast<const core::ExchangeNode>(planNode)
+                    ->serdeKind()
+              : std::string{}),
       preferredOutputBatchBytes_{
           driverCtx->queryConfig().preferredOutputBatchBytes()},
       closeExchangeClientOnClose_{ucxExchangeClient == nullptr},
@@ -180,10 +195,62 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
 
   // Get the packed_table and stream from the PackedTableWithStream
   PackedTableWithStream& data = *currentData_;
+
+  if (data.isHostPage()) {
+    auto page =
+        std::make_unique<exec::PrestoSerializedPage>(std::move(data.hostPage));
+    const auto pageBytes = page->size();
+
+    // The host page is gone once deserialized and uploaded, so the receive
+    // reservation is returned here rather than with a surviving vector.
+    auto releaseReservation = folly::makeGuard([this, pageBytes]() {
+      if (exchangeClient_->tracksInFlightReceiveBytes()) {
+        exchangeClient_->releaseInFlightReceiveBytes(pageBytes);
+      }
+    });
+
+    auto input = page->prepareStreamForDeserialize();
+
+    auto* serde = getNamedVectorSerde(serdeKind_);
+    RowVectorPtr rows;
+    vector_size_t offset = 0;
+    while (!input->atEnd()) {
+      serde->deserialize(
+          input.get(), pool(), outputType_, &rows, offset, nullptr);
+      offset = rows->size();
+    }
+    currentData_.reset();
+    if (rows == nullptr || rows->size() == 0) {
+      return nullptr;
+    }
+
+    auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+    std::unique_ptr<cudf::table> table;
+    try {
+      table = cudf_velox::with_arrow::toCudfTable(
+          rows, pool(), stream, cudf_velox::get_temp_mr());
+    } catch (const std::exception& e) {
+      exchangeClient_->recordReceiveAllocationPressure(pageBytes);
+      VELOX_FAIL(
+          "Failed to upload a host exchange page of {} bytes for {}: {}",
+          pageBytes,
+          taskId(),
+          e.what());
+    }
+    // The deserialized count, not the table's: a zero-column table has no
+    // rows of its own.
+    const auto uploadedRows = rows->size();
+    auto uploaded = std::make_shared<cudf_velox::CudfVector>(
+        pool(), outputType_, uploadedRows, std::move(table), stream);
+    stream.synchronize();
+    recordInputStats(pageBytes, uploaded);
+    return uploaded;
+  }
+
   const auto numRows = data.numRows;
   VELOX_CHECK_GE(numRows, 0);
-  if (data.packedTable->table.num_columns() > 0) {
-    VELOX_CHECK_EQ(data.packedTable->table.num_rows(), numRows);
+  if (data.table().num_columns() > 0) {
+    VELOX_CHECK_EQ(data.table().num_rows(), numRows);
   }
   auto gpuDataSize = data.gpuDataSize();
   auto stream = data.stream;
@@ -198,15 +265,60 @@ RowVectorPtr UcxExchange::getOutputFromPackedTable() {
     };
   }
 
-  // Use the stream that was allocated in UcxExchangeSource::onMetadata
-  // and the packed_table constructor of CudfVector to avoid copying data.
-  auto result = std::make_shared<cudf_velox::CudfVector>(
-      pool(),
-      outputType_,
-      numRows,
-      std::move(data.packedTable),
-      stream,
-      std::move(releaseCallback));
+  std::shared_ptr<cudf_velox::CudfVector> result;
+  if (data.owns()) {
+    result = std::make_shared<cudf_velox::CudfVector>(
+        pool(),
+        outputType_,
+        numRows,
+        std::move(data.packedTable),
+        stream,
+        std::move(releaseCallback));
+  } else {
+    // The view-and-owner constructor takes no release callback, so the owner
+    // releases from its destructor instead.
+    struct BorrowedOwner {
+      std::shared_ptr<void> inner;
+      std::weak_ptr<UcxExchangeClient> client;
+      uint64_t bytes{0};
+      rmm::cuda_stream_view stream;
+      bool tracked{false};
+
+      ~BorrowedOwner() {
+        if (!tracked) {
+          return;
+        }
+        // Throwing out of a destructor is std::terminate.
+        try {
+          stream.synchronize();
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Failed to synchronize the stream for a borrowed "
+                          "table before releasing its receive reservation: "
+                       << e.what();
+        }
+        if (auto locked = client.lock()) {
+          locked->releaseInFlightReceiveBytes(bytes);
+        }
+      }
+    };
+
+    auto owner = std::make_shared<BorrowedOwner>();
+    owner->inner = std::move(data.borrowedOwner);
+    owner->client = exchangeClient_;
+    owner->bytes = gpuDataSize;
+    owner->stream = stream;
+    owner->tracked = exchangeClient_->tracksInFlightReceiveBytes();
+
+    result = std::make_shared<cudf_velox::CudfVector>(
+        pool(),
+        outputType_,
+        numRows,
+        data.borrowedTable,
+        cudf_velox::CudfVector::ViewOwner{
+            std::static_pointer_cast<void>(std::move(owner))},
+        stream,
+        gpuDataSize);
+  }
 
   recordInputStats(gpuDataSize, result);
   // free the memory owned by PackedTableWithStream and set it to nullptr;

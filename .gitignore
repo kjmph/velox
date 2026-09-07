@@ -327,3 +327,4 @@ scripts/bm-report/report.html
 scripts/bm-report/result
 dist/
 wheelhouse/
+.cache/

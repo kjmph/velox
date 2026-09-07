@@ -75,6 +75,10 @@ class UcxExchange : public SourceOperator, public cudf_velox::NvtxHelper {
 
   void recordInputStats(uint64_t rawInputBytes, const RowVectorPtr& result);
 
+  // The serde the plan asked for, for a payload that arrives as host bytes
+  // and has to be deserialized before it can be uploaded.
+  std::string serdeKind_;
+
   std::shared_ptr<UcxExchangeClient> exchangeClient_;
 
   const uint64_t preferredOutputBatchBytes_;

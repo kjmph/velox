@@ -158,6 +158,12 @@ UcxExchangeClient::next(int consumerId, bool* atEnd, ContinueFuture* future) {
   return data;
 }
 
+bool UcxExchangeClient::recordReceiveAllocationPressure(
+    uint64_t attemptedBytes) {
+  std::lock_guard<std::mutex> l(queue_->mutex());
+  return queue_->recordReceiveAllocationPressureLocked(attemptedBytes);
+}
+
 void UcxExchangeClient::releaseInFlightReceiveBytes(uint64_t bytes) {
   std::vector<std::shared_ptr<UcxExchangeSource>> sourcesToResume;
   {

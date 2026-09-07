@@ -154,6 +154,12 @@ option(
   "Build the experimental UCX exchange library. Requires UCX development libraries."
   OFF
 )
+
+velox_set_with_default(
+  VELOX_BUILD_LAB
+  "Build the lab/ scratch harness for running hand-written plans. Requires VELOX_BUILD_TESTING."
+  OFF
+)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
@@ -872,3 +878,9 @@ if(VELOX_ENABLE_GEO)
 endif()
 
 add_subdirectory(velox)
+
+# The lab harness links velox_exec_test_lib, which only exists when testing
+# is enabled.
+if(VELOX_BUILD_LAB AND VELOX_BUILD_TESTING)
+  add_subdirectory(lab)
+endif()

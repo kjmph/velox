@@ -129,6 +129,25 @@ class UcxPartitionedOutput : public exec::Operator,
     rmm::cuda_stream_view stream;
   };
 
+  // Single decision point for the destination. 'transferReservationBytes' is
+  // released by the queue, or by this when the page goes elsewhere.
+  void enqueuePacked(
+      const std::shared_ptr<UcxOutputQueueManager>& queueManager,
+      int destination,
+      std::unique_ptr<cudf::packed_columns> packedColumns,
+      int32_t numRows,
+      int64_t transferReservationBytes = 0);
+
+  // Enqueues as an IOBuf chain of [host metadata][device data].
+
+  // Take dynamicUcxEnqueueBlocked_ first; this discards a real future.
+  bool queueBlocked(ContinueFuture* future);
+
+  void enqueuePackedToOutputBuffer(
+      int destination,
+      std::unique_ptr<cudf::packed_columns> packedColumns,
+      int32_t numRows);
+
   void partitionPendingInputBatch();
 
   bool drainPendingPartitionedBatch();
@@ -179,6 +198,23 @@ class UcxPartitionedOutput : public exec::Operator,
   bool maybeFinishCancelled();
 
   void clearPending();
+
+  // The serde the plan asked for, carried so a page rendered as host bytes
+  // uses the one the reader will parse with.
+  const std::string serdeKind_;
+
+  // Plan named a non-default transport, so Task points its teardown at that
+  // manager and this operator retires the ordinary output buffer.
+  const bool ownsOutputBuffer_;
+
+  // records if dynamicUcx is enabled at construction
+  const bool useDynamicUcx_;
+
+  // True if the output buffer reported itself full as a page was enqueued.
+  bool dynamicUcxEnqueueBlocked_{false};
+
+  // The future the output buffer handed back.
+  ContinueFuture dynamicUcxFuture_{ContinueFuture::makeEmpty()};
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;

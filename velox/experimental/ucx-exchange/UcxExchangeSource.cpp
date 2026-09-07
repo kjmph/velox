@@ -564,9 +564,10 @@ void UcxExchangeSource::onMetadata(
     failAndCloseEndpoint(std::move(errorMsg));
   } else {
     if (!arg) {
-      failAndCloseEndpoint(fmt::format(
-          "GPU exchange metadata callback returned no buffer for {}",
-          partitionKey_.toString()));
+      failAndCloseEndpoint(
+          fmt::format(
+              "GPU exchange metadata callback returned no buffer for {}",
+              partitionKey_.toString()));
       return;
     }
 
@@ -582,15 +583,17 @@ void UcxExchangeSource::onMetadata(
       VELOX_CHECK_GE(
           ptr->metadata.dataSizeBytes, 0, "UCX metadata data size is negative");
     } catch (const std::exception& e) {
-      failAndCloseEndpoint(fmt::format(
-          "Failed to decode GPU exchange metadata for {}: {}",
-          partitionKey_.toString(),
-          e.what()));
+      failAndCloseEndpoint(
+          fmt::format(
+              "Failed to decode GPU exchange metadata for {}: {}",
+              partitionKey_.toString(),
+              e.what()));
       return;
     } catch (...) {
-      failAndCloseEndpoint(fmt::format(
-          "Failed to decode GPU exchange metadata for {}",
-          partitionKey_.toString()));
+      failAndCloseEndpoint(
+          fmt::format(
+              "Failed to decode GPU exchange metadata for {}",
+              partitionKey_.toString()));
       return;
     }
 
@@ -683,11 +686,12 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
     // never depends on another RMM allocation, then discard it in onData().
     const auto discardSize = static_cast<uint64_t>(ptr->metadata.dataSizeBytes);
     if (discardSize > std::numeric_limits<size_t>::max()) {
-      failAndCloseEndpoint(fmt::format(
-          "GPU exchange drain payload {} is too large for host address space "
-          "for {}",
-          discardSize,
-          partitionKey_.toString()));
+      failAndCloseEndpoint(
+          fmt::format(
+              "GPU exchange drain payload {} is too large for host address space "
+              "for {}",
+              discardSize,
+              partitionKey_.toString()));
       return;
     }
     try {
@@ -705,6 +709,24 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
       return;
     }
     receiveBuffer = ptr->discardBuf.get();
+  } else if (!ptr->metadata.isDeviceData) {
+    // The producer did not pack this one. It is a serialized page, and it is
+    // deserialized on the host, so receive it there.
+    try {
+      ptr->hostBuf = std::unique_ptr<uint8_t[]>(
+          new uint8_t[static_cast<size_t>(ptr->metadata.dataSizeBytes)]);
+    } catch (const std::exception& e) {
+      // Neither the pending nor the active request, so close() misses it.
+      releaseReceiveBytes(ptr);
+      auto errorMsg = fmt::format(
+          "Failed to allocate {} host bytes for GPU exchange {}: {}",
+          ptr->metadata.dataSizeBytes,
+          partitionKey_.toString(),
+          e.what());
+      failAndCloseEndpoint(std::move(errorMsg));
+      return;
+    }
+    receiveBuffer = ptr->hostBuf.get();
   } else {
     // Normal remote exchange receives directly into device memory.
     auto stream =
@@ -745,10 +767,11 @@ void UcxExchangeSource::startDataReceive(std::shared_ptr<DataAndMetadata> ptr) {
       // host discard buffer. Going directly to Done would leave the producer's
       // GPU send unmatched—the exact stale state that cancellation must clear.
       pendingDataReceive_ = std::move(ptr);
-      failAndStartAbortDrain(fmt::format(
-          "Failed to allocate {} GPU bytes for exchange {}",
-          pendingDataReceive_->metadata.dataSizeBytes,
-          partitionKey_.toString()));
+      failAndStartAbortDrain(
+          fmt::format(
+              "Failed to allocate {} GPU bytes for exchange {}",
+              pendingDataReceive_->metadata.dataSizeBytes,
+              partitionKey_.toString()));
       return;
     }
 
@@ -834,9 +857,10 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     if (!arg) {
       releaseReceiveBytes(activeDataReceive_);
       activeDataReceive_.reset();
-      failAndCloseEndpoint(fmt::format(
-          "GPU exchange data callback returned no buffer for {}",
-          partitionKey_.toString()));
+      failAndCloseEndpoint(
+          fmt::format(
+              "GPU exchange data callback returned no buffer for {}",
+              partitionKey_.toString()));
       return;
     }
     VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
@@ -862,43 +886,60 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
     PackedTableWithStreamPtr data;
-    try {
-      // Create packed_columns from the received metadata and data buffer.
-      cudf::packed_columns packedCols(
-          std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
-
-      // Unpack to get the table_view and create a packed_table.
-      cudf::table_view tableView = cudf::unpack(packedCols);
-      auto packedTable = std::make_unique<cudf::packed_table>(
-          cudf::packed_table{tableView, std::move(packedCols)});
-
-      // Bundle the packed_table with the stream used for allocation.
-      auto numRows = ptr->metadata.numRows;
-      if (numRows < 0) {
-        VELOX_CHECK_GT(
-            tableView.num_columns(),
-            0,
-            "Legacy UCX metadata cannot represent logical rows for a "
-            "zero-column payload; upgrade producer and consumer together");
-        numRows = tableView.num_rows();
-      }
+    if (!ptr->metadata.isDeviceData) {
+      // Stays host bytes; the exchange operator decides whether to upload.
+      auto* raw = ptr->hostBuf.release();
+      auto page = folly::IOBuf::takeOwnership(
+          raw,
+          static_cast<size_t>(ptr->metadata.dataSizeBytes),
+          [](void* buf, void* /*userData*/) {
+            delete[] static_cast<uint8_t*>(buf);
+          });
       data = std::make_unique<PackedTableWithStream>(
-          std::move(packedTable), ptr->stream, numRows);
-    } catch (const std::exception& e) {
-      releaseReceiveBytes(ptr);
-      activeDataReceive_.reset();
-      failAndStartAbortDrain(fmt::format(
-          "Failed to unpack GPU exchange payload for {}: {}",
-          partitionKey_.toString(),
-          e.what()));
-      return;
-    } catch (...) {
-      releaseReceiveBytes(ptr);
-      activeDataReceive_.reset();
-      failAndStartAbortDrain(fmt::format(
-          "Failed to unpack GPU exchange payload for {}",
-          partitionKey_.toString()));
-      return;
+          std::move(page),
+          facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream(),
+          ptr->metadata.numRows);
+    } else {
+      try {
+        // Create packed_columns from the received metadata and data buffer.
+        cudf::packed_columns packedCols(
+            std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+
+        // Unpack to get the table_view and create a packed_table.
+        cudf::table_view tableView = cudf::unpack(packedCols);
+        auto packedTable = std::make_unique<cudf::packed_table>(
+            cudf::packed_table{tableView, std::move(packedCols)});
+
+        // Bundle the packed_table with the stream used for allocation.
+        auto numRows = ptr->metadata.numRows;
+        if (numRows < 0) {
+          VELOX_CHECK_GT(
+              tableView.num_columns(),
+              0,
+              "Legacy UCX metadata cannot represent logical rows for a "
+              "zero-column payload; upgrade producer and consumer together");
+          numRows = tableView.num_rows();
+        }
+        data = std::make_unique<PackedTableWithStream>(
+            std::move(packedTable), ptr->stream, numRows);
+      } catch (const std::exception& e) {
+        releaseReceiveBytes(ptr);
+        activeDataReceive_.reset();
+        failAndStartAbortDrain(
+            fmt::format(
+                "Failed to unpack GPU exchange payload for {}: {}",
+                partitionKey_.toString(),
+                e.what()));
+        return;
+      } catch (...) {
+        releaseReceiveBytes(ptr);
+        activeDataReceive_.reset();
+        failAndStartAbortDrain(
+            fmt::format(
+                "Failed to unpack GPU exchange payload for {}",
+                partitionKey_.toString()));
+        return;
+      }
     }
 
     ptr->receiveBytesReserved = false;
@@ -971,9 +1012,10 @@ void UcxExchangeSource::onHandshakeResponse(
   std::shared_ptr<HandshakeResponse> response =
       std::static_pointer_cast<HandshakeResponse>(arg);
   if (!response) {
-    failAndCloseEndpoint(fmt::format(
-        "GPU exchange handshake response returned no buffer for {}",
-        partitionKey_.toString()));
+    failAndCloseEndpoint(
+        fmt::format(
+            "GPU exchange handshake response returned no buffer for {}",
+            partitionKey_.toString()));
     return;
   }
 
@@ -1239,38 +1281,58 @@ void UcxExchangeSource::onIntraNodeData(
 
   VLOG(3) << toString()
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
-          << " size=" << data->data->gpu_data->size();
+          << " size=" << data->payloadBytes();
 
   metrics_.numPackedColumns_.addValue(1);
-  metrics_.totalBytes_.addValue(data->data->gpu_data->size());
+  metrics_.totalBytes_.addValue(data->payloadBytes());
 
   PackedTableWithStreamPtr tableWithStream;
   try {
-    // Convert packed_columns to PackedTableWithStream for the queue.
-    cudf::packed_columns packedCols(
-        std::move(data->data->metadata), std::move(data->data->gpu_data));
-
-    cudf::table_view tableView = cudf::unpack(packedCols);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedCols)});
-
     // The producer synchronized before publishing, so the GPU data is ready.
     auto stream =
         facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-    tableWithStream = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), stream, data->numRows);
+
+    if (data->data != nullptr) {
+      // The producer's own queues held the table, so take ownership of it.
+      cudf::packed_columns packedCols(
+          std::move(data->data->metadata), std::move(data->data->gpu_data));
+
+      cudf::table_view tableView = cudf::unpack(packedCols);
+      auto packedTable = std::make_unique<cudf::packed_table>(
+          cudf::packed_table{tableView, std::move(packedCols)});
+      tableWithStream = std::make_unique<PackedTableWithStream>(
+          std::move(packedTable), stream, data->numRows);
+    } else if (!data->deviceResident) {
+      auto page = data->buffer->clone();
+      tableWithStream = std::make_unique<PackedTableWithStream>(
+          std::move(page), stream, data->numRows);
+    } else {
+      // The output buffer still owns the bytes; view them and keep it alive.
+      cudf::table_view tableView = cudf::unpack(
+          static_cast<uint8_t const*>(data->metadata()),
+          static_cast<uint8_t const*>(data->payload()));
+      const auto deviceBytes = data->payloadBytes();
+      tableWithStream = std::make_unique<PackedTableWithStream>(
+          tableView,
+          std::shared_ptr<void>(data),
+          deviceBytes,
+          stream,
+          data->numRows);
+    }
   } catch (const std::exception& e) {
     ++sequenceNumber_;
-    failAndStartAbortDrain(fmt::format(
-        "Failed to unpack intra-node GPU exchange payload for {}: {}",
-        partitionKey_.toString(),
-        e.what()));
+    failAndStartAbortDrain(
+        fmt::format(
+            "Failed to unpack intra-node GPU exchange payload for {}: {}",
+            partitionKey_.toString(),
+            e.what()));
     return;
   } catch (...) {
     ++sequenceNumber_;
-    failAndStartAbortDrain(fmt::format(
-        "Failed to unpack intra-node GPU exchange payload for {}",
-        partitionKey_.toString()));
+    failAndStartAbortDrain(
+        fmt::format(
+            "Failed to unpack intra-node GPU exchange payload for {}",
+            partitionKey_.toString()));
     return;
   }
 

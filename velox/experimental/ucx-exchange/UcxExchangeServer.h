@@ -15,11 +15,14 @@
  */
 #pragma once
 
+#include <deque>
+
 #include <cudf/contiguous_split.hpp>
 #include <folly/Synchronized.h>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
+#include <velox/experimental/ucx-exchange/DynamicUcxOutputBufferReader.h>
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <atomic>
 #include <chrono>
@@ -160,6 +163,21 @@ class UcxExchangeServer
   /// server destruction releases any dequeued in-flight accounting itself.
   void installDataCallback();
 
+  // Arranges the next payload when the pages live in the ordinary output
+  // buffer.
+  void requestDynamicUcxData();
+
+  // Turns one drained batch into payloads and delivers the first.
+  void onDynamicUcxData(DynamicUcxOutputBufferReader::Data data);
+
+  // Delivers the next buffered payload, or a null one to signal end of
+  // stream, which is what onDataAvailable already expects.
+  void deliverDynamicUcxPage();
+
+  // Undoes what the dynamic UCX path set up. Idempotent. 'releaseBuffer' is
+  // right only when the stream finished.
+  void releaseDynamicUcxResources(bool releaseBuffer);
+
   /// Completes a remote data bundle once both tag sends have completed.
   void maybeCompleteRemoteSend();
 
@@ -251,7 +269,18 @@ class UcxExchangeServer
   // Early placeholder queues are initialized in place and task IDs cannot be
   // reused after removal. Keep this exact queue alive so completion callbacks
   // can release in-flight accounting after manager removal.
+  // Holds no pages with useDynamicUcx(); kept for the accounting.
   std::shared_ptr<UcxOutputQueue> outputQueue_;
+
+  // Read once: the switch is global and settable at runtime.
+  const bool useDynamicUcx_;
+
+  std::shared_ptr<DynamicUcxOutputBufferReader> dynamicUcxReader_;
+  std::deque<std::shared_ptr<UcxGpuPayload>> dynamicUcxPages_;
+  bool dynamicUcxAtEnd_{false};
+  // One payload per request, matching the queue's notify on the other path.
+  // A drain can produce several pages at once.
+  bool dynamicUcxRequestPending_{false};
 };
 
 } // namespace facebook::velox::ucx_exchange

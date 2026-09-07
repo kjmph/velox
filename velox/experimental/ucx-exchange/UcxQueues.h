@@ -16,6 +16,8 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <folly/io/IOBuf.h>
+
 #include <atomic>
 #include <cstddef>
 #include <deque>
@@ -28,15 +30,73 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/OutputBuffer.h" // for the Stats structure
 #include "velox/exec/Task.h"
+#include "velox/experimental/ucx-exchange/CudfPackedPage.h"
 
 namespace facebook::velox::ucx_exchange {
 
 /// One packed cuDF table plus the logical row count of the source vector.
 /// cuDF tables with zero columns cannot represent a row count, so the count
 /// must travel alongside the packed payload.
+///
+/// Held either as packed_columns or as an IOBuf chain, so senders use the
+/// accessors rather than either field.
 struct UcxGpuPayload {
+  /// Set when this transport's queues hold the table.
   std::shared_ptr<cudf::packed_columns> data;
+
+  /// From the ordinary output buffer. A packed table is
+  /// [uint32 magic][int32 numRows][cudf metadata] then device data.
+  std::shared_ptr<folly::IOBuf> buffer;
+
+  /// Whether the payload is a packed cuDF table in device memory. False for a
+  /// serialized page from an ordinary PartitionedOutput.
+  bool deviceResident{true};
+
+  /// Whether these bytes were charged to the in-flight accounting. True by
+  /// default: recordDequeue() charges on the way out of a queue.
+  bool inFlightCharged{true};
+
   int32_t numRows{0};
+
+  /// Start of the cuDF metadata. Empty for host bytes, which have none.
+  const uint8_t* metadata() const {
+    if (data != nullptr) {
+      return data->metadata->data();
+    }
+    return deviceResident ? buffer->data() + kCudfPackedPageHeaderBytes
+                          : nullptr;
+  }
+
+  size_t metadataBytes() const {
+    if (data != nullptr) {
+      return data->metadata->size();
+    }
+    return deviceResident ? buffer->length() - kCudfPackedPageHeaderBytes : 0;
+  }
+
+  /// Start of the payload: the packed table for a device payload, the
+  /// serialized page for a host one.
+  const void* payload() const {
+    if (data != nullptr) {
+      return data->gpu_data->data();
+    }
+    if (!deviceResident) {
+      return buffer->data();
+    }
+    // A zero-column table has no device segment; the chain is circular, so
+    // next() would hand back the header.
+    return buffer->next() == buffer.get() ? nullptr : buffer->next()->data();
+  }
+
+  size_t payloadBytes() const {
+    if (data != nullptr) {
+      return data->gpu_data->size();
+    }
+    if (!deviceResident) {
+      return buffer->length();
+    }
+    return buffer->next() == buffer.get() ? 0 : buffer->next()->length();
+  }
 };
 
 /// @brief  Callback function for getting data from the queues.
@@ -139,6 +199,10 @@ class UcxDestinationQueue {
   /// Returns true when a server has asked for data and is waiting for the next
   /// enqueue to satisfy that request.
   bool waitingForData() const;
+
+  /// Marks bytes for this destination as in-flight, for a transport that read
+  /// them from the ordinary output buffer rather than dequeuing them.
+  void acquireInFlight(int64_t bytes, int64_t numPackedCols);
 
   /// Marks bytes for this destination as no longer in-flight.
   void releaseInFlight(int64_t bytes, int64_t numPackedCols);
@@ -298,6 +362,11 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   /// @brief Releases a producer-side byte reservation.
   void releaseOutputReservation(int64_t bytes);
+
+  /// Charges 'bytes' as in flight for 'destination'. Returns false, having
+  /// charged nothing, when that destination has no queue.
+  bool
+  acquireInFlightBytes(int destination, int64_t bytes, int64_t numPackedCols);
 
   /// @brief Releases bytes retained by an in-flight exchange transfer.
   void

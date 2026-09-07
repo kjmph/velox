@@ -14,14 +14,23 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+
+#include <cstring>
+
 #include <glog/logging.h>
 #include <atomic>
 #include "velox/common/EnumDefine.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/CudfPackedPage.h"
+#include "velox/experimental/ucx-exchange/DynamicUcxTransport.h"
+#include "velox/experimental/ucx-exchange/ExchangeFormatRegistry.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
 namespace facebook::velox::ucx_exchange {
+
+static constexpr uint64_t kDynamicUcxFetchBytes{1ULL << 20};
 
 namespace {
 const folly::F14FastMap<UcxExchangeServer::ServerState, std::string_view>&
@@ -77,6 +86,7 @@ struct DataSendContext {
   std::shared_ptr<UcxOutputQueue> outputQueue;
   int destination{0};
   int64_t bytes{0};
+  bool charged{false};
   std::atomic<bool> callbackClaimed{false};
 
   bool tryClaimCallback() {
@@ -114,8 +124,7 @@ struct OutputQueueCallbackContext {
       queue = outputQueue.lock();
     }
     if (queue) {
-      queue->releaseInFlightBytes(
-          destination, data->data->gpu_data->size(), 1L);
+      queue->releaseInFlightBytes(destination, data->payloadBytes(), 1L);
     }
   }
 
@@ -140,7 +149,8 @@ UcxExchangeServer::UcxExchangeServer(
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
       isIntraNodeTransfer_(isIntraNodeTransfer),
-      queueMgr_(UcxOutputQueueManager::getInstanceRef()) {
+      queueMgr_(UcxOutputQueueManager::getInstanceRef()),
+      useDynamicUcx_(useDynamicUcx()) {
   setState(ServerState::Created);
 
   if (isIntraNodeTransfer_) {
@@ -279,13 +289,17 @@ void UcxExchangeServer::close() {
 
   releasePendingData();
   releaseIntraNodeInFlightBytes();
-  if (outputQueue_ && !outputResultsDeleted_) {
+
+  releaseDynamicUcxResources(/*releaseBuffer=*/false);
+  if (outputQueue_ && !outputResultsDeleted_ && !useDynamicUcx_) {
     // Hard transport cleanup can arrive while getData() is waiting. Clear the
     // installed callback and discard queued output before unregistering this
     // server. Do not create a placeholder here for a rejected server.
     outputResultsDeleted_ = true;
     outputQueue_->deleteResults(partitionKey_.destination);
   }
+  // Skipped under discovery: the pages are not in this queue, and nulling it
+  // makes UcxOutputQueue::deleteResults tell the task its output was consumed.
 
   if (communicator_) {
     // UCP cancellation is supported for tag receives, not tag sends. Retain
@@ -458,7 +472,148 @@ void UcxExchangeServer::requestData() {
   installDataCallback();
 }
 
+void UcxExchangeServer::requestDynamicUcxData() {
+  if (outputQueue_ == nullptr) {
+    outputQueue_ = queueMgr_->getQueueIfExists(partitionKey_.taskId);
+  }
+  if (dynamicUcxReader_ == nullptr) {
+    // Must precede the first read; the acceptor is too late.
+    ExchangeFormatRegistry::instance().setExchangeFormat(
+        partitionKey_.taskId,
+        partitionKey_.destination,
+        ExchangeFormatRegistry::Format::kCudf);
+    dynamicUcxReader_ = std::make_shared<DynamicUcxOutputBufferReader>(
+        exec::DefaultOutputBufferManager::getInstanceRef(),
+        partitionKey_.taskId,
+        partitionKey_.destination);
+  }
+
+  dynamicUcxRequestPending_ = true;
+  if (!dynamicUcxPages_.empty() || dynamicUcxAtEnd_) {
+    deliverDynamicUcxPage();
+    return;
+  }
+
+  std::weak_ptr<UcxExchangeServer> weakSelf = weak_from_this();
+  dynamicUcxReader_->request(
+      kDynamicUcxFetchBytes,
+      [weakSelf](DynamicUcxOutputBufferReader::Data data) {
+        auto self = weakSelf.lock();
+        if (!self || self->closed_.load(std::memory_order_acquire)) {
+          return;
+        }
+        // Data holds unique_ptrs; the event queue copies its callable.
+        auto held = std::make_shared<DynamicUcxOutputBufferReader::Data>(
+            std::move(data));
+        self->enqueueStateEvent(self, [raw = self.get(), held]() mutable {
+          raw->onDynamicUcxData(std::move(*held));
+        });
+        self->communicator_->addToWorkQueue(self);
+      });
+}
+
+void UcxExchangeServer::onDynamicUcxData(
+    DynamicUcxOutputBufferReader::Data data) {
+  // A batch can arrive after close(): both drain paths run events first.
+  if (closed_.load(std::memory_order_acquire) || dynamicUcxReader_ == nullptr) {
+    return;
+  }
+
+  if (outputQueue_ == nullptr) {
+    // May not have existed when this server was built.
+    outputQueue_ = queueMgr_->getQueueIfExists(partitionKey_.taskId);
+  }
+  for (auto& page : data.pages) {
+    bool deviceResident = false;
+    if (page->length() >= kCudfPackedPageHeaderBytes) {
+      uint32_t magic = 0;
+      std::memcpy(&magic, page->data(), sizeof(magic));
+      deviceResident = magic == kCudfPackedPageMagic;
+    }
+
+    auto payload = std::make_shared<UcxGpuPayload>();
+    payload->deviceResident = deviceResident;
+    if (deviceResident) {
+      int32_t rows = 0;
+      std::memcpy(
+          &rows, page->data() + sizeof(kCudfPackedPageMagic), sizeof(rows));
+      payload->numRows = rows;
+    } else {
+      // tagSend needs one region; a serialized page is a chain.
+      page->coalesce();
+      payload->numRows = 0;
+    }
+    payload->buffer = std::shared_ptr<folly::IOBuf>(std::move(page));
+    // Not dequeued, so nothing else charged it.
+    payload->inFlightCharged = outputQueue_ != nullptr &&
+        outputQueue_->acquireInFlightBytes(
+            partitionKey_.destination,
+            static_cast<int64_t>(payload->payloadBytes()),
+            1L);
+    dynamicUcxPages_.push_back(std::move(payload));
+  }
+  dynamicUcxAtEnd_ |= data.atEnd;
+  if (dynamicUcxRequestPending_) {
+    deliverDynamicUcxPage();
+  }
+}
+
+void UcxExchangeServer::releaseDynamicUcxResources(bool releaseBuffer) {
+  if (dynamicUcxReader_ != nullptr) {
+    // Pages taken but never sent were charged when they were taken.
+    if (outputQueue_ != nullptr) {
+      for (const auto& page : dynamicUcxPages_) {
+        if (page != nullptr && page->inFlightCharged) {
+          outputQueue_->releaseInFlightBytes(
+              partitionKey_.destination,
+              static_cast<int64_t>(page->payloadBytes()),
+              1L);
+        }
+      }
+    }
+    dynamicUcxPages_.clear();
+    // Undone here; a stock sink has no operator hook to do it.
+    ExchangeFormatRegistry::instance().setExchangeFormat(
+        partitionKey_.taskId,
+        partitionKey_.destination,
+        ExchangeFormatRegistry::Format::kUnknown);
+    dynamicUcxReader_->close();
+    if (releaseBuffer) {
+      dynamicUcxReader_->deleteResults();
+    }
+    dynamicUcxReader_.reset();
+  }
+
+  // The driver adapter's task registration is released by the producing
+  // operator at task completion, not here: other destinations may be unread.
+}
+
+void UcxExchangeServer::deliverDynamicUcxPage() {
+  if (!dynamicUcxRequestPending_) {
+    return;
+  }
+  dynamicUcxRequestPending_ = false;
+
+  std::shared_ptr<UcxGpuPayload> next;
+  if (!dynamicUcxPages_.empty()) {
+    next = std::move(dynamicUcxPages_.front());
+    dynamicUcxPages_.pop_front();
+  }
+  if (next == nullptr && !dynamicUcxAtEnd_) {
+    requestDynamicUcxData();
+    return;
+  }
+
+  onDataAvailable(std::move(next));
+
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
 void UcxExchangeServer::installDataCallback() {
+  if (useDynamicUcx_) {
+    requestDynamicUcxData();
+    return;
+  }
   std::weak_ptr<UcxExchangeServer> weakQueue = weak_from_this();
   auto callbackContext = std::make_shared<OutputQueueCallbackContext>();
   auto notify =
@@ -490,10 +645,10 @@ void UcxExchangeServer::onDataAvailable(std::shared_ptr<UcxGpuPayload> data) {
   if (closed_.load(std::memory_order_acquire) ||
       abortRequested_.load(std::memory_order_acquire) || finalMetadataSent_) {
     if (data) {
-      VELOX_CHECK_NOT_NULL(
-          outputQueue_, "Dequeued GPU data has no stable output queue");
-      outputQueue_->releaseInFlightBytes(
-          partitionKey_.destination, data->data->gpu_data->size(), 1L);
+      if (outputQueue_ != nullptr && data->inFlightCharged) {
+        outputQueue_->releaseInFlightBytes(
+            partitionKey_.destination, data->payloadBytes(), 1L);
+      }
     }
     return;
   }
@@ -556,9 +711,8 @@ void UcxExchangeServer::sendData() {
   VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_
           << "] sendData hasData=" << (dataPtr_ != nullptr)
-          << (dataPtr_ && dataPtr_->data && dataPtr_->data->gpu_data
-                  ? " size=" + std::to_string(dataPtr_->data->gpu_data->size())
-                  : "");
+          << (dataPtr_ ? " size=" + std::to_string(dataPtr_->payloadBytes())
+                       : "");
 
   if (!dataPtr_) {
     sendFinalMetadata();
@@ -567,7 +721,7 @@ void UcxExchangeServer::sendData() {
 
   if (isIntraNodeTransfer_) {
     sendStart_ = std::chrono::high_resolution_clock::now();
-    bytes_ = dataPtr_->data->gpu_data->size();
+    bytes_ = dataPtr_->payloadBytes();
 
     VLOG(3) << "@" << partitionKey_.taskId
             << " Intra-node transfer: publishing data for sequence "
@@ -575,12 +729,14 @@ void UcxExchangeServer::sendData() {
 
     IntraNodeTransferKey key{
         partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
+    // Read before the payload is handed over below.
+    const bool charged = dataPtr_->inFlightCharged;
     intraNodeRetrieveFuture_ =
         IntraNodeTransferRegistry::getInstance()->publish(
             key, dataPtr_, /*atEnd=*/false);
     dataPtr_.reset();
     intraNodeAtEndPublished_ = false;
-    intraNodeBytesInFlight_ = true;
+    intraNodeBytesInFlight_ = charged;
 
     setState(ServerState::WaitingForIntraNodeRetrieve);
     communicator_->addToWorkQueue(getSelfPtr());
@@ -588,15 +744,18 @@ void UcxExchangeServer::sendData() {
   }
 
   auto data = std::move(dataPtr_);
-  VELOX_CHECK_NOT_NULL(outputQueue_);
-  bytes_ = data->data->gpu_data->size();
+  bytes_ = data->payloadBytes();
 
   MetadataMsg metadataMsg;
   // Copy metadata because broadcast destinations can share packed_columns.
-  metadataMsg.cudfMetadata =
-      std::make_unique<std::vector<uint8_t>>(*data->data->metadata);
+  // Null iterators are UB even for an empty range.
+  metadataMsg.cudfMetadata = data->metadata() != nullptr
+      ? std::make_unique<std::vector<uint8_t>>(
+            data->metadata(), data->metadata() + data->metadataBytes())
+      : std::make_unique<std::vector<uint8_t>>();
   metadataMsg.dataSizeBytes = bytes_;
   metadataMsg.numRows = data->numRows;
+  metadataMsg.isDeviceData = data->deviceResident;
   metadataMsg.remainingBytes = {};
   metadataMsg.atEnd = false;
   auto [serializedMetadata, serMetaSize] = metadataMsg.serialize();
@@ -645,21 +804,22 @@ void UcxExchangeServer::sendData() {
       metaCtx);
 
   VLOG(3) << "@" << partitionKey_.taskId << " Sending rmm::buffer: " << std::hex
-          << data->data->gpu_data.get()
-          << " pointing to device memory: " << data->data->gpu_data->data()
-          << std::dec << " to task " << partitionKey_.toString() << ":"
-          << sequenceNumber_ << " of size " << bytes_;
+          << data->payload()
+          << " pointing to device memory: " << data->payload() << std::dec
+          << " to task " << partitionKey_.toString() << ":" << sequenceNumber_
+          << " of size " << bytes_;
 
   auto dataCtx = std::make_shared<DataSendContext>();
   dataCtx->data = std::move(data);
   dataCtx->outputQueue = outputQueue_;
   dataCtx->destination = partitionKey_.destination;
   dataCtx->bytes = bytes_;
+  dataCtx->charged = dataCtx->data->inFlightCharged;
   std::weak_ptr<UcxExchangeServer> weakData = weak_from_this();
 
   dataRequest_ = endpointRef_->endpoint_->tagSend(
-      dataCtx->data->data->gpu_data->data(),
-      dataCtx->data->data->gpu_data->size(),
+      const_cast<void*>(dataCtx->data->payload()),
+      dataCtx->data->payloadBytes(),
       ucxx::Tag{dataTag},
       false,
       [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
@@ -668,8 +828,10 @@ void UcxExchangeServer::sendData() {
           return;
         }
         ctx->data.reset();
-        ctx->outputQueue->releaseInFlightBytes(
-            ctx->destination, ctx->bytes, 1L);
+        if (ctx->outputQueue != nullptr && ctx->charged) {
+          ctx->outputQueue->releaseInFlightBytes(
+              ctx->destination, ctx->bytes, 1L);
+        }
 
         if (auto self = weakData.lock()) {
           self->enqueueStateEvent(self, [raw = self.get(), status]() {
@@ -881,19 +1043,20 @@ void UcxExchangeServer::releasePendingData() {
   if (!pending) {
     return;
   }
-  VELOX_CHECK_NOT_NULL(
-      outputQueue_, "Dequeued GPU data has no stable output queue");
-  outputQueue_->releaseInFlightBytes(
-      partitionKey_.destination, pending->data->gpu_data->size(), 1L);
+  // Release only what was charged; the queue can be absent.
+  if (outputQueue_ != nullptr && pending->inFlightCharged) {
+    outputQueue_->releaseInFlightBytes(
+        partitionKey_.destination, pending->payloadBytes(), 1L);
+  }
 }
 
 void UcxExchangeServer::releaseIntraNodeInFlightBytes() {
   if (!intraNodeBytesInFlight_) {
     return;
   }
-  VELOX_CHECK_NOT_NULL(
-      outputQueue_, "Intra-node GPU data has no stable output queue");
-  outputQueue_->releaseInFlightBytes(partitionKey_.destination, bytes_, 1L);
+  if (outputQueue_ != nullptr) {
+    outputQueue_->releaseInFlightBytes(partitionKey_.destination, bytes_, 1L);
+  }
   intraNodeBytesInFlight_ = false;
 }
 
@@ -902,16 +1065,24 @@ void UcxExchangeServer::deleteOutputResults() {
     return;
   }
   outputResultsDeleted_ = true;
-  if (!outputQueue_) {
+
+  // Only reader of the ordinary output buffer, so it releases the results.
+  releaseDynamicUcxResources(/*releaseBuffer=*/true);
+
+  if (!outputQueue_ && !useDynamicUcx_) {
     // The accepted source can abort before READY reaches requestData(). Use
     // the ordinary server callback here: getData() may synchronously dequeue
     // one table, and that table still needs its in-flight accounting released
     // after the stable queue pointer has been returned.
+    //
+    // Queue path only: under discovery this re-arms the reader being torn down.
     installDataCallback();
   }
-  if (outputQueue_) {
+  if (outputQueue_ && !useDynamicUcx_) {
     outputQueue_->deleteResults(partitionKey_.destination);
   }
+  // Skipped under discovery, as in close(). The deleteResults above is
+  // what finishes the destination.
 }
 
 void UcxExchangeServer::maybeFinish() {

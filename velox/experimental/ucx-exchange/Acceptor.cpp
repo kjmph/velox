@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/Acceptor.h"
+
 #include <cstring>
 #include <string>
 #include "velox/common/base/Exceptions.h"
@@ -128,6 +129,7 @@ void Acceptor::cStyleAMCallback(
       UcxOutputQueueManager::getInstanceRef()->registerExchangeServer(
           exchangeServer);
   const auto responseStatus = toGpuHandshakeResponseStatus(admission);
+
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
           << " peerIp=" << peerIp
           << " isIntraNodeTransfer=" << isIntraNodeTransfer

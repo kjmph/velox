@@ -36,6 +36,10 @@ set(
 
 set(
   UCX_EXCHANGE_CUDF_SOURCES
+  DynamicUcxTransport.cpp
+  CudfPackedPage.cpp
+  ExchangeFormatRegistry.cpp
+  DynamicUcxOutputBufferReader.cpp
   UcxCudfDriverAdapter.cpp
   UcxPartitionedOutput.cpp
   UcxOutputQueueManager.cpp

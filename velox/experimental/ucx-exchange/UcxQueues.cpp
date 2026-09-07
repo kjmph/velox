@@ -45,14 +45,14 @@ int64_t multiplySaturated(int64_t value, int64_t multiplier) {
 
 void UcxDestinationQueue::Stats::recordEnqueue(const UcxGpuPayload* data) {
   if (data != nullptr) {
-    bytesQueued += data->data->gpu_data->size();
+    bytesQueued += data->payloadBytes();
     packedColumnsQueued++;
   }
 }
 
 void UcxDestinationQueue::Stats::recordDequeue(const UcxGpuPayload* data) {
   if (data != nullptr) {
-    const int64_t size = data->data->gpu_data->size();
+    const int64_t size = data->payloadBytes();
 
     bytesQueued -= size;
     VELOX_DCHECK_GE(bytesQueued, 0, "bytesQueued must be non-negative");
@@ -159,6 +159,13 @@ bool UcxDestinationQueue::waitingForData() const {
   return notify_ != nullptr;
 }
 
+void UcxDestinationQueue::acquireInFlight(
+    int64_t bytes,
+    int64_t numPackedCols) {
+  stats_.bytesInFlight += bytes;
+  stats_.packedColumnsInFlight += numPackedCols;
+}
+
 void UcxDestinationQueue::releaseInFlight(
     int64_t bytes,
     int64_t numPackedCols) {
@@ -249,7 +256,7 @@ void UcxOutputQueue::addOutputBuffersLocked(int numBuffers) {
         buffer->enqueueBack(data);
         // Each backfilled payload will be dequeued and accounted independently
         // for this destination.
-        queuedBytes_ += data->data->gpu_data->size();
+        queuedBytes_ += data->payloadBytes();
         queuedPackedColumns_++;
       }
     }
@@ -308,7 +315,8 @@ void UcxOutputQueue::enqueue(
     std::lock_guard<std::mutex> l(mutex_);
     auto numBytes = data->gpu_data->size();
     auto sharedData = std::make_shared<UcxGpuPayload>(UcxGpuPayload{
-        std::shared_ptr<cudf::packed_columns>(std::move(data)), numRows});
+        .data = std::shared_ptr<cudf::packed_columns>(std::move(data)),
+        .numRows = numRows});
 
     bool success = false;
     if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast) {
@@ -703,6 +711,23 @@ void UcxOutputQueue::releaseOutputReservation(int64_t bytes) {
   }
 }
 
+bool UcxOutputQueue::acquireInFlightBytes(
+    int destination,
+    int64_t bytes,
+    int64_t numPackedCols) {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (destination < 0 || destination >= queues_.size() ||
+      queues_[destination] == nullptr) {
+    return false;
+  }
+  queues_[destination]->acquireInFlight(bytes, numPackedCols);
+
+  // These were never queued here, so only the in-flight side moves.
+  inFlightBytes_ += bytes;
+  inFlightPackedColumns_ += numPackedCols;
+  return true;
+}
+
 void UcxOutputQueue::releaseInFlightBytes(
     int destination,
     int64_t bytes,
@@ -711,6 +736,8 @@ void UcxOutputQueue::releaseInFlightBytes(
   std::vector<ContinuePromise> transferPromises;
   {
     std::lock_guard<std::mutex> l(mutex_);
+    // The destination's counters only while it has a queue; the task-level
+    // total always, or bytes for a page still being sent are stranded.
     if (destination >= 0 && destination < queues_.size() &&
         queues_[destination] != nullptr) {
       queues_[destination]->releaseInFlight(bytes, numPackedCols);
@@ -762,7 +789,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
       data = queue->getData([destination, notify, weakSelf](
                                 std::shared_ptr<UcxGpuPayload> data,
                                 std::vector<int64_t> remainingBytes) {
-        int64_t bytes = data ? data->data->gpu_data->size() : -1L;
+        int64_t bytes = data ? data->payloadBytes() : -1L;
         if (bytes >= 0L) {
           auto self = weakSelf.lock();
           if (self) {
@@ -782,8 +809,7 @@ void UcxOutputQueue::getData(int destination, UcxDataAvailableCallback notify) {
         // This implies data.immediate and no notify upcall will be done.
         // Need to update the stats here. The data is retained by the server
         // until transfer completion.
-        updateStatsWithDequeuedLocked(
-            data.data->data->gpu_data->size(), 1L, promises);
+        updateStatsWithDequeuedLocked(data.data->payloadBytes(), 1L, promises);
       }
     } else {
       data = UcxDestinationQueue::Data{nullptr, {}, true};

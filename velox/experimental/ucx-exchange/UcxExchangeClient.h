@@ -40,9 +40,10 @@ class UcxExchangeClient
         destination_(destination),
         maxQueuedColumns_(kDefaultMaxQueuedColumns),
         kRequestDataSizesMaxWaitSec_(requestDataSizesMaxWaitSec),
-        queue_(std::make_shared<UcxExchangeQueue>(
-            numberOfConsumers,
-            receiveHighWaterBytes)) {
+        queue_(
+            std::make_shared<UcxExchangeQueue>(
+                numberOfConsumers,
+                receiveHighWaterBytes)) {
     VELOX_CHECK_GE(
         destination, 0, "Exchange client destination must not be negative");
   }
@@ -79,6 +80,10 @@ class UcxExchangeClient
   next(int consumerId, bool* atEnd, ContinueFuture* future);
 
   void releaseInFlightReceiveBytes(uint64_t bytes);
+
+  /// Narrows the receive window after a failed allocation of 'attemptedBytes'.
+  /// Returns true if the caller should wait and retry.
+  bool recordReceiveAllocationPressure(uint64_t attemptedBytes);
 
   bool tracksInFlightReceiveBytes() const {
     return queue_->tracksInFlightReceiveBytes();

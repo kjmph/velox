@@ -82,6 +82,12 @@ std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {
 
   VELOX_CHECK_GE(numRows, 0, "UCX metadata row count is negative");
   std::memcpy(ptr, &numRows, sizeof(numRows));
+  ptr += sizeof(numRows);
+
+  // Presence is the flag; the value is filler.
+  if (!isDeviceData) {
+    *ptr = 0;
+  }
 
   return std::make_pair<std::shared_ptr<uint8_t>, size_t>(
       std::move(buffer), totalSize);
@@ -146,10 +152,14 @@ MetadataMsg MetadataMsg::deserializeMetadataMsg(const uint8_t* buffer) {
   // numRows was added as a trailing extension. Metadata produced by older
   // workers ends after atEnd. This is parse-compatible, but only
   // column-bearing legacy payloads have an inferable physical row count.
+  //
+  // A trailing byte after numRows marks a host payload.
   const auto trailingBytes = endPtr - ptr;
-  if (trailingBytes == sizeof(record.numRows)) {
+  if (trailingBytes == sizeof(record.numRows) ||
+      trailingBytes == sizeof(record.numRows) + 1) {
     std::memcpy(&record.numRows, ptr, sizeof(record.numRows));
     VELOX_CHECK_GE(record.numRows, 0, "UCX metadata row count is negative");
+    record.isDeviceData = trailingBytes == sizeof(record.numRows);
   } else if (trailingBytes != 0) {
     throw std::runtime_error("Invalid trailing UCX metadata bytes");
   }

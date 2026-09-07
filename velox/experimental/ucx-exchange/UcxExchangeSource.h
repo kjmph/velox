@@ -169,6 +169,7 @@ class UcxExchangeSource
     // Abort draining does not depend on free device memory. A committed GPU
     // send can land in this host buffer and be discarded without unpacking.
     std::unique_ptr<uint8_t[]> discardBuf;
+    std::unique_ptr<uint8_t[]> hostBuf;
     rmm::cuda_stream_view stream; // The stream used to allocate dataBuf
     bool receiveBytesReserved{false};
   };

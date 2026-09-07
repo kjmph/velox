@@ -289,6 +289,10 @@ struct MetadataMsg {
   std::vector<WireRemainingElementType> remainingBytes;
   bool atEnd{false};
 
+  /// Whether the payload is device memory or host bytes. Written only when
+  /// false, as a trailing byte, so device payloads stay byte-identical.
+  bool isDeviceData{true};
+
   uint32_t getSerializedSize() const {
     // The header: the magic number and the metadata length.
     uint32_t totalSize = sizeof(kMagicNumber) + sizeof(totalSize);
@@ -307,6 +311,9 @@ struct MetadataMsg {
     // compatibility: older receivers ignore it and newer receivers can parse
     // legacy records. Zero-column logical rows require upgraded peers.
     totalSize += sizeof(numRows);
+    if (!isDeviceData) {
+      totalSize += sizeof(uint8_t);
+    }
 
     return totalSize;
   }

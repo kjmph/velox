@@ -173,7 +173,11 @@ be adopted incrementally.
 
 The UCX exchange is experimental and is built separately from the core library
 (it requires a system UCX installation and benefits from GPUDirect/RDMA-capable
-hardware).
+hardware). When Velox builds cuDF from source, the transport is controlled by
+``VELOX_ENABLE_UCX_EXCHANGE``, which defaults to whether UCX's CMake package was
+found. Setting it ``OFF`` builds the cuDF backend without the transport, so no
+plan can select ``TransportKind::kUcx``. Setting it ``ON`` without a system UCX
+installation and its CMake package is a configure error.
 
 Choosing an approach
 --------------------

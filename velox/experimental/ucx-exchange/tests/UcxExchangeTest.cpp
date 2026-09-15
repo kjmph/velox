@@ -32,6 +32,7 @@
 #include <gtest/gtest.h>
 #include <rmm/device_buffer.hpp>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -1509,6 +1510,56 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     queueManager_->removeTask(srcTaskId);
   }
+}
+
+// A polling intra-node transfer must leave opportunities for endpoint and
+// request cleanup even while it keeps the communicator work queue nonempty.
+TEST_P(UcxExchangeTest, pollingDoesNotStarveDeferredCleanup) {
+  if (GetParam() != generateTestParams().front()) {
+    GTEST_SKIP() << "Communicator regression runs once";
+  }
+
+  class PollingElement : public CommElement,
+                         public std::enable_shared_from_this<PollingElement> {
+   public:
+    explicit PollingElement(std::shared_ptr<Communicator> communicator)
+        : CommElement(std::move(communicator)) {}
+
+    void process() override {
+      if (!cleanupRequested_) {
+        auto endpoint = std::make_shared<EndpointRef>(nullptr);
+        endpoint->addCommElem(shared_from_this());
+        communicator_->deferEndpointCleanup(std::move(endpoint));
+        cleanupRequested_ = true;
+      }
+      if (stopPolling.load()) {
+        communicator_->unregister(shared_from_this());
+      } else {
+        communicator_->addToWorkQueue(shared_from_this());
+      }
+    }
+
+    void close() override {
+      stopPolling.store(true);
+      communicator_->unregister(shared_from_this());
+      closed.set_value();
+    }
+
+    std::atomic<bool> stopPolling{false};
+    std::promise<void> closed;
+
+   private:
+    bool cleanupRequested_{false};
+  };
+
+  auto element = std::make_shared<PollingElement>(communicator_);
+  auto closed = element->closed.get_future();
+  communicator_->registerCommElement(element);
+  const auto status = closed.wait_for(std::chrono::seconds(5));
+  // Let an implementation that starves cleanup drain naturally after the
+  // deadline, so a failed assertion does not strand the communicator thread.
+  element->stopPolling.store(true);
+  EXPECT_EQ(status, std::future_status::ready);
 }
 
 // Regression test: aborting a source task while UCXX tagRecv requests are

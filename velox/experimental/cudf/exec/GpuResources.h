@@ -22,6 +22,7 @@
 
 #include <cuda/memory_resource>
 
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -34,6 +35,64 @@ extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
 
+/// Snapshot of memory visible to the current CUDA device. CUDA async pools
+/// retain freed allocations for reuse, so cudaMemGetInfo() alone understates
+/// memory available to RMM. When the primary cuDF resource is an async pool,
+/// the pool fields expose that reusable capacity as well.
+struct CudfDeviceMemoryInfo {
+  int deviceId{-1};
+  uint64_t freeBytes{0};
+  uint64_t totalBytes{0};
+  uint64_t poolReservedBytes{0};
+  uint64_t poolUsedBytes{0};
+  uint64_t poolReusableBytes{0};
+  uint64_t inProcessReservedBytes{0};
+  bool hasPoolStats{false};
+};
+
+[[nodiscard]] std::optional<CudfDeviceMemoryInfo> currentDeviceMemoryInfo();
+
+enum class CudfDeviceMemoryAdmissionStatus {
+  /// CUDA could not provide a memory snapshot. The caller may proceed without
+  /// local admission accounting and let the allocation report any failure.
+  kUnavailable,
+  /// The request and its required headroom fit in the current device budget.
+  kAdmitted,
+  /// Admitting the request would consume the required device headroom.
+  kInsufficient,
+};
+
+/// Token returned by tryReserveCurrentDeviceMemory(). The token is deliberately
+/// not self-releasing: callers normally put releaseDeviceMemoryReservation()
+/// in the same scope guard that owns the allocation attempt.
+struct CudfDeviceMemoryAdmission {
+  CudfDeviceMemoryAdmissionStatus status{
+      CudfDeviceMemoryAdmissionStatus::kUnavailable};
+  int deviceId{-1};
+  uint64_t bytes{0};
+
+  [[nodiscard]] bool mayProceed() const noexcept {
+    return status != CudfDeviceMemoryAdmissionStatus::kInsufficient;
+  }
+};
+
+/// Atomically snapshots and reserves memory for a materialization on the
+/// current CUDA device. The availability check and per-device accounting are
+/// serialized, so concurrent producers cannot all pass against the same free
+/// bytes before publishing their reservations.
+[[nodiscard]] CudfDeviceMemoryAdmission tryReserveCurrentDeviceMemory(
+    uint64_t bytes,
+    uint64_t requiredHeadroomBytes);
+
+/// Releases a token returned with kAdmitted status. Safe to call for an
+/// unavailable or insufficient token.
+void releaseDeviceMemoryReservation(
+    const CudfDeviceMemoryAdmission& admission) noexcept;
+
+/// Clears async-pool handles and materialization reservations recorded for
+/// device-memory admission. Call only after active cuDF work has stopped.
+void clearCurrentDeviceMemoryInfo();
+
 /**
  * @brief Creates a memory resource based on the given mode.
  *
@@ -42,7 +101,10 @@ rmm::device_async_resource_ref get_output_mr();
  * resource.
  */
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
-createMemoryResource(std::string_view mode, int percent);
+createMemoryResource(
+    std::string_view mode,
+    int percent,
+    bool trackAsCurrent = false);
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

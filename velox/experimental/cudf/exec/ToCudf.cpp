@@ -31,6 +31,7 @@
 #endif
 
 #include "folly/Conv.h"
+#include "folly/ScopeGuard.h"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -335,10 +336,18 @@ void registerCudf() {
   cudaFree(nullptr); // Initialize CUDA context at startup
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
-  auto mr = cudf_velox::createMemoryResource(
-      mrMode, CudfConfig::getInstance().memoryPercent);
-  cudf::set_current_device_resource(mr);
+  std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr;
+  // createMemoryResource() publishes an async pool handle so memory snapshots
+  // can include reusable pool capacity. Declare the guard after its local
+  // owner so failure clears the non-owning handle before destroying the pool.
+  auto clearTrackedMemoryResourceOnFailure =
+      folly::makeGuard([] { clearCurrentDeviceMemoryInfo(); });
+  mr.emplace(
+      cudf_velox::createMemoryResource(
+          mrMode, CudfConfig::getInstance().memoryPercent, true));
+  cudf::set_current_device_resource(*mr);
   mr_ = std::move(mr);
+  clearTrackedMemoryResourceOnFailure.dismiss();
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
@@ -375,6 +384,8 @@ void unregisterCudf() {
   // changed in between.
   ucx_exchange::unregisterUcxTransports();
 #endif
+  // Stop publishing raw async-pool handles before destroying their owner.
+  clearCurrentDeviceMemoryInfo();
   output_mr_.reset();
   mr_.reset();
   exec::DriverFactory::adapters.erase(

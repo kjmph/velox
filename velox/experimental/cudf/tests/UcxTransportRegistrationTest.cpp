@@ -189,9 +189,10 @@ TEST_F(UcxTransportRegistrationTest, ucxEntryBuildsUcxExchange) {
           .pool = pool(),
           .executor = executor_.get(),
           .queryConfig = task->queryCtx()->queryConfig()});
-  ASSERT_NE(
-      std::dynamic_pointer_cast<ucx_exchange::UcxExchangeClient>(client),
-      nullptr);
+  auto ucxClient =
+      std::dynamic_pointer_cast<ucx_exchange::UcxExchangeClient>(client);
+  ASSERT_NE(ucxClient, nullptr);
+  EXPECT_EQ(ucxClient->queue()->receiveHighWaterBytes(), 1 << 20);
 
   auto exchangeOperator =
       entry->makeExchangeOperator(0, driverCtx.get(), exchangeNode, client);

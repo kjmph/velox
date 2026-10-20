@@ -368,4 +368,37 @@ TEST_F(CudfVectorTest, releaseCallbackSynchronizesReboundStream) {
   EXPECT_EQ(callbackCount, 1);
 }
 
+TEST_F(CudfVectorTest, packedStorageReturnsReceiveCreditsOnce) {
+  TestCudaStream allocationStream;
+  TestCudaStream targetStream;
+  RecordingAsyncDeviceResource resource;
+  for (bool materialize : {false, true}) {
+    auto packedTable = makePackedTable(allocationStream.view(), resource);
+    int callbacks = 0;
+    auto vector = std::make_shared<CudfVector>(
+        pool_.get(),
+        ROW({"c0"}, {INTEGER()}),
+        packedTable->table.num_rows(),
+        std::move(packedTable),
+        allocationStream.view(),
+        [&](std::exception_ptr error) {
+          EXPECT_FALSE(error);
+          ++callbacks;
+          EXPECT_GT(resource.deallocationCount(), 0);
+          EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
+          EXPECT_EQ(cudaStreamQuery(targetStream.value()), cudaSuccess);
+        });
+    resource.reset();
+    ASSERT_TRUE(vector->rebindStream(targetStream.view()));
+    EXPECT_EQ(callbacks, 0);
+    if (materialize) {
+      auto table = vector->release();
+      EXPECT_EQ(table->num_rows(), 4);
+      EXPECT_EQ(callbacks, 1);
+    }
+    vector.reset();
+    EXPECT_EQ(callbacks, 1);
+  }
+}
+
 } // namespace

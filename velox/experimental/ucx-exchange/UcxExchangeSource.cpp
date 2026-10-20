@@ -129,8 +129,10 @@ std::shared_ptr<UcxExchangeSource> UcxExchangeSource::create(
 
 void UcxExchangeSource::start() {
   std::lock_guard<std::recursive_mutex> lock(processMutex_);
+  // A closed client can discover a producer after its receive queue stops
+  // accepting sources. Such a source starts only to handshake and abort that
+  // producer; closeRequested_ must not suppress this cleanup handshake.
   if (started_.load(std::memory_order_acquire) ||
-      closeRequested_.load(std::memory_order_acquire) ||
       closed_.load(std::memory_order_acquire)) {
     return;
   }
@@ -284,15 +286,13 @@ void UcxExchangeSource::processStateMachine() {
       return;
     }
 
-    if (closeRequested_.load(std::memory_order_acquire)) {
-      if (getState() == ReceiverState::Created) {
-        setState(ReceiverState::Done);
-      } else if (
-          handshakeAccepted_ &&
-          getState() != ReceiverState::DrainingAfterAbort &&
-          getState() != ReceiverState::Done) {
-        startAbortDrain();
-      }
+    // Even a source closed before its first processing pass must handshake:
+    // the producer needs the subsequent abort to release this destination.
+    // Only communicator shutdown may force cleanup without that handshake.
+    if (closeRequested_.load(std::memory_order_acquire) && handshakeAccepted_ &&
+        getState() != ReceiverState::DrainingAfterAbort &&
+        getState() != ReceiverState::Done) {
+      startAbortDrain();
     }
 
     switch (state_) {

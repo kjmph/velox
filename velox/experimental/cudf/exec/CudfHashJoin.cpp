@@ -199,7 +199,10 @@ cudf::size_type countNullJoinKeys(
     return 0;
   }
   auto [_, nullCount] =
-      cudf::bitmask_and(tableView.select(keyIndices), stream, get_temp_mr());
+      cudf::bitmask_and(
+          tableView.select(keyIndices),
+          stream,
+          cudf::memory_resources{get_temp_mr(), get_temp_mr()});
   return nullCount;
 }
 
@@ -716,7 +719,11 @@ void CudfHashJoinBuild::buildAndPublish(std::vector<CudfVectorPtr> inputs) {
     if (useDistinctHashJoin) {
       hashObjects.push_back(nullptr);
       distinctHashObjects.push_back(std::make_shared<cudf::distinct_hash_join>(
-          buildKeyView, cudf::null_equality::UNEQUAL, 0.5, stream));
+          buildKeyView,
+          cudf::null_equality::UNEQUAL,
+          0.5,
+          stream,
+          get_temp_mr()));
       VELOX_CHECK_NOT_NULL(distinctHashObjects.back());
     } else if (preferProbeUniqueInnerJoin) {
       hashObjects.push_back(nullptr);
@@ -1149,7 +1156,11 @@ CudfHashJoinProbe::unfilteredOutputWithIdentityLeft(
 
   auto rightInput = rightTableView.select(outputLayout_.buildColumnIndices());
   auto rightResult = cudf::gather(
-      rightInput, rightIndicesCol, oobPolicy, stream, get_output_mr());
+      rightInput,
+      rightIndicesCol,
+      oobPolicy,
+      stream,
+      cudf::memory_resources{get_output_mr(), get_temp_mr()});
   auto rightCols = rightResult->release();
   outputLayout_.scatterGatheredBuildColumns(joinedCols, rightCols);
 
@@ -1330,7 +1341,11 @@ CudfHashJoinProbe::computeProbeUniqueInnerJoinIndices(
     cudf::table_view rightKeyView,
     cuda::stream_ref stream) {
   cudf::distinct_hash_join probeHashJoin{
-      leftKeyView, cudf::null_equality::UNEQUAL, 0.5, stream};
+      leftKeyView,
+      cudf::null_equality::UNEQUAL,
+      0.5,
+      stream,
+      get_temp_mr()};
   auto [rightJoinIndices, leftJoinIndices] =
       probeHashJoin.inner_join(rightKeyView, stream, get_temp_mr());
   return std::make_pair(
@@ -2118,13 +2133,13 @@ CudfHashJoinProbe::leftSemiProjectMinMaxJoin(
         rightIndicesCol,
         oobPolicy,
         stream,
-        get_temp_mr());
+        cudf::memory_resources{get_temp_mr(), get_temp_mr()});
     auto gatheredMaxTable = cudf::gather(
         cudf::table_view{{maxValue}},
         rightIndicesCol,
         oobPolicy,
         stream,
-        get_temp_mr());
+        cudf::memory_resources{get_temp_mr(), get_temp_mr()});
     auto gatheredMinColumns = gatheredMinTable->release();
     auto gatheredMaxColumns = gatheredMaxTable->release();
     VELOX_CHECK_EQ(gatheredMinColumns.size(), 1);
@@ -2275,7 +2290,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
         leftKeyView,
         cudf::null_equality::UNEQUAL,
         cudf::join_prefilter::NO,
-        stream);
+        stream,
+        get_temp_mr());
     // Scatter reads all inputs asynchronously. Keep old match columns, scatter
     // maps, and scalar sources alive until the final stream synchronization
     // below.

@@ -3063,6 +3063,9 @@ TEST_F(HashJoinTest, rightJoinWithBatchConcat) {
   auto task = AssertQueryBuilder(plan)
                   .maxDrivers(kNumDrivers)
                   .config(
+                      cudf_velox::CudfFromVelox::kGpuBatchSizeRows,
+                      std::to_string(kRowsPerBatch))
+                  .config(
                       core::QueryConfig::kMaxLocalExchangePartitionCount,
                       std::to_string(kNumDrivers))
                   .assertResults(expected);
@@ -4180,6 +4183,42 @@ TEST_F(HashJoinTest, semiProjectWithFilter) {
         .injectSpill(false)
         .run();
   }
+}
+
+TEST_F(HashJoinTest, semiProjectNotEqualWithTrustedNonNullKeys) {
+  auto probe = makeRowVector(
+      {"t0", "t1"},
+      {makeFlatVector<int32_t>({1, 2, 3, 5}),
+       makeFlatVector<int64_t>({10, 20, 30, 50})});
+  auto build = makeRowVector(
+      {"u0", "u1"},
+      {makeFlatVector<int32_t>({1, 1, 2, 3}),
+       makeNullableFlatVector<int64_t>({10, 11, 20, std::nullopt})});
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(generator)
+                  .values({probe})
+                  .hashJoin(
+                      {"t0"},
+                      {"u0"},
+                      PlanBuilder(generator).values({build}).planNode(),
+                      "t1 <> u1",
+                      {"t0", "t1", "match"},
+                      core::JoinType::kLeftSemiProject,
+                      true /* nullAware */)
+                  .planNode();
+  auto trustedPlan =
+      core::HashJoinNode::Builder(*plan->as<core::HashJoinNode>())
+          .leftKeysNonNull(true)
+          .rightKeysNonNull(true)
+          .build();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .plan(trustedPlan)
+      .assertResults(
+          "SELECT t0, t1, t0 IN (SELECT u0 FROM u WHERE t1 <> u1) FROM t");
 }
 
 // Comprehensive edge case tests for null-aware left semi project with filter

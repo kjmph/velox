@@ -425,7 +425,9 @@ class AggregationAdapter : public OperatorAdapter {
     if (cudfConfig.concatOptimizationEnabled &&
         !flushesGroupIdPartialInput) {
       VELOX_CHECK_GT(cudfConfig.batchSizeMinThreshold, 0);
-      auto targetRows = static_cast<size_t>(cudfConfig.batchSizeMinThreshold);
+      // Leave the default path to select the configured byte or row target.
+      // An explicit row target is reserved for the final-aggregation override.
+      size_t targetRows = 0;
       if (!isGlobal && !isDistinct &&
           aggregationPlanNode->step() == core::AggregationNode::Step::kFinal &&
           cudfConfig.finalAggregationBatchSizeMinThreshold.has_value()) {

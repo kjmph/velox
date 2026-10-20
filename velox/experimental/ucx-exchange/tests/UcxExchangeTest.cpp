@@ -42,6 +42,8 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowExchangeClient.h"
+#include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
@@ -910,6 +912,90 @@ TEST_F(UcxExchangeFocusedTest, sharedClientSurvivesOneExchangeClose) {
   EXPECT_EQ(rowsReceived, static_cast<uint64_t>(numChunks) * numRowsPerChunk);
 
   queueManager()->removeTask(srcTaskId);
+}
+
+// A Task owns its receive client and may close it before a later split update
+// reveals a producer. The late source still needs to handshake and abort so the
+// producer can discard buffered output and finish, even though no data is read.
+TEST_F(UcxExchangeFocusedTest, closedGpuClientReleasesLateProducer) {
+  const auto prefix = getUniqueTaskPrefix();
+  const auto producerId = prefix + "lateGpuProducer";
+  auto producer = createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
+  queueManager()->initializeTask(
+      producer, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1);
+  auto removeProducer = folly::makeGuard(
+      [&]() { queueManager()->removeTask(producerId); });
+  UcxPartitionedOutputMock output(producerId, 1, 1, 2, 10);
+  output.run();
+  output.joinThreads();
+  ASSERT_FALSE(queueManager()->isFinished(producerId));
+
+  auto client = std::make_shared<UcxExchangeClient>(prefix + "closedGpu", 0, 1);
+  client->close();
+  const auto split = remoteSplit(producerId, 0);
+  const auto remote = std::dynamic_pointer_cast<exec::RemoteConnectorSplit>(
+      split.connectorSplit);
+  ASSERT_NE(remote, nullptr);
+  client->addRemoteTaskId(remote->taskId);
+  client->addRemoteTaskId(remote->taskId);
+  client->noMoreRemoteTasks();
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!queueManager()->isFinished(producerId) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(queueManager()->isFinished(producerId));
+  EXPECT_EQ(client->getRemoteTaskIdList().size(), 1);
+  bool atEnd = false;
+  ContinueFuture future;
+  EXPECT_EQ(client->next(0, &atEnd, &future), nullptr);
+  EXPECT_TRUE(atEnd);
+  EXPECT_FALSE(future.valid());
+}
+
+TEST_F(UcxExchangeFocusedTest, closedCpuClientReleasesLateProducer) {
+  const auto prefix = getUniqueTaskPrefix();
+  const auto producerId = prefix + "lateCpuProducer";
+  auto producer = createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
+  auto manager = UcxCpuRowOutputQueueManager::getInstanceRef();
+  manager->initializeTask(
+      producer, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1);
+  auto removeProducer =
+      folly::makeGuard([&]() { manager->removeTask(producerId); });
+  auto payload = std::make_unique<UcxCpuRowPayload>();
+  payload->data = folly::IOBuf::copyBuffer("discarded");
+  payload->numRows = 1;
+  payload->numBytes = payload->data->length();
+  manager->enqueue(producerId, 0, std::move(payload), 1);
+  manager->noMoreData(producerId);
+  ASSERT_FALSE(manager->isFinished(producerId));
+
+  auto client =
+      std::make_shared<UcxCpuRowExchangeClient>(prefix + "closedCpu", 0, 1);
+  client->close();
+  const auto split = remoteSplit(producerId, 0);
+  const auto remote = std::dynamic_pointer_cast<exec::RemoteConnectorSplit>(
+      split.connectorSplit);
+  ASSERT_NE(remote, nullptr);
+  client->addRemoteTaskId(remote->taskId);
+  client->addRemoteTaskId(remote->taskId);
+  client->noMoreRemoteTasks();
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!manager->isFinished(producerId) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(manager->isFinished(producerId));
+  EXPECT_EQ(client->getRemoteTaskIdList().size(), 1);
+  bool atEnd = false;
+  ContinueFuture future;
+  EXPECT_EQ(client->next(0, &atEnd, &future), nullptr);
+  EXPECT_TRUE(atEnd);
+  EXPECT_FALSE(future.valid());
 }
 
 // Test that verifies intra-node exchange does not livelock when a producing

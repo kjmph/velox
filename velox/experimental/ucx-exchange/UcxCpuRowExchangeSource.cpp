@@ -253,6 +253,12 @@ std::shared_ptr<UcxCpuRowExchangeSource> UcxCpuRowExchangeSource::create(
 }
 
 void UcxCpuRowExchangeSource::start() {
+  std::lock_guard<std::recursive_mutex> processLock(processMutex_);
+  bool expected = false;
+  VELOX_CHECK(
+      started_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel),
+      "UcxCpuRowExchangeSource::start called more than once");
   auto self = getSelfPtr();
   VELOX_CHECK_NOT_NULL(
       self, "UcxCpuRowExchangeSource must be owned by shared_ptr");
@@ -266,15 +272,13 @@ void UcxCpuRowExchangeSource::process() {
       return;
     }
 
-    if (closeRequested_.load(std::memory_order_acquire)) {
-      if (getState() == ReceiverState::Created) {
-        setState(ReceiverState::Done);
-      } else if (
-          handshakeAccepted_ &&
-          getState() != ReceiverState::DrainingAfterAbort &&
-          getState() != ReceiverState::Done) {
-        startAbortDrain();
-      }
+    // Even a source closed before its first processing pass must handshake:
+    // the producer needs the subsequent abort to release this destination.
+    // Only communicator shutdown may force cleanup without that handshake.
+    if (closeRequested_.load(std::memory_order_acquire) &&
+        handshakeAccepted_ && getState() != ReceiverState::DrainingAfterAbort &&
+        getState() != ReceiverState::Done) {
+      startAbortDrain();
     }
 
     switch (state_) {
@@ -419,7 +423,9 @@ void UcxCpuRowExchangeSource::close() {
     return;
   }
   deliverEndMarker();
-  communicator_->addToWorkQueue(getSelfPtr());
+  if (started_.load(std::memory_order_acquire)) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
 }
 
 void UcxCpuRowExchangeSource::forceCloseForShutdown() {

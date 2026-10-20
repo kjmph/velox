@@ -24,25 +24,31 @@ void UcxCpuRowExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
   if (cpuUcxExchangeEnabled()) {
     VELOX_CHECK(startCpuUcxExchange(), "CPU UCX communicator failed to start");
   }
+  std::shared_ptr<UcxCpuRowExchangeSource> sourceToStart;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
-
-    bool duplicate = !remoteTaskIds_.insert(std::string{remoteTaskId}).second;
-    if (duplicate) {
+    if (!remoteTaskIds_.emplace(remoteTaskId).second) {
+      // Task updates may repeat producers, including after the client closes.
       return;
     }
-
-    if (closed_) {
-      return;
+    if (!closed_) {
+      sourceToStart = UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
+      sources_.push_back(sourceToStart);
+      queue_->addSourceLocked();
+      sourceToStart->setRegistered();
     }
-
-    auto source =
-        UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
-    sources_.push_back(source);
-    queue_->addSourceLocked();
-    source->setRegistered();
-    source->start();
   }
+
+  if (!sourceToStart) {
+    // Task can discover producers after its receive client closes. Establish
+    // their control connection and abort it so producer output is released.
+    // This source must not participate in the closed receive queue's counts.
+    sourceToStart = UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
+    sourceToStart->close();
+  }
+  // Registration can synchronously reject during communicator shutdown and
+  // close() may deliver an end marker, so both run outside the queue mutex.
+  sourceToStart->start();
 }
 
 void UcxCpuRowExchangeClient::noMoreRemoteTasks() {

@@ -85,17 +85,20 @@ void UcxExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
     }
   }
 
-  // Outside of lock.
+  // A producer discovered after closure still needs a control connection and
+  // partition abort. This source stays outside the closed queue's counts.
+  // Both close() and start() run outside the receive-queue mutex.
   if (toClose) {
-    toClose->close();
-    return;
+    toStart = std::move(toClose);
+    toStart->close();
   }
 
   try {
     toStart->start();
   } catch (...) {
-    // The source was already counted in the queue. close() delivers its end
-    // marker even if Communicator registration failed partway through.
+    // For registered sources, close() delivers the counted end marker even
+    // if Communicator registration failed partway through. Late sources are
+    // uncounted and only need control-path cleanup.
     try {
       toStart->close();
     } catch (...) {

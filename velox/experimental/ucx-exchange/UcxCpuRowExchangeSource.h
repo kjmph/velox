@@ -60,9 +60,9 @@ class UcxCpuRowExchangeSource
       std::string_view url,
       const std::shared_ptr<UcxCpuRowExchangeQueue>& queue);
 
-  /// Starts communicator processing for this source. Call after the
-  /// owning exchange queue has registered the source so any early
-  /// failure can wake consumers correctly.
+  /// Starts communicator processing exactly once. Register active sources
+  /// with the receive queue first. A late source for a closed client instead
+  /// calls close() before start(), and only handshakes to abort the producer.
   void start();
 
   void process() override;
@@ -212,6 +212,7 @@ class UcxCpuRowExchangeSource
   std::map<uint32_t, UcxCpuRowReceivedPtr> completedData_;
 
   const std::shared_ptr<UcxCpuRowExchangeQueue> queue_{nullptr};
+  std::atomic<bool> started_{false};
   std::atomic<bool> closeRequested_{false};
   std::atomic<bool> closed_{false};
   bool cleanupStarted_{false};

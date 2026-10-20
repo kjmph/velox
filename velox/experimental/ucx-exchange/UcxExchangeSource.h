@@ -90,9 +90,9 @@ class UcxExchangeSource
       std::string_view url,
       const std::shared_ptr<UcxExchangeQueue>& queue);
 
-  /// Starts communicator processing for this source. Call only after the
-  /// owning exchange queue has registered the source so an early connection
-  /// failure can deliver its end marker correctly.
+  /// Starts communicator processing exactly once. Register active sources
+  /// with the receive queue first. A late source for a closed client instead
+  /// calls close() before start(), and only handshakes to abort the producer.
   void start();
 
   bool supportsMetrics() const {

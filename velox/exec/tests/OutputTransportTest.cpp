@@ -448,10 +448,10 @@ TEST_F(
   auto task =
       makeBroadcastTask("task-output-initialize-failure", transportType);
 
-  VELOX_ASSERT_THROW(
-      task->start(1, 1), "injected output buffer initialization failure");
+  EXPECT_THROW(task->start(1, 1), std::runtime_error);
 
   EXPECT_EQ(task->state(), TaskState::kFailed);
+  EXPECT_EQ(task->errorMessage(), "injected output buffer initialization failure");
   EXPECT_EQ(manager->initializeCount.load(), 1);
   EXPECT_EQ(manager->updateCount.load(), 0);
   EXPECT_EQ(manager->removeCount.load(), 1);
@@ -472,10 +472,10 @@ TEST_F(OutputTransportTest, replayFailureTerminatesTaskAndCleansBuffer) {
   auto task = makeBroadcastTask("task-output-replay-failure", transportType);
   EXPECT_TRUE(task->updateOutputBuffers(10, true));
 
-  VELOX_ASSERT_THROW(
-      task->start(1, 1), "injected output buffer replay failure");
+  EXPECT_THROW(task->start(1, 1), std::runtime_error);
 
   EXPECT_EQ(task->state(), TaskState::kFailed);
+  EXPECT_EQ(task->errorMessage(), "injected output buffer replay failure");
   EXPECT_EQ(manager->initializeCount.load(), 1);
   EXPECT_EQ(manager->updateCount.load(), 1);
   EXPECT_EQ(manager->removeCount.load(), 1);

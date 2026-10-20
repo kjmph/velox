@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
+#include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -491,4 +492,57 @@ TEST_F(AdapterOperatorTest, adaptsCudfOperatorInsertedByEarlierAdapter) {
   EXPECT_TRUE(projStats.operatorStats.count("CudfBatchConcat"));
   EXPECT_TRUE(projStats.operatorStats.count("CudfToVelox"));
   EXPECT_FALSE(projStats.operatorStats.count("FilterProject"));
+}
+
+TEST_F(AdapterOperatorTest, groupedScalarFilterUsesTypedExpressions) {
+  auto queryCtx = core::QueryCtx::create();
+  core::ExecCtx execCtx(pool(), queryCtx.get());
+  const auto augmentedType = ROW(
+      {"group_id", "value", "scalar_value"}, {BIGINT(), BIGINT(), BIGINT()});
+  auto predicate = cudf_velox::test_utils::parseAndInferTypedExpr(
+      "group_id = 0 AND value > scalar_value + (1 + 1)",
+      augmentedType,
+      &execCtx);
+
+  auto grouped = makeRowVector(
+      {"group_id", "value"},
+      {makeFlatVector<int64_t>({0, 0, 0}),
+       makeFlatVector<int64_t>({5, 12, 20})});
+  auto scalar = makeRowVector(
+      {"group_id", "value"},
+      {makeFlatVector<int64_t>({1}), makeFlatVector<int64_t>({10})});
+  auto expected = makeRowVector(
+      {"group_id", "value"},
+      {makeFlatVector<int64_t>({0}), makeFlatVector<int64_t>({20})});
+
+  const auto run = [&](const std::vector<RowVectorPtr>& batches,
+                       const RowVectorPtr& expectedRows) {
+    auto plan = PlanBuilder()
+                    .values(batches)
+                    .addNode([&](core::PlanNodeId id, core::PlanNodePtr source) {
+                      return std::make_shared<core::GroupedScalarFilterNode>(
+                          id,
+                          std::move(source),
+                          "group_id",
+                          0,
+                          1,
+                          "value",
+                          "scalar_value",
+                          predicate);
+                    })
+                    .planNode();
+    std::shared_ptr<Task> task;
+    auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
+    facebook::velox::test::assertEqualVectors(expectedRows, result);
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_TRUE(
+        stats.at(plan->id()).operatorStats.count("CudfGroupedScalarFilter"));
+  };
+  run({grouped, scalar}, expected);
+  auto empty = makeRowVector(
+      {"group_id", "value"},
+      {makeFlatVector<int64_t>(std::vector<int64_t>{}),
+       makeFlatVector<int64_t>(std::vector<int64_t>{})});
+  run({grouped}, empty);
+  run({empty}, empty);
 }

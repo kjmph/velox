@@ -183,6 +183,15 @@ bool usesPrebuiltCudfHashJoin(const core::HashJoinNode& joinNode) {
       (joinNode.isLeftSemiProjectJoin() && joinNode.filter());
 }
 
+bool canUseMinMaxSummary(const core::HashJoinNode& joinNode) {
+  // The summary records boolean matches; it cannot represent the unknown
+  // marker produced by a null-aware join when either side has null keys.
+  return joinNode.isLeftSemiProjectJoin() && joinNode.filter() &&
+      joinNode.leftKeys().size() == 1 && joinNode.rightKeys().size() == 1 &&
+      (!joinNode.isNullAware() ||
+       (joinNode.leftKeysNonNull() && joinNode.rightKeysNonNull()));
+}
+
 bool useProbeUniqueInnerJoin(const core::HashJoinNode& joinNode) {
   return CudfConfig::getInstance().probeUniqueInnerJoinEnabled &&
       CudfConfig::getInstance().distinctHashJoinEnabled &&
@@ -595,8 +604,7 @@ CudfHashJoinBuild::CudfHashJoinBuild(
     buildKeyIndices_[i] = static_cast<cudf::size_type>(
         buildType->getChildIdx(rightKeys[i]->name()));
   }
-  if (joinNode_->filter() && joinNode_->isLeftSemiProjectJoin() &&
-      buildKeyIndices_.size() == 1) {
+  if (canUseMinMaxSummary(*joinNode_)) {
     simpleNotEqual_ = detectSimpleCrossSideNotEqual(
         joinNode_->filter(),
         asRowType(joinNode_->sources()[0]->outputType()),
@@ -899,8 +907,7 @@ void CudfHashJoinProbe::initialize() {
       pool,
       config);
 
-  if (joinNode_->isLeftSemiProjectJoin() && leftKeyIndices_.size() == 1 &&
-      rightKeyIndices_.size() == 1) {
+  if (canUseMinMaxSummary(*joinNode_)) {
     auto simpleNotEqual = detectSimpleCrossSideNotEqual(
         joinNode_->filter(), probeType_, buildType_);
     if (simpleNotEqual.has_value()) {
@@ -2239,9 +2246,8 @@ CudfHashJoinProbe::leftSemiProjectJoin(
   const bool isNullAwareWithFilter = isNullAware && hasFilter;
   const bool isNullAwareWithoutFilter = isNullAware && !hasFilter;
 
-  // Q21 EXISTS semijoins arrive as null-aware left semi project joins. The
-  // simple cross-side NOT_EQUAL filter still produces a boolean EXISTS marker:
-  // NULL comparisons do not match and are folded to false in the min/max path.
+  // A min/max summary is selected only when the join has boolean marker
+  // semantics, including null-aware joins whose keys are known non-null.
   if (hasFilter && simpleNotEqualLeftIndex_.has_value() &&
       simpleNotEqualRightIndex_.has_value()) {
     return leftSemiProjectMinMaxJoin(leftTableView, stream);

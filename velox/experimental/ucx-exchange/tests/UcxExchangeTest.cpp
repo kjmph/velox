@@ -949,7 +949,7 @@ TEST_F(UcxExchangeFocusedTest, closedGpuClientReleasesLateProducer) {
   EXPECT_TRUE(queueManager()->isFinished(producerId));
   EXPECT_EQ(client->getRemoteTaskIdList().size(), 1);
   bool atEnd = false;
-  ContinueFuture future;
+  ContinueFuture future = ContinueFuture::makeEmpty();
   EXPECT_EQ(client->next(0, &atEnd, &future), nullptr);
   EXPECT_TRUE(atEnd);
   EXPECT_FALSE(future.valid());
@@ -992,7 +992,7 @@ TEST_F(UcxExchangeFocusedTest, closedCpuClientReleasesLateProducer) {
   EXPECT_TRUE(manager->isFinished(producerId));
   EXPECT_EQ(client->getRemoteTaskIdList().size(), 1);
   bool atEnd = false;
-  ContinueFuture future;
+  ContinueFuture future = ContinueFuture::makeEmpty();
   EXPECT_EQ(client->next(0, &atEnd, &future), nullptr);
   EXPECT_TRUE(atEnd);
   EXPECT_FALSE(future.valid());

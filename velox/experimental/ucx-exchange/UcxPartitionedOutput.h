@@ -171,8 +171,11 @@ class UcxPartitionedOutput : public exec::Operator,
     int64_t estimatedBytes{0};
     cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
     size_t nextDestination{0};
-    cudf::size_type nextRow{0};
-    uint64_t nextPayloadBytes{0};
+    // Each destination resumes at its first unpublished row. A stalled
+    // destination must not suppress replicas for the other destinations.
+    std::vector<cudf::size_type> nextRows;
+    std::vector<uint64_t> nextPayloadBytes;
+    size_t remainingDestinations{0};
   };
 
   void partitionPendingInputBatch();

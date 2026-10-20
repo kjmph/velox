@@ -450,7 +450,7 @@ bool UcxPartitionedOutput::prepareReplicateNullsAndAny(
         1,
         static_cast<vector_size_t>(input.numRows));
     PendingReplicatedBatch replicatedBatch{
-        nullptr, {}, slices[0], replicatedEstimate, stream, 0, 0, 0};
+        nullptr, {}, slices[0], replicatedEstimate, stream, 0, {}, {}, 0};
     if (input.numRows == 1) {
       replicatedBatch.tableOwner = std::move(input.tableOwner);
       replicatedBatch.vectorOwners = std::move(input.vectorOwners);
@@ -523,7 +523,8 @@ bool UcxPartitionedOutput::prepareReplicateNullsAndAny(
             replicatedEstimate,
             stream,
             0,
-            0,
+            {},
+            {},
             0});
   }
   if (needsArbitraryRow) {
@@ -572,168 +573,233 @@ bool UcxPartitionedOutput::drainPendingReplicatedBatch() {
     return estimate > static_cast<long double>(whole) ? whole + 1 : whole;
   };
 
-  while (batch.nextDestination < numPartitions_) {
-    if (maybeFinishCancelled()) {
-      return false;
+  if (batch.nextRows.empty()) {
+    // Publish the initialization sentinel only after every allocation succeeds.
+    std::vector<cudf::size_type> nextRows(numPartitions_, 0);
+    std::vector<uint64_t> nextPayloadBytes(numPartitions_, 0);
+    batch.nextRows = std::move(nextRows);
+    batch.nextPayloadBytes = std::move(nextPayloadBytes);
+    batch.remainingDestinations = numPartitions_;
+  }
+
+  while (batch.remainingDestinations > 0) {
+    bool madeProgress = false;
+    int waitDestination = -1;
+    uint64_t waitBytes = 0;
+    uint64_t waitLimit = 0;
+    auto rememberWait = [&](int destination, uint64_t bytes, uint64_t limit) {
+      if (waitDestination < 0) {
+        waitDestination = destination;
+        waitBytes = bytes;
+        waitLimit = limit;
+      }
+    };
+
+    // Visit every destination before parking. Cursors are committed only
+    // after enqueue, so a resumed pass neither duplicates nor loses replicas.
+    for (size_t visited = 0; visited < numPartitions_; ++visited) {
+      if (maybeFinishCancelled()) {
+        return false;
+      }
+      const auto destination = static_cast<int>(batch.nextDestination);
+      batch.nextDestination = (batch.nextDestination + 1) % numPartitions_;
+      auto& nextRow = batch.nextRows[destination];
+      auto& nextPayloadBytes = batch.nextPayloadBytes[destination];
+      if (nextRow == totalRows) {
+        continue;
+      }
+      auto transferWindow =
+          static_cast<uint64_t>(queueManager->transferWindowBytes(
+              this->taskId(),
+              destination,
+              static_cast<int64_t>(baseWindow),
+              static_cast<int64_t>(normalWindow),
+              static_cast<int64_t>(maxWindow)));
+      nextPayloadBytes = nextPayloadBytes == 0
+          ? std::min<uint64_t>(normalWindow, transferWindow)
+          : std::min<uint64_t>(nextPayloadBytes, transferWindow);
+
+      if (queueManager->checkTransferCapacity(
+              this->taskId(), destination, transferWindow, nullptr)) {
+        rememberWait(destination, 1, transferWindow);
+        continue;
+      }
+
+      const auto remainingRows = totalRows - nextRow;
+      const auto remainingBytes = estimatedBytes(nextRow, totalRows);
+      auto rowsForChunk = remainingRows;
+      if (remainingBytes > nextPayloadBytes && nextPayloadBytes > 0) {
+        rowsForChunk = std::max<cudf::size_type>(
+            1,
+            static_cast<cudf::size_type>(
+                static_cast<long double>(remainingRows) *
+                static_cast<long double>(nextPayloadBytes) /
+                static_cast<long double>(remainingBytes)));
+      }
+      auto chunkEnd =
+          std::min<cudf::size_type>(totalRows, nextRow + rowsForChunk);
+
+      auto slice = [&](cudf::size_type end) {
+        std::vector<cudf::size_type> offsets{nextRow, end};
+        auto slices = cudf::slice(batch.tableView, offsets, batch.stream);
+        VELOX_CHECK_EQ(slices.size(), 1);
+        return slices.front();
+      };
+
+      uint64_t exactBytes = 0;
+      try {
+        exactBytes =
+            cudf::packed_size(slice(chunkEnd), batch.stream, get_temp_mr());
+        while (exactBytes > transferWindow && chunkEnd - nextRow > 1) {
+          const auto currentRows = chunkEnd - nextRow;
+          const auto adjustedRows = std::clamp<cudf::size_type>(
+              static_cast<cudf::size_type>(
+                  static_cast<long double>(currentRows) *
+                  static_cast<long double>(transferWindow) /
+                  static_cast<long double>(exactBytes)),
+              1,
+              currentRows - 1);
+          chunkEnd = nextRow + adjustedRows;
+          exactBytes =
+              cudf::packed_size(slice(chunkEnd), batch.stream, get_temp_mr());
+        }
+      } catch (const std::bad_alloc&) {
+        if (!recordAllocationPressure(
+                std::max<uint64_t>(nextPayloadBytes, 1))) {
+          throw;
+        }
+        return false;
+      }
+
+      if (exactBytes > transferWindow) {
+        queueManager->recordTransferDemand(
+            this->taskId(),
+            destination,
+            static_cast<int64_t>(
+                std::min<uint64_t>(exactBytes, maxReservation)),
+            static_cast<int64_t>(baseWindow),
+            static_cast<int64_t>(maxWindow));
+        transferWindow =
+            static_cast<uint64_t>(queueManager->transferWindowBytes(
+                this->taskId(),
+                destination,
+                static_cast<int64_t>(baseWindow),
+                static_cast<int64_t>(normalWindow),
+                static_cast<int64_t>(maxWindow)));
+      }
+
+      VELOX_CHECK_LE(
+          exactBytes,
+          maxReservation,
+          "Replicated UCX payload exceeds the supported reservation range");
+      auto reservationBytes = std::max<uint64_t>(exactBytes, 1);
+      auto reservationLimit = std::min<uint64_t>(
+          std::max<uint64_t>(transferWindow, reservationBytes), maxReservation);
+      if (queueManager->reserveTransferBytes(
+              this->taskId(),
+              destination,
+              static_cast<int64_t>(reservationBytes),
+              static_cast<int64_t>(reservationLimit),
+              nullptr)) {
+        rememberWait(destination, reservationBytes, reservationLimit);
+        continue;
+      }
+      auto releaseReservation = folly::makeGuard([&]() {
+        queueManager->releaseTransferReservation(
+            this->taskId(),
+            destination,
+            static_cast<int64_t>(reservationBytes));
+      });
+
+      std::optional<cudf::packed_columns> packedColumns;
+      try {
+        packedColumns.emplace(
+            cudf::pack(slice(chunkEnd), batch.stream, get_output_mr()));
+      } catch (const std::bad_alloc&) {
+        // Do not let our own reservation make the capacity wait immediately
+        // ready. A retry is useful only if already-retained output can wake it.
+        queueManager->releaseTransferReservation(
+            this->taskId(),
+            destination,
+            static_cast<int64_t>(reservationBytes));
+        releaseReservation.dismiss();
+        if (!recordAllocationPressure(reservationBytes)) {
+          throw;
+        }
+        return false;
+      }
+      batch.stream.sync();
+
+      const auto actualBytes = packedColumns->gpu_data->size();
+      VELOX_CHECK_LE(
+          actualBytes,
+          maxReservation,
+          "Replicated UCX payload exceeds the supported reservation range");
+      if (actualBytes > reservationBytes) {
+        const auto delta = std::min<uint64_t>(
+            actualBytes - reservationBytes, maxReservation - reservationBytes);
+        reservationLimit = std::min<uint64_t>(
+            std::max<uint64_t>(reservationLimit, actualBytes), maxReservation);
+        if (queueManager->reserveTransferBytes(
+                this->taskId(),
+                destination,
+                static_cast<int64_t>(delta),
+                static_cast<int64_t>(reservationLimit),
+                nullptr)) {
+          // The guard releases this attempt's original reservation. A later
+          // pass must reserve the whole packed payload, not only this delta.
+          rememberWait(destination, actualBytes, reservationLimit);
+          continue;
+        }
+        reservationBytes += delta;
+      }
+
+      auto packedColumnsPtr = std::make_unique<cudf::packed_columns>(
+          std::move(packedColumns->metadata),
+          std::move(packedColumns->gpu_data));
+      queueManager->enqueue(
+          this->taskId(),
+          destination,
+          std::move(packedColumnsPtr),
+          chunkEnd - nextRow,
+          static_cast<int64_t>(reservationBytes));
+      releaseReservation.dismiss();
+
+      nextRow = chunkEnd;
+      madeProgress = true;
+      if (nextRow == totalRows) {
+        VELOX_CHECK_GT(batch.remainingDestinations, 0);
+        --batch.remainingDestinations;
+        nextPayloadBytes = 0;
+      } else {
+        nextPayloadBytes = std::min<uint64_t>(
+            transferWindow,
+            multiplySaturated(std::max<uint64_t>(nextPayloadBytes, 1), 2));
+      }
+      if (queueManager->checkBlocked(this->taskId(), &future_)) {
+        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
+        return false;
+      }
     }
-    if (batch.nextRow == totalRows) {
-      ++batch.nextDestination;
-      batch.nextRow = 0;
-      batch.nextPayloadBytes = 0;
+    if (madeProgress) {
       continue;
     }
 
-    const auto destination = static_cast<int>(batch.nextDestination);
-    auto transferWindow =
-        static_cast<uint64_t>(queueManager->transferWindowBytes(
-            this->taskId(),
-            destination,
-            static_cast<int64_t>(baseWindow),
-            static_cast<int64_t>(normalWindow),
-            static_cast<int64_t>(maxWindow)));
-    batch.nextPayloadBytes = batch.nextPayloadBytes == 0
-        ? std::min<uint64_t>(normalWindow, transferWindow)
-        : std::min<uint64_t>(batch.nextPayloadBytes, transferWindow);
-
-    const auto remainingRows = totalRows - batch.nextRow;
-    const auto remainingBytes = estimatedBytes(batch.nextRow, totalRows);
-    auto rowsForChunk = remainingRows;
-    if (remainingBytes > batch.nextPayloadBytes && batch.nextPayloadBytes > 0) {
-      rowsForChunk = std::max<cudf::size_type>(
-          1,
-          static_cast<cudf::size_type>(
-              static_cast<long double>(remainingRows) *
-              static_cast<long double>(batch.nextPayloadBytes) /
-              static_cast<long double>(remainingBytes)));
-    }
-    auto chunkEnd =
-        std::min<cudf::size_type>(totalRows, batch.nextRow + rowsForChunk);
-
-    auto slice = [&](cudf::size_type end) {
-      std::vector<cudf::size_type> offsets{batch.nextRow, end};
-      auto slices = cudf::slice(batch.tableView, offsets, batch.stream);
-      VELOX_CHECK_EQ(slices.size(), 1);
-      return slices.front();
-    };
-
-    uint64_t exactBytes = 0;
-    try {
-      exactBytes =
-          cudf::packed_size(slice(chunkEnd), batch.stream, get_temp_mr());
-      while (exactBytes > transferWindow && chunkEnd - batch.nextRow > 1) {
-        const auto currentRows = chunkEnd - batch.nextRow;
-        const auto adjustedRows = std::clamp<cudf::size_type>(
-            static_cast<cudf::size_type>(
-                static_cast<long double>(currentRows) *
-                static_cast<long double>(transferWindow) /
-                static_cast<long double>(exactBytes)),
-            1,
-            currentRows - 1);
-        chunkEnd = batch.nextRow + adjustedRows;
-        exactBytes =
-            cudf::packed_size(slice(chunkEnd), batch.stream, get_temp_mr());
-      }
-    } catch (const std::bad_alloc&) {
-      if (!recordAllocationPressure(
-              std::max<uint64_t>(batch.nextPayloadBytes, 1))) {
-        throw;
-      }
-      return false;
-    }
-
-    if (exactBytes > transferWindow) {
-      queueManager->recordTransferDemand(
-          this->taskId(),
-          destination,
-          static_cast<int64_t>(std::min<uint64_t>(exactBytes, maxReservation)),
-          static_cast<int64_t>(baseWindow),
-          static_cast<int64_t>(maxWindow));
-      transferWindow = static_cast<uint64_t>(queueManager->transferWindowBytes(
-          this->taskId(),
-          destination,
-          static_cast<int64_t>(baseWindow),
-          static_cast<int64_t>(normalWindow),
-          static_cast<int64_t>(maxWindow)));
-    }
-
-    VELOX_CHECK_LE(
-        exactBytes,
-        maxReservation,
-        "Replicated UCX payload exceeds the supported reservation range");
-    auto reservationBytes = std::max<uint64_t>(exactBytes, 1);
-    auto reservationLimit = std::min<uint64_t>(
-        std::max<uint64_t>(transferWindow, reservationBytes), maxReservation);
+    VELOX_CHECK_GE(waitDestination, 0);
+    // Recheck and install the wakeup atomically under the queue lock. Capacity
+    // may have changed after the probe; return an admitted probe immediately
+    // before retrying the full pass.
     if (queueManager->reserveTransferBytes(
             this->taskId(),
-            destination,
-            static_cast<int64_t>(reservationBytes),
-            static_cast<int64_t>(reservationLimit),
+            waitDestination,
+            static_cast<int64_t>(waitBytes),
+            static_cast<int64_t>(waitLimit),
             &future_)) {
       blockingReason_ = exec::BlockingReason::kWaitForConsumer;
       return false;
     }
-    auto releaseReservation = folly::makeGuard([&]() {
-      queueManager->releaseTransferReservation(
-          this->taskId(), destination, static_cast<int64_t>(reservationBytes));
-    });
-
-    std::optional<cudf::packed_columns> packedColumns;
-    try {
-      packedColumns.emplace(
-          cudf::pack(slice(chunkEnd), batch.stream, get_output_mr()));
-    } catch (const std::bad_alloc&) {
-      // Do not let our own reservation make the capacity wait immediately
-      // ready. A retry is useful only if already-retained output can wake it.
-      queueManager->releaseTransferReservation(
-          this->taskId(), destination, static_cast<int64_t>(reservationBytes));
-      releaseReservation.dismiss();
-      if (!recordAllocationPressure(reservationBytes)) {
-        throw;
-      }
-      return false;
-    }
-    batch.stream.sync();
-
-    const auto actualBytes = packedColumns->gpu_data->size();
-    VELOX_CHECK_LE(
-        actualBytes,
-        maxReservation,
-        "Replicated UCX payload exceeds the supported reservation range");
-    if (actualBytes > reservationBytes) {
-      const auto delta = std::min<uint64_t>(
-          actualBytes - reservationBytes, maxReservation - reservationBytes);
-      reservationLimit = std::min<uint64_t>(
-          std::max<uint64_t>(reservationLimit, actualBytes), maxReservation);
-      if (queueManager->reserveTransferBytes(
-              this->taskId(),
-              destination,
-              static_cast<int64_t>(delta),
-              static_cast<int64_t>(reservationLimit),
-              &future_)) {
-        blockingReason_ = exec::BlockingReason::kWaitForConsumer;
-        return false;
-      }
-      reservationBytes += delta;
-    }
-
-    auto packedColumnsPtr = std::make_unique<cudf::packed_columns>(
-        std::move(packedColumns->metadata), std::move(packedColumns->gpu_data));
-    queueManager->enqueue(
-        this->taskId(),
-        destination,
-        std::move(packedColumnsPtr),
-        chunkEnd - batch.nextRow,
-        static_cast<int64_t>(reservationBytes));
-    releaseReservation.dismiss();
-
-    batch.nextRow = chunkEnd;
-    batch.nextPayloadBytes = std::min<uint64_t>(
-        transferWindow,
-        multiplySaturated(std::max<uint64_t>(batch.nextPayloadBytes, 1), 2));
-    if (queueManager->checkBlocked(this->taskId(), &future_)) {
-      blockingReason_ = exec::BlockingReason::kWaitForConsumer;
-      return false;
-    }
+    queueManager->releaseTransferReservation(
+        this->taskId(), waitDestination, static_cast<int64_t>(waitBytes));
   }
 
   pendingReplicatedBatch_.reset();

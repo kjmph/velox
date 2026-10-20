@@ -940,6 +940,66 @@ TEST_F(UcxPartitionedOutputTest, replicatesNullPartitionKeysToAllDestinations) {
       kNumPartitions * (numNullRows + 1) + (kNumRows - numNullRows - 1));
 }
 
+// A stalled destination must not block the others or make their replicated
+// rows appear again when the stalled destination resumes. The held reservation
+// exercises admission pressure without allocating a huge device buffer.
+TEST_F(UcxPartitionedOutputTest, resumesReplicationWithoutDuplicateRows) {
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  auto task = createPartitionedOutputTask(
+      taskId_,
+      pool_,
+      UcxTestData::kTestRowType,
+      kNumPartitions,
+      {"c0"},
+      FOUR_GBYTES,
+      {{CudfConfig::kUcxPartitionedOutputBatchRows, "1"}},
+      /*replicateNullsAndAny=*/true);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      /*numDrivers=*/1);
+
+  constexpr int64_t kHeldBytes = int64_t{64} << 30;
+  ASSERT_FALSE(queueManager_->reserveTransferBytes(
+      taskId_, 0, kHeldBytes, kHeldBytes, nullptr));
+  auto releaseReservation = folly::makeGuard([&]() {
+    queueManager_->releaseTransferReservation(taskId_, 0, kHeldBytes);
+  });
+
+  auto partitionedOutput = makePartitionedOutput(task);
+  feedBatch(
+      partitionedOutput.get(),
+      makeKeyColumn(
+          {10, 20, kNullSentinel, 30, kNullSentinel, 40}, {2, 4}, stream),
+      stream);
+  ContinueFuture future;
+  EXPECT_EQ(
+      partitionedOutput->isBlocked(&future),
+      exec::BlockingReason::kWaitForConsumer);
+  ASSERT_TRUE(future.valid());
+  EXPECT_FALSE(future.isReady());
+  // The two unblocked destinations have already received their replicas.
+  EXPECT_EQ(numBufferedPages(), kNumPartitions - 1);
+
+  queueManager_->releaseTransferReservation(taskId_, 0, kHeldBytes);
+  releaseReservation.dismiss();
+  ASSERT_TRUE(future.isReady());
+  finishPartitionedOutput(partitionedOutput.get());
+
+  std::vector<int32_t> allKeys;
+  for (int destination = 0; destination < kNumPartitions; ++destination) {
+    const auto keys = drainKeyColumn(destination);
+    EXPECT_EQ(countValue(keys, 10), 1);
+    EXPECT_EQ(countSentinels(keys), 2);
+    allKeys.insert(allKeys.end(), keys.begin(), keys.end());
+  }
+  EXPECT_EQ(allKeys.size(), 3 * kNumPartitions + 3);
+  for (const auto routedKey : {20, 30, 40}) {
+    EXPECT_EQ(countValue(allKeys, routedKey), 1);
+  }
+}
+
 TEST_F(UcxPartitionedOutputTest, replicatesNullFirstRowOncePerDestination) {
   cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
   const std::vector<int32_t> keyValues{

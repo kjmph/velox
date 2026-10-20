@@ -306,7 +306,7 @@ class GroupedScalarFilterAdapter : public OperatorAdapter {
   }
 
   bool canRunOnGPU(
-      const exec::Operator* /*op*/,
+      const exec::Operator* op,
       const core::PlanNodePtr& planNode,
       exec::DriverCtx* ctx) const override {
     auto groupedScalarFilterNode =
@@ -318,9 +318,10 @@ class GroupedScalarFilterAdapter : public OperatorAdapter {
           planNode->id());
       return false;
     }
-    if (!canBeEvaluatedByCudf(
-            {groupedScalarFilterNode->filter()},
-            ctx->task->queryCtx().get())) {
+    if (!canExprRunOnGpu(
+            groupedScalarFilterNode->filter(),
+            ctx->task->queryCtx().get(),
+            op->pool())) {
       LOG_FALLBACK(
           "GroupedScalarFilter predicate cannot be evaluated by cuDF, PlanNode id: {}",
           planNode->id());

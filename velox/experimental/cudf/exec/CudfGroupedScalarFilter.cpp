@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/expression/ExprOptimizer.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -57,11 +58,12 @@ CudfGroupedScalarFilter::CudfGroupedScalarFilter(
 void CudfGroupedScalarFilter::initialize() {
   Operator::initialize();
 
-  std::vector<core::TypedExprPtr> exprs{planNode_->filter()};
-  auto exprSet =
-      exec::makeExprSetFromFlag(std::move(exprs), operatorCtx_->execCtx(), false);
-  filterEvaluator_ =
-      createCudfExpression(exprSet->exprs()[0], augmentedInputType_);
+  auto* const queryCtx = operatorCtx_->execCtx()->queryCtx();
+  filterEvaluator_ = createCudfExpression(
+      expression::optimize(planNode_->filter(), queryCtx, pool()),
+      augmentedInputType_,
+      pool(),
+      queryCtx->queryConfig());
 }
 
 void CudfGroupedScalarFilter::doAddInput(RowVectorPtr input) {
@@ -72,6 +74,11 @@ void CudfGroupedScalarFilter::doAddInput(RowVectorPtr input) {
 
 RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
   if (finished_ || !noMoreInput_) {
+    return nullptr;
+  }
+
+  if (inputs_.empty()) {
+    finished_ = true;
     return nullptr;
   }
 
@@ -97,7 +104,7 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
       get_temp_mr());
 
   auto scalarRows =
-      cudf::apply_boolean_mask(tableView, scalarMask->view(), stream, get_temp_mr());
+      cudf::apply_retention_mask(tableView, scalarMask->view(), stream, get_temp_mr());
   if (scalarRows->num_rows() == 0) {
     finished_ = true;
     return nullptr;
@@ -122,7 +129,7 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
 
   auto filterColumn =
       filterEvaluator_->eval(augmentedViews, stream, get_temp_mr(), true);
-  auto filteredTable = cudf::apply_boolean_mask(
+  auto filteredTable = cudf::apply_retention_mask(
       tableView, asView(filterColumn), stream, get_output_mr());
 
   finished_ = true;

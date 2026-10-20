@@ -490,20 +490,18 @@ bool UcxOutputQueueManager::updateNumDrivers(
 
 std::optional<double> UcxOutputQueueManager::getUtilization(
     const std::string& taskId) {
-  auto queue = getQueueIfExists(taskId);
-  if (queue == nullptr) {
-    return std::nullopt;
+  if (auto queue = getQueueIfExists(taskId); queue && queue->isInitialized()) {
+    return queue->getUtilization();
   }
-  return queue->getUtilization();
+  return std::nullopt;
 }
 
 std::optional<bool> UcxOutputQueueManager::isOverutilized(
     const std::string& taskId) {
-  auto queue = getQueueIfExists(taskId);
-  if (queue == nullptr) {
-    return std::nullopt;
+  if (auto queue = getQueueIfExists(taskId); queue && queue->isInitialized()) {
+    return queue->isOverutilized();
   }
-  return queue->isOverutilized();
+  return std::nullopt;
 }
 
 std::string UcxOutputQueueManager::toString(const std::string& taskId) {

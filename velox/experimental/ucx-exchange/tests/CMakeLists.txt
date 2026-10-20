@@ -22,6 +22,7 @@ set_tests_properties(ucx_communicator_test PROPERTIES TIMEOUT 60)
 
 if(VELOX_ENABLE_CUDF)
   set_tests_properties(ucx_communicator_test PROPERTIES LABELS cuda_driver)
+  target_link_libraries(ucx_communicator_test PRIVATE velox_cudf_exec)
 endif()
 
 target_link_libraries(
@@ -54,6 +55,7 @@ if(VELOX_ENABLE_CUDF)
     ucx_communicator_progress_fairness_test
     PROPERTIES LABELS cuda_driver
   )
+  target_link_libraries(ucx_communicator_progress_fairness_test PRIVATE velox_cudf_exec)
 endif()
 
 target_link_libraries(

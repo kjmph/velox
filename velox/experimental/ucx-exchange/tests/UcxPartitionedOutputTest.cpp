@@ -888,6 +888,87 @@ TEST_F(UcxPartitionedOutputTest, resumesReplicationWithoutDuplicateRows) {
   }
 }
 
+// Once all unfinished destinations block, any of them must be able to wake
+// replication. The first destination may remain stalled across that wakeup.
+TEST_F(
+    UcxPartitionedOutputTest,
+    resumesReplicationWhenLaterBlockedDestinationDrains) {
+  cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  auto task = createPartitionedOutputTask(
+      taskId_,
+      pool_,
+      UcxTestData::kTestRowType,
+      kNumPartitions,
+      {"c0"},
+      FOUR_GBYTES,
+      {{CudfConfig::kUcxPartitionedOutputBatchRows, "1"}},
+      /*replicateNullsAndAny=*/true);
+  queueManager_->initializeTask(
+      task,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      kNumPartitions,
+      /*numDrivers=*/1);
+
+  constexpr int64_t kHeldBytes = int64_t{64} << 30;
+  ASSERT_FALSE(queueManager_->reserveTransferBytes(
+      taskId_, 0, kHeldBytes, kHeldBytes, nullptr));
+  ASSERT_FALSE(queueManager_->reserveTransferBytes(
+      taskId_, 1, kHeldBytes, kHeldBytes, nullptr));
+  bool secondReservationHeld = true;
+  auto releaseReservation = folly::makeGuard([&]() {
+    queueManager_->releaseTransferReservation(taskId_, 0, kHeldBytes);
+    if (secondReservationHeld) {
+      queueManager_->releaseTransferReservation(taskId_, 1, kHeldBytes);
+    }
+  });
+
+  auto partitionedOutput = makePartitionedOutput(task);
+  feedBatch(
+      partitionedOutput.get(),
+      makeKeyColumn(
+          {10, 20, kNullSentinel, 30, kNullSentinel, 40}, {2, 4}, stream),
+      stream);
+  ContinueFuture future;
+  EXPECT_EQ(
+      partitionedOutput->isBlocked(&future),
+      exec::BlockingReason::kWaitForConsumer);
+  ASSERT_TRUE(future.valid());
+  EXPECT_FALSE(future.isReady());
+  // Only destination two can receive replicas on the first pass.
+  EXPECT_EQ(numBufferedPages(), 1);
+
+  // Free the second blocked destination while the first stays full. Its
+  // capacity change must wake the operator and publish its replicas once.
+  queueManager_->releaseTransferReservation(taskId_, 1, kHeldBytes);
+  secondReservationHeld = false;
+  ASSERT_TRUE(future.isReady());
+  partitionedOutput->getOutput();
+  ContinueFuture firstDestinationFuture;
+  EXPECT_EQ(
+      partitionedOutput->isBlocked(&firstDestinationFuture),
+      exec::BlockingReason::kWaitForConsumer);
+  ASSERT_TRUE(firstDestinationFuture.valid());
+  EXPECT_FALSE(firstDestinationFuture.isReady());
+  EXPECT_EQ(numBufferedPages(), 2);
+
+  queueManager_->releaseTransferReservation(taskId_, 0, kHeldBytes);
+  releaseReservation.dismiss();
+  ASSERT_TRUE(firstDestinationFuture.isReady());
+  finishPartitionedOutput(partitionedOutput.get());
+
+  std::vector<int32_t> allKeys;
+  for (int destination = 0; destination < kNumPartitions; ++destination) {
+    const auto keys = drainKeyColumn(destination);
+    EXPECT_EQ(countValue(keys, 10), 1);
+    EXPECT_EQ(countSentinels(keys), 2);
+    allKeys.insert(allKeys.end(), keys.begin(), keys.end());
+  }
+  EXPECT_EQ(allKeys.size(), 3 * kNumPartitions + 3);
+  for (const auto routedKey : {20, 30, 40}) {
+    EXPECT_EQ(countValue(allKeys, routedKey), 1);
+  }
+}
+
 TEST_F(UcxPartitionedOutputTest, replicatesNullFirstRowOncePerDestination) {
   cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
   const std::vector<int32_t> keyValues{

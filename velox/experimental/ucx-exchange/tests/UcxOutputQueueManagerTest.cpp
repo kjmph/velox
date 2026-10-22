@@ -1311,6 +1311,102 @@ TEST_F(UcxOutputQueueManagerTest, transferReservationBlocksAndWakes) {
   EXPECT_TRUE(cancelledFuture.isReady());
 }
 
+TEST_F(
+    UcxOutputQueueManagerTest,
+    anyTransferCapacityWakesOnLaterDestinationWithoutRetainedWaiters) {
+  const std::string taskId = "adaptive.anyTransferCapacity";
+  auto task = initializeTask(taskId, 2, 1);
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 0, 100, 100, nullptr));
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 1, 100, 100, nullptr));
+  const std::vector<UcxOutputQueue::TransferCapacityRequest> requests{
+      {0, 1, 100}, {1, 1, 100}};
+
+  // Destination zero remains full through every wakeup. A collectAny over
+  // newly installed destination-local futures would retain stale waiters here.
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    ContinueFuture future;
+    ASSERT_TRUE(
+        queueManager_->waitForAnyTransferCapacity(taskId, requests, &future));
+    EXPECT_FALSE(future.isReady());
+    EXPECT_NE(
+        queueManager_->toString(taskId).find("waitingAnyTransferProducers=1"),
+        std::string::npos);
+    queueManager_->releaseTransferReservation(taskId, 1, 100);
+    EXPECT_TRUE(future.isReady());
+    EXPECT_NE(
+        queueManager_->toString(taskId).find("waitingAnyTransferProducers=0"),
+        std::string::npos);
+
+    // A release between the producer's probes and waiter installation must
+    // prevent parking. This check also must not reserve any bytes itself.
+    ContinueFuture unblockedFuture = ContinueFuture::makeEmpty();
+    EXPECT_FALSE(queueManager_->waitForAnyTransferCapacity(
+        taskId, requests, &unblockedFuture));
+    EXPECT_FALSE(unblockedFuture.valid());
+    ASSERT_FALSE(
+        queueManager_->reserveTransferBytes(taskId, 1, 100, 100, nullptr));
+  }
+  queueManager_->releaseTransferReservation(taskId, 0, 100);
+  queueManager_->releaseTransferReservation(taskId, 1, 100);
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(UcxOutputQueueManagerTest, anyTransferCapacityChecksExactRequestBytes) {
+  const std::string taskId = "adaptive.anyExactAdmission";
+  auto task = initializeTask(taskId, 2, 1);
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 0, 90, 100, nullptr));
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 1, 90, 100, nullptr));
+  const std::vector<UcxOutputQueue::TransferCapacityRequest> requests{
+      {0, 20, 100}, {1, 20, 100}};
+  ContinueFuture future;
+  EXPECT_TRUE(
+      queueManager_->waitForAnyTransferCapacity(taskId, requests, &future));
+  EXPECT_FALSE(future.isReady());
+  queueManager_->releaseTransferReservation(taskId, 1, 10);
+  EXPECT_TRUE(future.isReady());
+  ContinueFuture unblockedFuture = ContinueFuture::makeEmpty();
+  EXPECT_FALSE(queueManager_->waitForAnyTransferCapacity(
+      taskId, requests, &unblockedFuture));
+  EXPECT_FALSE(unblockedFuture.valid());
+  // Successful probing leaves the exact 20-byte capacity available.
+  EXPECT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 1, 20, 100, nullptr));
+  queueManager_->releaseTransferReservation(taskId, 0, 90);
+  queueManager_->releaseTransferReservation(taskId, 1, 100);
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    anyTransferCapacityWakesOnDestinationDeletionAndTaskRemoval) {
+  const std::string taskId = "adaptive.anyTerminalWakeup";
+  auto task = initializeTask(taskId, 2, 1);
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 0, 100, 100, nullptr));
+  ASSERT_FALSE(
+      queueManager_->reserveTransferBytes(taskId, 1, 100, 100, nullptr));
+  ContinueFuture deletedFuture;
+  EXPECT_TRUE(queueManager_->waitForAnyTransferCapacity(
+      taskId, {{0, 1, 100}, {1, 1, 100}}, &deletedFuture));
+  queueManager_->deleteResults(taskId, 1);
+  EXPECT_TRUE(deletedFuture.isReady());
+
+  ContinueFuture removedFuture;
+  EXPECT_TRUE(queueManager_->waitForAnyTransferCapacity(
+      taskId, {{0, 1, 100}}, &removedFuture));
+  task->requestAbort().wait();
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(removedFuture.isReady());
+  ContinueFuture terminalFuture = ContinueFuture::makeEmpty();
+  EXPECT_FALSE(queueManager_->waitForAnyTransferCapacity(
+      taskId, {{0, 1, 100}}, &terminalFuture));
+  EXPECT_FALSE(terminalFuture.valid());
+}
+
 TEST_F(UcxOutputQueueManagerTest, enqueueConsumesReservationExactlyOnce) {
   const std::string taskId = "adaptive.enqueueReservationCommit";
   auto task = initializeTask(taskId, 1, 1);

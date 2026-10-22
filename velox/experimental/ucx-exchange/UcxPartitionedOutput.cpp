@@ -582,17 +582,16 @@ bool UcxPartitionedOutput::drainPendingReplicatedBatch() {
     batch.remainingDestinations = numPartitions_;
   }
 
+  std::vector<UcxOutputQueue::TransferCapacityRequest> blockedRequests;
+  blockedRequests.reserve(numPartitions_);
   while (batch.remainingDestinations > 0) {
     bool madeProgress = false;
-    int waitDestination = -1;
-    uint64_t waitBytes = 0;
-    uint64_t waitLimit = 0;
+    blockedRequests.clear();
     auto rememberWait = [&](int destination, uint64_t bytes, uint64_t limit) {
-      if (waitDestination < 0) {
-        waitDestination = destination;
-        waitBytes = bytes;
-        waitLimit = limit;
-      }
+      blockedRequests.push_back(
+          {destination,
+           static_cast<int64_t>(bytes),
+           static_cast<int64_t>(limit)});
     };
 
     // Visit every destination before parking. Cursors are committed only
@@ -785,21 +784,15 @@ bool UcxPartitionedOutput::drainPendingReplicatedBatch() {
       continue;
     }
 
-    VELOX_CHECK_GE(waitDestination, 0);
-    // Recheck and install the wakeup atomically under the queue lock. Capacity
-    // may have changed after the probe; return an admitted probe immediately
-    // before retrying the full pass.
-    if (queueManager->reserveTransferBytes(
-            this->taskId(),
-            waitDestination,
-            static_cast<int64_t>(waitBytes),
-            static_cast<int64_t>(waitLimit),
-            &future_)) {
+    VELOX_CHECK(!blockedRequests.empty());
+    // Recheck all admission predicates and install one queue-wide wakeup under
+    // the same mutex. A later destination can resume us even while the first
+    // remains stalled, without retaining one stale waiter per destination.
+    if (queueManager->waitForAnyTransferCapacity(
+            this->taskId(), blockedRequests, &future_)) {
       blockingReason_ = exec::BlockingReason::kWaitForConsumer;
       return false;
     }
-    queueManager->releaseTransferReservation(
-        this->taskId(), waitDestination, static_cast<int64_t>(waitBytes));
   }
 
   pendingReplicatedBatch_.reset();

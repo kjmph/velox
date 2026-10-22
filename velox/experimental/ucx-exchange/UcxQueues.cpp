@@ -562,6 +562,38 @@ bool UcxOutputQueue::reserveTransferBytes(
     int64_t maxBytes,
     ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);
+  return reserveTransferBytesLocked(
+      destination, bytes, maxBytes, future, /*reserveBytes=*/true);
+}
+
+bool UcxOutputQueue::waitForAnyTransferCapacity(
+    const std::vector<TransferCapacityRequest>& requests,
+    ContinueFuture* future) {
+  VELOX_CHECK_NOT_NULL(future);
+  VELOX_CHECK(!requests.empty());
+  std::lock_guard<std::mutex> l(mutex_);
+  for (const auto& request : requests) {
+    if (!reserveTransferBytesLocked(
+            request.destination,
+            request.bytes,
+            request.maxBytes,
+            nullptr,
+            /*reserveBytes=*/false)) {
+      return false;
+    }
+  }
+  anyTransferPromises_.emplace_back(
+      "UcxOutputQueue::waitForAnyTransferCapacity");
+  *future = anyTransferPromises_.back().getSemiFuture();
+  return true;
+}
+
+bool UcxOutputQueue::reserveTransferBytesLocked(
+    int destination,
+    int64_t bytes,
+    int64_t maxBytes,
+    ContinueFuture* future,
+    bool reserveBytes) {
   VELOX_CHECK_GT(bytes, 0);
   VELOX_CHECK_GT(maxBytes, 0);
   VELOX_CHECK_GE(destination, 0);
@@ -591,7 +623,9 @@ bool UcxOutputQueue::reserveTransferBytes(
   auto& reservedBytes = transferReservedBytes_[destination];
   if (queue->waitingForData() && destinationStats.bytesQueued == 0 &&
       reservedBytes == 0) {
-    reservedBytes = checkedAdd(reservedBytes, bytes, "transfer reservation");
+    if (reserveBytes) {
+      reservedBytes = checkedAdd(reservedBytes, bytes, "transfer reservation");
+    }
     return false;
   }
 
@@ -605,7 +639,9 @@ bool UcxOutputQueue::reserveTransferBytes(
     return true;
   }
 
-  reservedBytes = checkedAdd(reservedBytes, bytes, "transfer reservation");
+  if (reserveBytes) {
+    reservedBytes = checkedAdd(reservedBytes, bytes, "transfer reservation");
+  }
   return false;
 }
 
@@ -1066,6 +1102,7 @@ void UcxOutputQueue::collectTransferPromisesLocked(
     promises.push_back(std::move(promise));
   }
   transferPromises_[destination].clear();
+  collectAnyTransferPromisesLocked(promises);
 }
 
 void UcxOutputQueue::collectAllTransferPromisesLocked(
@@ -1076,6 +1113,16 @@ void UcxOutputQueue::collectAllTransferPromisesLocked(
     }
     destinationPromises.clear();
   }
+  collectAnyTransferPromisesLocked(promises);
+}
+
+void UcxOutputQueue::collectAnyTransferPromisesLocked(
+    std::vector<ContinuePromise>& promises) {
+  promises.reserve(promises.size() + anyTransferPromises_.size());
+  for (auto& promise : anyTransferPromises_) {
+    promises.push_back(std::move(promise));
+  }
+  anyTransferPromises_.clear();
 }
 
 void UcxOutputQueue::enqueueBroadcastOutputLocked(
@@ -1372,6 +1419,7 @@ std::string UcxOutputQueue::toString() {
       << ", fullTransferRetainedLimit=" << fullTransferRetainedLimitLocked()
       << ", fullTransferCongested=" << fullTransferCongested_
       << ", waitingProducers=" << promises_.size()
+      << ", waitingAnyTransferProducers=" << anyTransferPromises_.size()
       << ", numFinished=" << numFinished_ << "/" << numDrivers_
       << ", atEnd=" << atEnd_ << ", noMoreQueues=" << noMoreQueues_
       << ", terminated=" << terminated_ << "]";

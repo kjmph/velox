@@ -210,6 +210,7 @@ void CudfVector::runReleaseCallback(
 }
 
 std::unique_ptr<cudf::table> CudfVector::release() {
+  flatSize_ = 0;
   if (auto* tablePtr =
           std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_)) {
     return std::move(*tablePtr);

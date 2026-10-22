@@ -351,6 +351,10 @@ TEST_F(CudfVectorTest, retainedSizeReportsDeviceStorage) {
 
   EXPECT_EQ(vector.estimateFlatSize(), 4 * sizeof(int32_t));
   EXPECT_EQ(vector.retainedSize(), vector.estimateFlatSize());
+  auto released = vector.release();
+  EXPECT_EQ(released->num_rows(), 4);
+  EXPECT_EQ(vector.estimateFlatSize(), 0);
+  EXPECT_EQ(vector.retainedSize(), 0);
 }
 
 TEST_F(CudfVectorTest, rebindOwnedTableDeallocationStream) {
@@ -421,7 +425,10 @@ TEST_F(CudfVectorTest, packedTableReleaseUsesMaterializationStream) {
       targetStream.view());
   resource.reset();
 
+  EXPECT_GT(vector.estimateFlatSize(), 0);
   auto materialized = vector.release();
+  EXPECT_EQ(vector.estimateFlatSize(), 0);
+  EXPECT_EQ(vector.retainedSize(), 0);
 
   EXPECT_GT(resource.deallocationCount(), 0);
   EXPECT_EQ(resource.lastDeallocationStream(), targetStream.value());
@@ -528,9 +535,12 @@ TEST_F(CudfVectorTest, sharedOwnerReleaseDropsOwnerAfterMaterializing) {
       tableView,
       std::move(owner),
       stream.view(),
-      0);
+      numRows * sizeof(int32_t));
 
+  EXPECT_GT(vector.estimateFlatSize(), 0);
   auto materialized = vector.release();
+  EXPECT_EQ(vector.estimateFlatSize(), 0);
+  EXPECT_EQ(vector.retainedSize(), 0);
 
   EXPECT_TRUE(resource.wasDeallocated(sourceData));
   EXPECT_EQ(materialized->num_rows(), 4);

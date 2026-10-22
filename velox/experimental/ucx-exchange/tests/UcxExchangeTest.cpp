@@ -42,9 +42,11 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowExchangeClient.h"
 #include "velox/experimental/ucx-exchange/UcxCpuRowOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
@@ -58,6 +60,30 @@ using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
+
+// Drives a serialized callback at a chosen receiver state without starting a
+// network connection. Tests still use the real callback queue and state
+// machine.
+class UcxExchangeSourceTestPeer {
+ public:
+  static void prepareIntraNodePoll(UcxExchangeSource& source) {
+    source.isIntraNodeTransfer_ = true;
+    source.setState(UcxExchangeSource::ReceiverState::WaitingForIntraNodeData);
+  }
+
+  static void prepareDormantReceive(UcxExchangeSource& source, uint64_t bytes) {
+    source.pendingDataReceive_ =
+        std::make_shared<UcxExchangeSource::DataAndMetadata>();
+    source.pendingDataReceive_->metadata.dataSizeBytes = bytes;
+    source.backpressureActive_.store(true, std::memory_order_release);
+    source.setState(UcxExchangeSource::ReceiverState::WaitingForReceiveCredit);
+  }
+
+  static void enqueueSuccessfulHandshakeAck(UcxExchangeSource& source) {
+    source.enqueueSerializedCallback(
+        UcxExchangeSource::CallbackPhase::HandshakeAck, UCS_OK, nullptr);
+  }
+};
 
 struct ExchangeTestParams {
   int numSrcDrivers;
@@ -826,6 +852,69 @@ TEST_P(UcxExchangeTest, realPartitionedOutputDataIntegrityTest) {
   queueManager()->removeTask(srcTaskId);
 
   VLOG(3) << "- UcxExchangeTest::realPartitionedOutputDataIntegrityTest";
+}
+
+TEST_F(UcxExchangeFocusedTest, coalescedHandshakeAckPreservesIntraNodePoll) {
+  const auto taskId = getUniqueTaskPrefix() + "coalescedIntraPoll";
+  auto queue = std::make_shared<UcxExchangeQueue>(1);
+  auto source = UcxExchangeSource::create(
+      "coalescedPollSink",
+      "http://localhost:1/v1/task/" + taskId + "/results/0",
+      queue);
+  auto registry = IntraNodeTransferRegistry::getInstance();
+  auto retrieved = registry->publish({taskId, 0, 0}, nullptr, 0, true);
+  SCOPE_EXIT {
+    source->forceCloseForShutdown();
+    registry->cancelTask(taskId);
+  };
+
+  UcxExchangeSourceTestPeer::prepareIntraNodePoll(*source);
+  // A polling turn is already queued when the successful ACK arrives. Its
+  // callback coalesces into that turn, exactly as in the communicator
+  // dispatcher.
+  ASSERT_TRUE(source->markQueued());
+  UcxExchangeSourceTestPeer::enqueueSuccessfulHandshakeAck(*source);
+  source->clearQueued();
+  source->process();
+
+  EXPECT_EQ(
+      retrieved.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+}
+
+TEST_F(UcxExchangeFocusedTest, coalescedHandshakeAckKeepsReceiveDormant) {
+  const auto taskId = getUniqueTaskPrefix() + "coalescedDormantReceive";
+  auto queue = std::make_shared<UcxExchangeQueue>(1, 1024);
+  auto source = UcxExchangeSource::create(
+      "coalescedDormantSink",
+      "http://localhost:1/v1/task/" + taskId + "/results/0",
+      queue);
+  SCOPE_EXIT {
+    source->forceCloseForShutdown();
+  };
+  {
+    std::lock_guard<std::mutex> lock(queue->mutex());
+    // Another source has one byte of drainable receive memory and lowered the
+    // shared window under allocation pressure. No memory has been released yet.
+    ASSERT_TRUE(queue->tryReserveReceiveBytesLocked(1));
+    ASSERT_TRUE(queue->recordReceiveAllocationPressureLocked(1024));
+    ASSERT_EQ(queue->receivePrefetchByteLimitLocked(), 1024);
+  }
+  // This larger pending receive still cannot fit, even if an erroneous retry
+  // grows the window. That makes the regression observable without allocating
+  // device memory or posting a request to the unstarted source's endpoint.
+  UcxExchangeSourceTestPeer::prepareDormantReceive(*source, 8192);
+  ASSERT_TRUE(source->markQueued());
+  UcxExchangeSourceTestPeer::enqueueSuccessfulHandshakeAck(*source);
+  source->clearQueued();
+  source->process();
+  // A callback can schedule another turn just before the current turn drains
+  // it. That stale turn has no event left but must still respect dormancy.
+  source->process();
+
+  std::lock_guard<std::mutex> lock(queue->mutex());
+  EXPECT_EQ(queue->receivePrefetchByteLimitLocked(), 1024);
+  EXPECT_EQ(queue->reservedReceiveBytesLocked(), 1);
+  EXPECT_FALSE(queue->isInError());
 }
 
 // Focused regression test for shared UcxExchangeClient ownership. This

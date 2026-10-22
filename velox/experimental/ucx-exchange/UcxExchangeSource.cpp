@@ -272,17 +272,21 @@ void UcxExchangeSource::runSerializedCallback(
 
 void UcxExchangeSource::processStateMachine() {
   while (true) {
-    const bool drainedEvents = drainStateEvents();
+    drainStateEvents();
     if (closed_.load(std::memory_order_acquire)) {
       if (!cleanupComplete_) {
         cleanUp();
       }
       return;
     }
-    // An allocation-failed callback parks under the queue mutex. Do not retry
-    // and shrink its receive window again in this same processing turn.
-    if (drainedEvents && !closeRequested_.load(std::memory_order_acquire) &&
-        getState() != ReceiverState::Done) {
+    // A callback can park a receive under the queue mutex. Preserve that
+    // dormant state until a consumer clears backpressure and schedules a wake.
+    // Other callbacks must still advance this turn: a no-op handshake ACK can
+    // coalesce with an already queued intra-node poll, so returning after every
+    // event would lose the only poll and strand the producer's published data.
+    if (!closeRequested_.load(std::memory_order_acquire) &&
+        getState() == ReceiverState::WaitingForReceiveCredit &&
+        backpressureActive_.load(std::memory_order_acquire)) {
       return;
     }
 

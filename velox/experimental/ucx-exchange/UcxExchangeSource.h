@@ -161,6 +161,8 @@ class UcxExchangeSource
   }
 
  private:
+  friend class UcxExchangeSourceTestPeer;
+
   enum class CallbackPhase {
     Handshake,
     Metadata,

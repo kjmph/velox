@@ -31,7 +31,6 @@
 #include <cudf/unary.hpp>
 
 #include <algorithm>
-
 #include <limits>
 
 namespace facebook::velox::cudf_velox {

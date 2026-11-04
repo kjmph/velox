@@ -413,7 +413,10 @@ TEST_F(CudfDecimalTest, caseWhenNormalizesDecimal32Input) {
   auto queryCtx = core::QueryCtx::create();
   core::ExecCtx execCtx(pool(), queryCtx.get());
   auto expression = test_utils::optimizeTypedExpr(
-      "CASE WHEN condition THEN sales_price ELSE NULL END", rowType, queryCtx.get(), &execCtx);
+      "CASE WHEN condition THEN sales_price ELSE NULL END",
+      rowType,
+      queryCtx.get(),
+      &execCtx);
   auto evaluator = createCudfExpression(
       expression, rowType, pool(), queryCtx->queryConfig());
 
@@ -450,7 +453,9 @@ TEST_F(CudfDecimalTest, betweenNormalizesDecimal32Input) {
       "price BETWEEN "
       "CAST('0.99' AS DECIMAL(7, 2)) AND "
       "CAST('1.49' AS DECIMAL(7, 2))",
-      rowType, queryCtx.get(), &execCtx);
+      rowType,
+      queryCtx.get(),
+      &execCtx);
   auto evaluator = createCudfExpression(
       expression, rowType, pool(), queryCtx->queryConfig());
 
@@ -473,7 +478,10 @@ TEST_F(CudfDecimalTest, multiplyNormalizesDecimal32Input) {
   auto queryCtx = core::QueryCtx::create();
   core::ExecCtx execCtx(pool(), queryCtx.get());
   auto expression = test_utils::optimizeTypedExpr(
-      "CAST(quantity AS DECIMAL(10, 0)) * sales_price", rowType, queryCtx.get(), &execCtx);
+      "CAST(quantity AS DECIMAL(10, 0)) * sales_price",
+      rowType,
+      queryCtx.get(),
+      &execCtx);
   auto evaluator = createCudfExpression(
       expression, rowType, pool(), queryCtx->queryConfig());
 
@@ -518,9 +526,10 @@ TEST_F(CudfDecimalTest, divideUsesWidestDecimalStorage) {
 
   auto assertExpression = [&](const std::string& sql,
                               const std::vector<int64_t>& expected) {
-    auto expression = test_utils::optimizeTypedExpr(sql, rowType, queryCtx.get(), &execCtx);
+    auto expression =
+        test_utils::optimizeTypedExpr(sql, rowType, queryCtx.get(), &execCtx);
     auto evaluator = createCudfExpression(
-      expression, rowType, pool(), queryCtx->queryConfig());
+        expression, rowType, pool(), queryCtx->queryConfig());
     auto result = evaluator->eval(inputs, stream, mr);
     auto resultView = asView(result);
     auto expectedType =
@@ -556,7 +565,9 @@ TEST_F(CudfDecimalTest, coalesceNormalizesDecimal32Input) {
   auto expression = test_utils::optimizeTypedExpr(
       "sales_price - "
       "coalesce(return_amount, CAST('0.00' AS DECIMAL(7, 2)))",
-      rowType, queryCtx.get(), &execCtx);
+      rowType,
+      queryCtx.get(),
+      &execCtx);
   auto evaluator = createCudfExpression(
       expression, rowType, pool(), queryCtx->queryConfig());
 
@@ -589,7 +600,9 @@ TEST_F(CudfDecimalTest, coalescePreservesOwnedFirstInput) {
       "coalesce("
       "CAST(return_amount AS DECIMAL(12, 2)), "
       "CAST('0.00' AS DECIMAL(12, 2)))",
-      rowType, queryCtx.get(), &execCtx);
+      rowType,
+      queryCtx.get(),
+      &execCtx);
   auto evaluator = createCudfExpression(
       expression, rowType, pool(), queryCtx->queryConfig());
 

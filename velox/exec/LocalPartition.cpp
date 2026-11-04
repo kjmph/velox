@@ -628,8 +628,9 @@ void LocalPartition::addInput(RowVectorPtr input) {
         ++maxIndex[partition];
       }
     } else {
-      const auto partition =
-          singlePartition.has_value() ? singlePartition.value() : partitions_[i];
+      const auto partition = singlePartition.has_value()
+          ? singlePartition.value()
+          : partitions_[i];
       ++maxIndex[partition];
     }
   }
@@ -654,8 +655,9 @@ void LocalPartition::addInput(RowVectorPtr input) {
         ++maxIndex[partition];
       }
     } else {
-      const auto partition =
-          singlePartition.has_value() ? singlePartition.value() : partitions_[i];
+      const auto partition = singlePartition.has_value()
+          ? singlePartition.value()
+          : partitions_[i];
       rawIndices_[partition][maxIndex[partition]] = i;
       ++maxIndex[partition];
     }

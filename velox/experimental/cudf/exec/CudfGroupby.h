@@ -22,8 +22,8 @@
 
 #include <memory>
 #include <optional>
-#include <unordered_map>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace facebook::velox::core {
@@ -316,7 +316,9 @@ class CudfGroupby : public CudfOperatorBase {
   void computePartialGroupbyIncrementally(CudfVectorPtr tbl);
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
-  void addPendingGroupbyState(CudfVectorPtr state, bool projectAggregationInputs);
+  void addPendingGroupbyState(
+      CudfVectorPtr state,
+      bool projectAggregationInputs);
   void compactPendingGroupbyStates(bool projectAggregationInputs);
   CudfVectorPtr compactGroupbyStates(
       std::vector<CudfVectorPtr>&& states,

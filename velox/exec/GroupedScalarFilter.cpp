@@ -34,12 +34,10 @@ GroupedScalarFilter::GroupedScalarFilter(
           "GroupedScalarFilter"),
       planNode_(std::move(planNode)),
       augmentedInputType_(planNode_->augmentedInputType()),
-      groupIdChannel_(
-          planNode_->sources()[0]->outputType()->getChildIdx(
-              planNode_->groupIdName())),
-      scalarValueChannel_(
-          planNode_->sources()[0]->outputType()->getChildIdx(
-              planNode_->scalarValueName())) {}
+      groupIdChannel_(planNode_->sources()[0]->outputType()->getChildIdx(
+          planNode_->groupIdName())),
+      scalarValueChannel_(planNode_->sources()[0]->outputType()->getChildIdx(
+          planNode_->scalarValueName())) {}
 
 void GroupedScalarFilter::initialize() {
   Operator::initialize();
@@ -81,7 +79,8 @@ bool GroupedScalarFilter::findScalar() {
   return false;
 }
 
-RowVectorPtr GroupedScalarFilter::makeAugmentedInput(const RowVectorPtr& input) {
+RowVectorPtr GroupedScalarFilter::makeAugmentedInput(
+    const RowVectorPtr& input) {
   auto children = input->children();
   children.push_back(
       BaseVector::wrapInConstant(input->size(), scalarIndex_, scalarVector_));
@@ -127,7 +126,8 @@ RowVectorPtr GroupedScalarFilter::getOutput() {
     exprs_->eval(0, 1, true, *rows, evalCtx, results);
     const auto numOut =
         processFilterResults(results[0], *rows, filterEvalCtx_, pool());
-    addRuntimeStat("groupedScalarFilterInputRows", RuntimeCounter(input_->size()));
+    addRuntimeStat(
+        "groupedScalarFilterInputRows", RuntimeCounter(input_->size()));
     addRuntimeStat("groupedScalarFilterOutputRows", RuntimeCounter(numOut));
 
     if (numOut == 0) {

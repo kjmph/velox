@@ -22,9 +22,9 @@
 
 #include "velox/exec/Operator.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <cstddef>
 #include <queue>
 
 namespace facebook::velox::cudf_velox {

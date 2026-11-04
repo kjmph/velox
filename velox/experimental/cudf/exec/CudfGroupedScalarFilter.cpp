@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/CudfNoDefaults.h"
-#include "velox/expression/ExprOptimizer.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
+#include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+
+#include "velox/expression/ExprOptimizer.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
@@ -48,12 +49,10 @@ CudfGroupedScalarFilter::CudfGroupedScalarFilter(
           planNode),
       planNode_(std::move(planNode)),
       augmentedInputType_(planNode_->augmentedInputType()),
-      groupIdChannel_(
-          planNode_->sources()[0]->outputType()->getChildIdx(
-              planNode_->groupIdName())),
-      scalarValueChannel_(
-          planNode_->sources()[0]->outputType()->getChildIdx(
-              planNode_->scalarValueName())) {}
+      groupIdChannel_(planNode_->sources()[0]->outputType()->getChildIdx(
+          planNode_->groupIdName())),
+      scalarValueChannel_(planNode_->sources()[0]->outputType()->getChildIdx(
+          planNode_->scalarValueName())) {}
 
 void CudfGroupedScalarFilter::initialize() {
   Operator::initialize();
@@ -103,8 +102,8 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
       stream,
       get_temp_mr());
 
-  auto scalarRows =
-      cudf::apply_retention_mask(tableView, scalarMask->view(), stream, get_temp_mr());
+  auto scalarRows = cudf::apply_retention_mask(
+      tableView, scalarMask->view(), stream, get_temp_mr());
   if (scalarRows->num_rows() == 0) {
     finished_ = true;
     return nullptr;
@@ -115,10 +114,7 @@ RowVectorPtr CudfGroupedScalarFilter::doGetOutput() {
   std::vector<cudf::column_view> scalarColumns{
       scalarOneRow[0].column(scalarValueChannel_)};
   auto repeatedScalar = cudf::repeat(
-      cudf::table_view(scalarColumns),
-      inputRows,
-      stream,
-      get_temp_mr());
+      cudf::table_view(scalarColumns), inputRows, stream, get_temp_mr());
 
   std::vector<cudf::column_view> augmentedViews;
   augmentedViews.reserve(tableView.num_columns() + 1);

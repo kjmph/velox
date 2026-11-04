@@ -87,7 +87,8 @@ CudfBatchConcat::CudfBatchConcat(
           NvtxMethodFlag::kAll,
           std::nullopt,
           planNode),
-      targetBytes_(targetRows == 0 ? getTargetBytes(outputType_) : std::nullopt),
+      targetBytes_(
+          targetRows == 0 ? getTargetBytes(outputType_) : std::nullopt),
       targetRows_(resolveTargetRows(targetRows)) {}
 
 bool CudfBatchConcat::meetsTarget(size_t numRows, uint64_t numBytes) const {

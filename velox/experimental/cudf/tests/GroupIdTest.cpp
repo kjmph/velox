@@ -31,6 +31,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
+
 #include <folly/ScopeGuard.h>
 
 using namespace facebook::velox;
@@ -368,8 +369,7 @@ TEST_F(CudfGroupIdTest, intermediateAggregationReducesEachGroupingSet) {
   createDuckDbTable({batch1, batch2});
 
   auto& config = cudf_velox::CudfConfig::getInstance();
-  const auto savedConcatOptimizationEnabled =
-      config.concatOptimizationEnabled;
+  const auto savedConcatOptimizationEnabled = config.concatOptimizationEnabled;
   const auto savedBatchSizeMinThreshold = config.batchSizeMinThreshold;
   SCOPE_EXIT {
     config.concatOptimizationEnabled = savedConcatOptimizationEnabled;
@@ -395,19 +395,18 @@ TEST_F(CudfGroupIdTest, intermediateAggregationReducesEachGroupingSet) {
           .localPartitionRoundRobin(sources)
           .groupId({"k1", "k2"}, {{"k1"}, {"k2"}}, {"sum_a"})
           .addNode([](auto nodeId, auto source) -> core::PlanNodePtr {
-            auto k1 = std::make_shared<core::FieldAccessTypedExpr>(
-                VARCHAR(), "k1");
+            auto k1 =
+                std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "k1");
             auto k2 =
                 std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "k2");
             auto groupId = std::make_shared<core::FieldAccessTypedExpr>(
                 BIGINT(), "group_id");
-            auto sumState = std::make_shared<core::FieldAccessTypedExpr>(
-                BIGINT(), "sum_a");
+            auto sumState =
+                std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "sum_a");
 
             core::AggregationNode::Aggregate aggregate;
-            aggregate.call =
-                std::make_shared<core::CallTypedExpr>(
-                    BIGINT(), "sum", sumState);
+            aggregate.call = std::make_shared<core::CallTypedExpr>(
+                BIGINT(), "sum", sumState);
             aggregate.rawInputTypes = {BIGINT()};
 
             return std::make_shared<core::AggregationNode>(
@@ -422,8 +421,7 @@ TEST_F(CudfGroupIdTest, intermediateAggregationReducesEachGroupingSet) {
                 std::move(source));
           })
           .capturePlanNodeId(intermediateAggregationNodeId)
-          .singleAggregation(
-              {"k1", "k2", "group_id"}, {"sum(sum_a) as sum_a"})
+          .singleAggregation({"k1", "k2", "group_id"}, {"sum(sum_a) as sum_a"})
           .project({"k1", "k2", "sum_a"})
           .planNode();
 
@@ -437,16 +435,14 @@ TEST_F(CudfGroupIdTest, intermediateAggregationReducesEachGroupingSet) {
               "GROUP BY GROUPING SETS ((k1), (k2))");
 
   auto planStats = toPlanStats(task->taskStats());
-  const auto& intermediateStats =
-      planStats.at(intermediateAggregationNodeId);
+  const auto& intermediateStats = planStats.at(intermediateAggregationNodeId);
   EXPECT_EQ(intermediateStats.operatorStats.count("CudfBatchConcat"), 0);
 
   const auto groupbyIt =
       intermediateStats.operatorStats.find("CudfGroupbyINTERMEDIATE");
   ASSERT_NE(groupbyIt, intermediateStats.operatorStats.end());
   EXPECT_EQ(groupbyIt->second->inputVectors, 4);
-  EXPECT_EQ(
-      groupbyIt->second->outputVectors, groupbyIt->second->inputVectors);
+  EXPECT_EQ(groupbyIt->second->outputVectors, groupbyIt->second->inputVectors);
   EXPECT_EQ(groupbyIt->second->inputRows, 16);
   EXPECT_EQ(groupbyIt->second->outputRows, 8);
 }

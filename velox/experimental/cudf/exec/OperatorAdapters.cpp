@@ -23,9 +23,9 @@
 #include "velox/experimental/cudf/exec/CudfDistinct.h"
 #include "velox/experimental/cudf/exec/CudfEnforceSingleRow.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
-#include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/exec/CudfGroupId.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
+#include "velox/experimental/cudf/exec/CudfGroupedScalarFilter.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfLimit.h"
 #include "velox/experimental/cudf/exec/CudfLocalMerge.h"
@@ -53,8 +53,8 @@
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/FilterProject.h"
-#include "velox/exec/GroupedScalarFilter.h"
 #include "velox/exec/GroupId.h"
+#include "velox/exec/GroupedScalarFilter.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashProbe.h"
@@ -366,8 +366,9 @@ class GroupedScalarFilterAdapter : public OperatorAdapter {
     VELOX_CHECK_NOT_NULL(groupedScalarFilterNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<CudfGroupedScalarFilter>(
-        operatorId, ctx, groupedScalarFilterNode));
+    result.push_back(
+        std::make_unique<CudfGroupedScalarFilter>(
+            operatorId, ctx, groupedScalarFilterNode));
     return result;
   }
 };
@@ -430,8 +431,7 @@ class AggregationAdapter : public OperatorAdapter {
 
     bool isGlobal = aggregationPlanNode->groupingKeys().empty();
     bool isDistinct = !isGlobal && aggregationPlanNode->aggregates().empty();
-    const bool flushesGroupIdPartialInput =
-        !isGlobal && !isDistinct &&
+    const bool flushesGroupIdPartialInput = !isGlobal && !isDistinct &&
         exec::isPartialOutput(aggregationPlanNode->step()) &&
         !hasFinalAggs(aggregationPlanNode->aggregates()) &&
         !hasCompanionAggregates(aggregationPlanNode->aggregates()) &&
@@ -439,8 +439,7 @@ class AggregationAdapter : public OperatorAdapter {
 
     std::vector<std::unique_ptr<exec::Operator>> result;
     const auto& cudfConfig = CudfConfig::getInstance();
-    if (cudfConfig.concatOptimizationEnabled &&
-        !flushesGroupIdPartialInput) {
+    if (cudfConfig.concatOptimizationEnabled && !flushesGroupIdPartialInput) {
       VELOX_CHECK_GT(cudfConfig.batchSizeMinThreshold, 0);
       // Leave the default path to select the configured byte or row target.
       // An explicit row target is reserved for the final-aggregation override.
@@ -453,8 +452,9 @@ class AggregationAdapter : public OperatorAdapter {
         targetRows = static_cast<size_t>(
             cudfConfig.finalAggregationBatchSizeMinThreshold.value());
       }
-      result.push_back(std::make_unique<CudfBatchConcat>(
-          operatorId, ctx, aggregationPlanNode, targetRows));
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(
+              operatorId, ctx, aggregationPlanNode, targetRows));
     }
     if (isGlobal) {
       result.push_back(

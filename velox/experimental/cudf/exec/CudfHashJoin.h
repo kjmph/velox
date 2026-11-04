@@ -37,9 +37,9 @@
 #include <cuda/stream>
 
 #include <memory>
-#include <vector>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 

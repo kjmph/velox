@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
-#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/CudfFunctionBaseTest.h"
@@ -517,20 +517,21 @@ TEST_F(AdapterOperatorTest, groupedScalarFilterUsesTypedExpressions) {
 
   const auto run = [&](const std::vector<RowVectorPtr>& batches,
                        const RowVectorPtr& expectedRows) {
-    auto plan = PlanBuilder()
-                    .values(batches)
-                    .addNode([&](core::PlanNodeId id, core::PlanNodePtr source) {
-                      return std::make_shared<core::GroupedScalarFilterNode>(
-                          id,
-                          std::move(source),
-                          "group_id",
-                          0,
-                          1,
-                          "value",
-                          "scalar_value",
-                          predicate);
-                    })
-                    .planNode();
+    auto plan =
+        PlanBuilder()
+            .values(batches)
+            .addNode([&](core::PlanNodeId id, core::PlanNodePtr source) {
+              return std::make_shared<core::GroupedScalarFilterNode>(
+                  id,
+                  std::move(source),
+                  "group_id",
+                  0,
+                  1,
+                  "value",
+                  "scalar_value",
+                  predicate);
+            })
+            .planNode();
     std::shared_ptr<Task> task;
     auto result = AssertQueryBuilder(plan).copyResults(pool(), task);
     facebook::velox::test::assertEqualVectors(expectedRows, result);

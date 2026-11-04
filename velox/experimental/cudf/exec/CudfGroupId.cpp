@@ -144,18 +144,20 @@ void CudfGroupId::doAddInput(RowVectorPtr input) {
   input_ = std::move(cudfInput);
 
   std::vector<std::unique_ptr<cudf::column>> nullColumns;
-  nullColumns.reserve(std::count_if(
-      nullColumnMappings_.begin(), nullColumnMappings_.end(), [](auto index) {
-        return index != kNoNullColumn;
-      }));
+  nullColumns.reserve(
+      std::count_if(
+          nullColumnMappings_.begin(),
+          nullColumnMappings_.end(),
+          [](auto index) { return index != kNoNullColumn; }));
   for (size_t key = 0; key < numGroupingKeys_; ++key) {
     if (nullColumnMappings_[key] == kNoNullColumn) {
       continue;
     }
     auto nullScalar = cudf::make_default_constructed_scalar(
         groupingKeyCudfTypes_[key], inputStream_, get_temp_mr());
-    nullColumns.push_back(cudf::make_column_from_scalar(
-        *nullScalar, input_->size(), inputStream_, get_output_mr()));
+    nullColumns.push_back(
+        cudf::make_column_from_scalar(
+            *nullScalar, input_->size(), inputStream_, get_output_mr()));
   }
   nullColumns_ = std::make_shared<cudf::table>(std::move(nullColumns));
   groupingSetIndex_ = 0;

@@ -20,8 +20,6 @@
 #include <limits>
 #include <string>
 
-#include "velox/common/time/Timer.h"
-
 namespace facebook::velox::ucx_exchange {
 namespace {
 
@@ -863,12 +861,11 @@ void UcxCpuRowOutputQueue::maybeUnblockProducersLocked(
 }
 
 void UcxCpuRowOutputQueue::updateTotalQueuedBytesMsLocked() {
-  const auto nowMs = getCurrentTimeMs();
+  const auto deltaMs = queueWatch_.lap().count();
   if (queuedBytes_ > 0) {
-    const auto deltaMs = nowMs - queueStartMs_;
-    totalQueuedBytesMs_ += queuedBytes_ * deltaMs;
+    totalQueuedBytesMs_ +=
+        static_cast<double>(queuedBytes_) * static_cast<double>(deltaMs);
   }
-  queueStartMs_ = nowMs;
 }
 
 int64_t UcxCpuRowOutputQueue::getAverageQueueTimeMsLocked() const {

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <folly/io/IOBuf.h>
+#include <folly/stop_watch.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -327,7 +328,7 @@ class UcxCpuRowOutputQueue
   int64_t totalRowsSent_{0};
   int64_t totalPayloadsSent_{0};
 
-  uint64_t queueStartMs_{0};
+  folly::stop_watch<std::chrono::milliseconds> queueWatch_;
   double totalQueuedBytesMs_{0};
 };
 

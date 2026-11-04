@@ -20,15 +20,17 @@ add_test(NAME ucx_communicator_test COMMAND ucx_communicator_test)
 
 set_tests_properties(ucx_communicator_test PROPERTIES TIMEOUT 60)
 
-if(VELOX_ENABLE_CUDF)
-  set_tests_properties(ucx_communicator_test PROPERTIES LABELS cuda_driver)
-  target_link_libraries(ucx_communicator_test PRIVATE velox_cudf_exec)
-endif()
-
+# Resolve the transport's selected UCXX headers before cuDF's dependency
+# include directories, which may contain another UCXX installation.
 target_link_libraries(
   ucx_communicator_test
   PRIVATE velox_ucx_exchange Folly::folly GTest::gtest GTest::gtest_main Threads::Threads
 )
+
+if(VELOX_ENABLE_CUDF)
+  set_tests_properties(ucx_communicator_test PROPERTIES LABELS cuda_driver)
+  target_link_libraries(ucx_communicator_test PRIVATE velox_cudf_exec)
+endif()
 
 add_executable(ucx_communicator_progress_fairness_test CommunicatorProgressFairnessTest.cpp)
 
@@ -39,15 +41,15 @@ add_test(
 
 set_tests_properties(ucx_communicator_progress_fairness_test PROPERTIES TIMEOUT 180)
 
-if(VELOX_ENABLE_CUDF)
-  set_tests_properties(ucx_communicator_progress_fairness_test PROPERTIES LABELS cuda_driver)
-  target_link_libraries(ucx_communicator_progress_fairness_test PRIVATE velox_cudf_exec)
-endif()
-
 target_link_libraries(
   ucx_communicator_progress_fairness_test
   PRIVATE velox_ucx_exchange Folly::folly GTest::gtest GTest::gtest_main Threads::Threads
 )
+
+if(VELOX_ENABLE_CUDF)
+  set_tests_properties(ucx_communicator_progress_fairness_test PROPERTIES LABELS cuda_driver)
+  target_link_libraries(ucx_communicator_progress_fairness_test PRIVATE velox_cudf_exec)
+endif()
 
 add_executable(
   ucx_cpu_row_completion_tracker_test

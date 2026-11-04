@@ -2028,7 +2028,7 @@ std::unique_ptr<cudf::column> getIndicesWhere(
       mr);
 
   // Filter to keep only indices where mask is true
-  auto indicesTable = cudf::apply_boolean_mask(
+  auto indicesTable = cudf::apply_retention_mask(
       cudf::table_view{{seq->view()}}, mask, stream, mr);
 
   return std::move(indicesTable->release()[0]);

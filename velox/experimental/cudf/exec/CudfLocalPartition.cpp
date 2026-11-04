@@ -274,7 +274,7 @@ void CudfLocalPartition::doAddInput(RowVectorPtr input) {
         if (replicateNulls_) {
           auto nullMask = createKeyNullMask(
               tableView, partitionKeyIndices, stream, get_temp_mr());
-          auto replicatedNullRows = cudf::apply_boolean_mask(
+          auto replicatedNullRows = cudf::apply_retention_mask(
               tableView, nullMask->view(), stream, get_temp_mr());
           if (replicatedNullRows->num_rows() > 0) {
             auto nullPartitionResult = cudf::hash_partition(

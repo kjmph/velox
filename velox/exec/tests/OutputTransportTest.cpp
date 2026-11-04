@@ -18,9 +18,9 @@
 
 #include <gmock/gmock.h>
 
-#include "folly/Synchronized.h"
 #include <atomic>
 #include <stdexcept>
+#include "folly/Synchronized.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
@@ -451,7 +451,8 @@ TEST_F(
   EXPECT_THROW(task->start(1, 1), std::runtime_error);
 
   EXPECT_EQ(task->state(), TaskState::kFailed);
-  EXPECT_EQ(task->errorMessage(), "injected output buffer initialization failure");
+  EXPECT_EQ(
+      task->errorMessage(), "injected output buffer initialization failure");
   EXPECT_EQ(manager->initializeCount.load(), 1);
   EXPECT_EQ(manager->updateCount.load(), 0);
   EXPECT_EQ(manager->removeCount.load(), 1);

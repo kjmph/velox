@@ -275,8 +275,8 @@ void UcxCpuRowExchangeSource::process() {
     // Even a source closed before its first processing pass must handshake:
     // the producer needs the subsequent abort to release this destination.
     // Only communicator shutdown may force cleanup without that handshake.
-    if (closeRequested_.load(std::memory_order_acquire) &&
-        handshakeAccepted_ && getState() != ReceiverState::DrainingAfterAbort &&
+    if (closeRequested_.load(std::memory_order_acquire) && handshakeAccepted_ &&
+        getState() != ReceiverState::DrainingAfterAbort &&
         getState() != ReceiverState::Done) {
       startAbortDrain();
     }

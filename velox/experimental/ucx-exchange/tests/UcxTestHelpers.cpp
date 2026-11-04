@@ -133,10 +133,11 @@ std::shared_ptr<Task> createPartitionedOutputTask(
       pool.get(), rowType, BufferPtr(nullptr), vectorSize, vecPtrs);
 
   // Build the plan: Values -> PartitionedOutput
-  auto planFragment = exec::test::PlanBuilder()
-                          .values({rowVector})
-                          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
-                          .planFragment();
+  auto planFragment =
+      exec::test::PlanBuilder()
+          .values({rowVector})
+          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
+          .planFragment();
   if (outputTypeOverride != nullptr ||
       partitionFunctionSpecOverride != nullptr) {
     const auto partitionedOutput =

@@ -32,7 +32,8 @@ void UcxCpuRowExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
       return;
     }
     if (!closed_) {
-      sourceToStart = UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
+      sourceToStart =
+          UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
       sources_.push_back(sourceToStart);
       queue_->addSourceLocked();
       sourceToStart->setRegistered();
@@ -43,7 +44,8 @@ void UcxCpuRowExchangeClient::addRemoteTaskId(std::string_view remoteTaskId) {
     // Task can discover producers after its receive client closes. Establish
     // their control connection and abort it so producer output is released.
     // This source must not participate in the closed receive queue's counts.
-    sourceToStart = UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
+    sourceToStart =
+        UcxCpuRowExchangeSource::create(taskId_, remoteTaskId, queue_);
     sourceToStart->close();
   }
   // Registration can synchronously reject during communicator shutdown and
@@ -112,8 +114,8 @@ UcxCpuRowExchangeClient::~UcxCpuRowExchangeClient() {
   close();
 }
 
-folly::F14FastMap<std::string, RuntimeMetric>
-UcxCpuRowExchangeClient::stats() const {
+folly::F14FastMap<std::string, RuntimeMetric> UcxCpuRowExchangeClient::stats()
+    const {
   // Receive bytes and rows are recorded by UcxCpuRowExchange. The shared
   // communicator does not currently attribute its CPU time to individual tasks.
   return {};

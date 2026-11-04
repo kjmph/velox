@@ -139,10 +139,11 @@ class UcxCpuRowMergeExchangeSource : public exec::MergeSource {
       const std::string& taskId,
       int destination)
       : mergeExchange_(mergeExchange),
-        client_(std::make_shared<UcxCpuRowExchangeClient>(
-            mergeExchange->taskId(),
-            destination,
-            1)) {
+        client_(
+            std::make_shared<UcxCpuRowExchangeClient>(
+                mergeExchange->taskId(),
+                destination,
+                1)) {
     client_->addRemoteTaskId(taskId);
     client_->noMoreRemoteTasks();
   }
@@ -274,7 +275,8 @@ void registerCpuUcxExchangeTransport() {
         VELOX_CHECK_NOT_NULL(mergeNode);
         // MergeExchange preserves ordering with one independent UCX client
         // per producer via the registered MergeSource factory.
-        return std::make_unique<exec::MergeExchange>(operatorId, ctx, mergeNode);
+        return std::make_unique<exec::MergeExchange>(
+            operatorId, ctx, mergeNode);
       });
   exec::ExchangeTransportRegistry::global().insert(
       std::string{core::TransportKind::kUcx}, std::move(entry));

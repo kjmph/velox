@@ -831,14 +831,15 @@ BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
             operatorCtx_->planNodeId(),
             operatorCtx_->driverCtx()->pipelineId,
             remoteSourceIndex);
-        sources_.emplace_back(MergeSource::createMergeExchangeSource(
-            this,
-            remoteSourceTaskIds_[remoteSourceIndex],
-            operatorCtx_->task()->destination(),
-            maxQueuedBytesPerSource,
-            pool,
-            operatorCtx_->task()->queryCtx()->executor(),
-            transportKind_));
+        sources_.emplace_back(
+            MergeSource::createMergeExchangeSource(
+                this,
+                remoteSourceTaskIds_[remoteSourceIndex],
+                operatorCtx_->task()->destination(),
+                maxQueuedBytesPerSource,
+                pool,
+                operatorCtx_->task()->queryCtx()->executor(),
+                transportKind_));
       }
     }
     // TODO Delay this call until all input data has been processed.

@@ -33,10 +33,7 @@ set(
   VELOX_UCXX_BUILD_SHA256_CHECKSUM
   63c5f8a9e7a84bab932b52d1dad82619c684a0383b3318914eba029d9b2fa9cd
 )
-set(
-  VELOX_UCXX_SOURCE_URL
-  "https://github.com/rapidsai/ucxx/archive/${VELOX_UCXX_COMMIT}.tar.gz"
-)
+set(VELOX_UCXX_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/${VELOX_UCXX_COMMIT}.tar.gz")
 
 block(SCOPE_FOR VARIABLES)
   set(BUILD_TESTS OFF)
@@ -55,10 +52,11 @@ block(SCOPE_FOR VARIABLES)
     ucxx
     URL ${VELOX_UCXX_SOURCE_URL}
     URL_HASH SHA256=${VELOX_UCXX_BUILD_SHA256_CHECKSUM}
-    SOURCE_SUBDIR cpp
+    SOURCE_SUBDIR
+    cpp
     UPDATE_DISCONNECTED 1
-    PATCH_COMMAND git init -q && git apply
-      ${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch
+    PATCH_COMMAND
+      git init -q && git apply ${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch
   )
   FetchContent_MakeAvailable(rapids-cmake ucxx)
 endblock()

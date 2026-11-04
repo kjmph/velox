@@ -1009,11 +1009,12 @@ TEST_F(UcxExchangeFocusedTest, sharedClientSurvivesOneExchangeClose) {
 TEST_F(UcxExchangeFocusedTest, closedGpuClientReleasesLateProducer) {
   const auto prefix = getUniqueTaskPrefix();
   const auto producerId = prefix + "lateGpuProducer";
-  auto producer = createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
+  auto producer =
+      createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
   queueManager()->initializeTask(
       producer, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1);
-  auto removeProducer = folly::makeGuard(
-      [&]() { queueManager()->removeTask(producerId); });
+  auto removeProducer =
+      folly::makeGuard([&]() { queueManager()->removeTask(producerId); });
   UcxPartitionedOutputMock output(producerId, 1, 1, 2, 10);
   output.run();
   output.joinThreads();
@@ -1047,7 +1048,8 @@ TEST_F(UcxExchangeFocusedTest, closedGpuClientReleasesLateProducer) {
 TEST_F(UcxExchangeFocusedTest, closedCpuClientReleasesLateProducer) {
   const auto prefix = getUniqueTaskPrefix();
   const auto producerId = prefix + "lateCpuProducer";
-  auto producer = createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
+  auto producer =
+      createSourceTask(producerId, pool_, UcxTestData::kTestRowType);
   auto manager = UcxCpuRowOutputQueueManager::getInstanceRef();
   manager->initializeTask(
       producer, core::PartitionedOutputNode::Kind::kPartitioned, 1, 1);

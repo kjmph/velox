@@ -1578,7 +1578,7 @@ TEST_F(
   for (const bool allocationFailure : {false, true}) {
     const auto taskId = std::string("adaptive.enqueueCallbackFailure.") +
         (allocationFailure ? "allocation" : "consumer");
-    auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+    auto task = initializeTask(taskId, 1, 1);
     auto page = makePackedColumns(10);
     const auto bytes = static_cast<int64_t>(page->gpu_data->size());
     ASSERT_GT(bytes, 0);
@@ -1652,7 +1652,7 @@ TEST_F(
 
 TEST_F(UcxOutputQueueManagerTest, enqueueFailureRetainsReservationForRollback) {
   const std::string taskId = "adaptive.enqueueBeforeCommitFailure";
-  auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 1, 1);
   auto page = makePackedColumns(10);
   const auto bytes = static_cast<int64_t>(page->gpu_data->size());
   ASSERT_GT(bytes, 0);
@@ -1700,7 +1700,7 @@ TEST_F(UcxOutputQueueManagerTest, enqueueClearsCancelledReservation) {
   for (const bool removeTask : {false, true}) {
     const auto taskId = std::string("adaptive.enqueueCancelledReservation.") +
         (removeTask ? "removed" : "aborted");
-    auto task = initializeTask(taskId, 1, 1, false /* cleanup */);
+    auto task = initializeTask(taskId, 1, 1);
     auto page = makePackedColumns(10);
     const auto bytes = static_cast<int64_t>(page->gpu_data->size());
     auto reservationBytes = static_cast<uint64_t>(bytes);
@@ -1725,7 +1725,7 @@ TEST_F(UcxOutputQueueManagerTest, enqueueClearsCancelledReservation) {
 
 TEST_F(UcxOutputQueueManagerTest, enqueueClearsDeletedDestinationReservation) {
   const std::string taskId = "adaptive.enqueueDeletedDestinationReservation";
-  auto task = initializeTask(taskId, 2, 1, false /* cleanup */);
+  auto task = initializeTask(taskId, 2, 1);
   auto page = makePackedColumns(10);
   const auto bytes = static_cast<int64_t>(page->gpu_data->size());
   auto reservationBytes = static_cast<uint64_t>(bytes);
@@ -2181,7 +2181,12 @@ TEST_F(UcxOutputQueueManagerTest, arbitraryPreservesRowsAndTransferAccounting) {
   // A waiting destination receives the first page. The next page is retained
   // once in the shared pool and can be claimed by either destination.
   receive(1);
-  queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 17);
+  // A producer may explicitly pass a zero reservation. Arbitrary output
+  // validates the byte value, not whether the ownership pointer is null.
+  uint64_t reservationBytes = 0;
+  queueManager_->enqueue(
+      taskId, 0, makeZeroColumnPackedColumns(), 17, &reservationBytes);
+  EXPECT_EQ(reservationBytes, 0);
   EXPECT_EQ(received, std::vector<vector_size_t>{17});
   queueManager_->enqueue(taskId, 0, makeZeroColumnPackedColumns(), 23);
   EXPECT_EQ(queueManager_->stats(taskId)->bufferedPages, 1);

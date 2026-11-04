@@ -488,7 +488,10 @@ void UcxOutputQueue::enqueue(
           checkedAdd(totalPackedColumnsSent_, 1, "totalPackedColumnsSent");
       success = true;
     } else if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
-      VELOX_CHECK_EQ(transferReservationBytes, 0);
+      VELOX_CHECK_EQ(
+          reservationBytes,
+          0,
+          "Arbitrary output does not use transfer reservations");
       VELOX_CHECK_EQ(destination, 0, "Arbitrary output uses destination 0");
       enqueueArbitraryOutputLocked(
           std::move(sharedData), numRows, dataAvailableCallbacks);

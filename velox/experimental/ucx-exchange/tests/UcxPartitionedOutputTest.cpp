@@ -28,6 +28,8 @@
 #include <cuda/stream>
 #include <limits>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include "velox/common/base/tests/GTestUtils.h"
@@ -350,6 +352,85 @@ class UcxPartitionedOutputTest : public testing::Test {
     auto partitionedOutput = makePartitionedOutput(task);
     feedBatch(partitionedOutput.get(), std::move(keyColumn), stream);
     finishPartitionedOutput(partitionedOutput.get());
+  }
+
+  // Replicated rows use their own resumable drain loop. Once its enqueue
+  // publishes a page, consumer failure must neither roll back another
+  // producer's reservation nor retry the already-published rows.
+  void testReplicatedEnqueueCallbackFailure(bool allocationFailure) {
+    cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+    auto task = createPartitionedOutputTask(
+        taskId_,
+        pool_,
+        UcxTestData::kTestRowType,
+        kNumPartitions,
+        {"c0"},
+        FOUR_GBYTES,
+        {{CudfConfig::kUcxPartitionedOutputBatchRows, "1"}},
+        /*replicateNullsAndAny=*/true);
+    queueManager_->initializeTask(
+        task,
+        core::PartitionedOutputNode::Kind::kPartitioned,
+        kNumPartitions,
+        /*numDrivers=*/1);
+
+    constexpr int64_t kOtherReservation = 37;
+    ASSERT_FALSE(queueManager_->reserveTransferBytes(
+        taskId_, 0, kOtherReservation, FOUR_GBYTES, nullptr));
+    std::shared_ptr<UcxOutputQueue> stableQueue;
+    std::shared_ptr<cudf::packed_columns> received;
+    int callbackCount = 0;
+    auto cleanup = folly::makeGuard([&] {
+      task->requestAbort().wait();
+      queueManager_->removeTask(taskId_);
+    });
+    queueManager_->getDataWithQueue(
+        taskId_,
+        0,
+        [&](std::shared_ptr<UcxOutputQueue> queue,
+            std::shared_ptr<cudf::packed_columns> data,
+            vector_size_t numRows,
+            std::vector<int64_t> /*remainingBytes*/) {
+          if (!data) {
+            return;
+          }
+          ++callbackCount;
+          EXPECT_EQ(numRows, 1);
+          stableQueue = std::move(queue);
+          received = std::move(data);
+          if (allocationFailure) {
+            throw std::bad_alloc{};
+          }
+          throw std::runtime_error("replicated consumer failed");
+        });
+
+    auto partitionedOutput = makePartitionedOutput(task);
+    auto publish = [&] {
+      feedBatch(
+          partitionedOutput.get(),
+          makeKeyColumn({kNullSentinel, 20}, {0}, stream),
+          stream);
+    };
+    if (allocationFailure) {
+      // The queue converts a post-publication allocation failure to a
+      // terminal error, so the drain's allocation retry cannot duplicate it.
+      EXPECT_THROW(publish(), VeloxRuntimeError);
+    } else {
+      EXPECT_THROW(publish(), std::runtime_error);
+    }
+    EXPECT_EQ(callbackCount, 1);
+    ASSERT_NE(stableQueue, nullptr);
+    ASSERT_NE(received, nullptr);
+    EXPECT_EQ(numBufferedPages(), 1);
+    EXPECT_ANY_THROW(queueManager_->releaseTransferReservation(
+        taskId_, 0, kOtherReservation + 1));
+    EXPECT_NO_THROW(queueManager_->releaseTransferReservation(
+        taskId_, 0, kOtherReservation));
+    EXPECT_ANY_THROW(queueManager_->releaseTransferReservation(taskId_, 0, 1));
+    stableQueue->releaseInFlightBytes(
+        0, static_cast<int64_t>(received->gpu_data->size()), 1);
+    received.reset();
+    EXPECT_EQ(numBufferedPages(), 0);
   }
 
   // Drains one destination and returns the key column of every packet that
@@ -938,6 +1019,16 @@ TEST_F(UcxPartitionedOutputTest, replicatesNullPartitionKeysToAllDestinations) {
   EXPECT_EQ(
       totalRows,
       kNumPartitions * (numNullRows + 1) + (kNumRows - numNullRows - 1));
+}
+
+TEST_F(
+    UcxPartitionedOutputTest,
+    replicatedEnqueueConsumesReservationOnFailure) {
+  testReplicatedEnqueueCallbackFailure(/*allocationFailure=*/false);
+}
+
+TEST_F(UcxPartitionedOutputTest, replicatedEnqueueDoesNotRetryPublishedPage) {
+  testReplicatedEnqueueCallbackFailure(/*allocationFailure=*/true);
 }
 
 // A stalled destination must not block the others or make their replicated

@@ -27,45 +27,26 @@ endif()
 
 target_link_libraries(
   ucx_communicator_test
-  PRIVATE
-    velox_ucx_exchange
-    Folly::folly
-    GTest::gtest
-    GTest::gtest_main
-    Threads::Threads
+  PRIVATE velox_ucx_exchange Folly::folly GTest::gtest GTest::gtest_main Threads::Threads
 )
 
-add_executable(
-  ucx_communicator_progress_fairness_test
-  CommunicatorProgressFairnessTest.cpp
-)
+add_executable(ucx_communicator_progress_fairness_test CommunicatorProgressFairnessTest.cpp)
 
 add_test(
   NAME ucx_communicator_progress_fairness_test
   COMMAND ucx_communicator_progress_fairness_test
 )
 
-set_tests_properties(
-  ucx_communicator_progress_fairness_test
-  PROPERTIES TIMEOUT 180
-)
+set_tests_properties(ucx_communicator_progress_fairness_test PROPERTIES TIMEOUT 180)
 
 if(VELOX_ENABLE_CUDF)
-  set_tests_properties(
-    ucx_communicator_progress_fairness_test
-    PROPERTIES LABELS cuda_driver
-  )
+  set_tests_properties(ucx_communicator_progress_fairness_test PROPERTIES LABELS cuda_driver)
   target_link_libraries(ucx_communicator_progress_fairness_test PRIVATE velox_cudf_exec)
 endif()
 
 target_link_libraries(
   ucx_communicator_progress_fairness_test
-  PRIVATE
-    velox_ucx_exchange
-    Folly::folly
-    GTest::gtest
-    GTest::gtest_main
-    Threads::Threads
+  PRIVATE velox_ucx_exchange Folly::folly GTest::gtest GTest::gtest_main Threads::Threads
 )
 
 add_executable(
@@ -76,19 +57,11 @@ add_executable(
   ../CpuRowPayloadCopy.cpp
 )
 
-add_test(
-  NAME ucx_cpu_row_completion_tracker_test
-  COMMAND ucx_cpu_row_completion_tracker_test
-)
+add_test(NAME ucx_cpu_row_completion_tracker_test COMMAND ucx_cpu_row_completion_tracker_test)
 
 target_link_libraries(
   ucx_cpu_row_completion_tracker_test
-  PRIVATE
-    Folly::folly
-    GTest::gtest
-    GTest::gtest_main
-    Threads::Threads
-    ucx::ucs
+  PRIVATE Folly::folly GTest::gtest GTest::gtest_main Threads::Threads ucx::ucs
 )
 
 add_executable(
@@ -100,10 +73,7 @@ add_executable(
   ../UcxCpuRowQueues.cpp
 )
 
-add_test(
-  NAME ucx_cpu_row_output_queue_test
-  COMMAND ucx_cpu_row_output_queue_test
-)
+add_test(NAME ucx_cpu_row_output_queue_test COMMAND ucx_cpu_row_output_queue_test)
 
 target_link_libraries(
   ucx_cpu_row_output_queue_test

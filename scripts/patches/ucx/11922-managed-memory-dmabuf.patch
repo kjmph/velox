@@ -1,0 +1,265 @@
+Upstream: https://github.com/openucx/ucx/commit/2054662d38316b3688ba4a5631f3fdd12d218c51
+Upstream-PR: https://github.com/openucx/ucx/pull/11922
+Base: UCX v1.23.2 tag 1f6969031f16fb5318270c6c572d6ec80f4c048b
+Backport: Upstream production edits and tests, rebased context only;
+          retain the release-specific is_gdr_capable function argument.
+Scope: DMA-BUF managed-memory fix and its three upstream test files.
+       No UCXX/RMA compatibility or rendezvous changes.
+
+diff --git a/src/uct/cuda/cuda_copy/cuda_copy_md.c b/src/uct/cuda/cuda_copy/cuda_copy_md.c
+--- a/src/uct/cuda/cuda_copy/cuda_copy_md.c
++++ b/src/uct/cuda/cuda_copy/cuda_copy_md.c
+@@ -892,6 +892,11 @@
+         return 0;
+     }
+ 
++    /* Managed memory is registered through ODP and is not dmabuf-exportable. */
++    if (mem_info->type == UCS_MEMORY_TYPE_CUDA_MANAGED) {
++        return 1;
++    }
++
+     /* Host-located CUDA VMM is registerable even if dmabuf export fails. */
+     if (is_host_located || (mem_info->sys_dev == UCS_SYS_DEVICE_ID_UNKNOWN) ||
+         !md->config.dmabuf_supported) {
+@@ -956,8 +961,9 @@
+     int is_gdr_capable         = 0;
+     CUdevice cur_cuda_device   = CU_DEVICE_INVALID;
+     CUdevice avail_cuda_device = CU_DEVICE_INVALID;
++    ucs_memory_info_t detected_mem_info = {};
++    ucs_memory_info_t addr_mem_info     = {};
+     ucs_memory_info_t cached_mem_info;
+-    ucs_memory_info_t addr_mem_info;
+     ucs_status_t cache_status;
+     ucs_status_t status;
+ 
+@@ -984,8 +990,10 @@
+             return status;
+         }
+ 
+-        /* CUDA reports device symbols as device memory, so preserve the type
+-         * explicitly provided by the UCM allocation event. */
++        /* Preserve the driver-reported type for flags. CUDA reports device
++         * symbols as device memory, so use the UCM event type for callers. */
++        detected_mem_info = addr_mem_info;
++
+         if ((cache_status == UCS_OK) &&
+             (cached_mem_info.type == UCS_MEMORY_TYPE_CUDA_MANAGED)) {
+             addr_mem_info.type = cached_mem_info.type;
+@@ -1039,7 +1047,7 @@
+ 
+     if (address != NULL) {
+         addr_mem_info.mem_flags = uct_cuda_copy_md_detect_mem_flags(
+-                md, &addr_mem_info, is_async_managed, is_host_located,
++                md, &detected_mem_info, is_async_managed, is_host_located,
+                 is_gdr_capable, dmabuf_queried ? &dmabuf : NULL);
+         ucs_memtype_cache_update(addr_mem_info.base_address,
+                                  addr_mem_info.alloc_length, addr_mem_info.type,
+diff --git a/test/gtest/common/mem_buffer.cc b/test/gtest/common/mem_buffer.cc
+--- a/test/gtest/common/mem_buffer.cc
++++ b/test/gtest/common/mem_buffer.cc
+@@ -52,6 +52,31 @@
+ 
+ #endif
+ 
++#if HAVE_CUDA && CUDART_VERSION >= 13000
++static cudaError_t
++mem_buffer_cuda_get_default_managed_pool(cudaMemPool_t *pool_p)
++{
++    cudaMemLocation location = {};
++    int device;
++    cudaError_t cuda_status;
++
++    cuda_status = cudaGetDevice(&device);
++    if (cuda_status != cudaSuccess) {
++        return cuda_status;
++    }
++
++    location.type = cudaMemLocationTypeDevice;
++    location.id   = device;
++    cuda_status   = cudaMemGetDefaultMemPool(pool_p, &location,
++                                             cudaMemAllocationTypeManaged);
++    if (cuda_status != cudaSuccess) {
++        (void)cudaGetLastError(); /* do not leak the error to other tests */
++    }
++
++    return cuda_status;
++}
++#endif
++
+ #if HAVE_ROCM
+ #include <hip_runtime.h>
+ #include <hip_version.h>
+@@ -498,7 +523,22 @@
+         }
+         return ptr;
+     case UCS_MEMORY_TYPE_CUDA_MANAGED:
+-        CUDA_CALL(cudaMallocManaged(&ptr, size), ": size=" << size);
++        if (async) {
++#if CUDART_VERSION >= 13000
++            cudaMemPool_t pool;
++
++            CUDA_CALL(mem_buffer_cuda_get_default_managed_pool(&pool), "");
++            CUDA_CALL(cudaMallocFromPoolAsync(&ptr, size, pool, 0),
++                      ": size=" << size);
++            CUDA_CALL(cudaStreamSynchronize(0), "");
++#else
++            UCS_TEST_ABORT("asynchronous allocation for " +
++                           std::string(ucs_memory_type_names[mem_type]) +
++                           " memory type is not supported");
++#endif
++        } else {
++            CUDA_CALL(cudaMallocManaged(&ptr, size), ": size=" << size);
++        }
+         return ptr;
+ #endif
+ #if HAVE_ROCM
+@@ -574,6 +614,7 @@
+             break;
+ #if HAVE_CUDA
+         case UCS_MEMORY_TYPE_CUDA:
++        case UCS_MEMORY_TYPE_CUDA_MANAGED:
+             if (async) {
+ #if CUDART_VERSION >= 11020
+                 cudaStreamSynchronize(0);
+@@ -586,9 +627,6 @@
+             } else {
+                 CUDA_CALL(cudaFree(ptr), ": ptr=" << ptr);
+             }
+-            break;
+-        case UCS_MEMORY_TYPE_CUDA_MANAGED:
+-            CUDA_CALL(cudaFree(ptr), ": ptr=" << ptr);
+             break;
+ #endif
+ #if HAVE_ROCM
+@@ -876,10 +914,21 @@
+     if (!is_mem_type_supported(UCS_MEMORY_TYPE_CUDA)) {
+         return false;
+     }
+-    return mem_type == UCS_MEMORY_TYPE_CUDA;
+-#else
++
++    if (mem_type == UCS_MEMORY_TYPE_CUDA) {
++        return true;
++    }
++
++#if CUDART_VERSION >= 13000
++    if (mem_type == UCS_MEMORY_TYPE_CUDA_MANAGED) {
++        cudaMemPool_t pool;
++
++        return mem_buffer_cuda_get_default_managed_pool(&pool) == cudaSuccess;
++    }
++#endif
++#endif
++
+     return false;
+-#endif
+ }
+ 
+ mem_buffer::mem_buffer(size_t size, ucs_memory_type_t mem_type) :
+diff --git a/test/gtest/common/mem_buffer.h b/test/gtest/common/mem_buffer.h
+--- a/test/gtest/common/mem_buffer.h
++++ b/test/gtest/common/mem_buffer.h
+@@ -128,7 +128,7 @@
+     /* Allocation mode. */
+     enum class alloc_mode {
+         DEFAULT, /* Default allocation mode, using cudaMalloc */
+-        ASYNC    /* Asynchronous allocation mode, using cudaMallocAsync */
++        ASYNC    /* Asynchronous CUDA allocation mode */
+     };
+ 
+     mem_buffer(size_t size, ucs_memory_type_t mem_type);
+diff --git a/test/gtest/uct/cuda/test_switch_cuda_device.cc b/test/gtest/uct/cuda/test_switch_cuda_device.cc
+--- a/test/gtest/uct/cuda/test_switch_cuda_device.cc
++++ b/test/gtest/uct/cuda/test_switch_cuda_device.cc
+@@ -384,6 +384,44 @@
+         query_gdr_capable(buffer.ptr(), size, 0);
+     }
+ 
++    void check_managed_memory_context(void *address)
++    {
++        CUpointer_attribute attr_type = CU_POINTER_ATTRIBUTE_CONTEXT;
++        CUcontext cuda_mem_ctx        = nullptr;
++
++        ASSERT_EQ(CUDA_SUCCESS,
++                  cuPointerGetAttribute(&cuda_mem_ctx, attr_type,
++                                        (CUdeviceptr)address));
++        EXPECT_NE(nullptr, cuda_mem_ctx);
++    }
++
++    void query_managed_registrable(void *address, size_t size)
++    {
++        uct_md_mem_attr_v2_t mem_attr = {};
++
++        mem_attr.field_mask = UCT_MD_MEM_ATTR_V2_FIELD_MEM_TYPE |
++                              UCT_MD_MEM_ATTR_V2_FIELD_MEM_FLAGS;
++        EXPECT_UCS_OK(uct_md_mem_query_v2(md(), address, size, &mem_attr));
++        EXPECT_EQ(UCS_MEMORY_TYPE_CUDA_MANAGED, mem_attr.mem_type);
++        EXPECT_TRUE(mem_attr.mem_flags & UCS_MEM_FLAG_REGISTRABLE);
++    }
++
++    void test_async_managed_mem_pool_registrable()
++    {
++        constexpr size_t size = 192;
++
++        if (!mem_buffer::is_async_supported(UCS_MEMORY_TYPE_CUDA_MANAGED)) {
++            UCS_TEST_SKIP_R("asynchronous CUDA managed memory is not "
++                            "supported");
++        }
++
++        mem_buffer buffer(size, UCS_MEMORY_TYPE_CUDA_MANAGED,
++                          mem_buffer::alloc_mode::ASYNC);
++        buffer.memset(0);
++
++        query_managed_registrable(buffer.ptr(), size);
++    }
++
+ private:
+     std::vector<ucs_sys_device_t> m_sys_dev;
+ 
+@@ -560,6 +598,46 @@
+     query_gdr_capable(buffer.ptr(), size, 0);
+ }
+ #endif
++
++UCS_TEST_P(test_mem_alloc_device, user_managed_mem_registrable,
++           "CUDA_COPY_PREF_LOC=gpu")
++{
++    constexpr size_t size = 4 * UCS_MBYTE;
++    mem_buffer buffer(size, UCS_MEMORY_TYPE_CUDA_MANAGED);
++
++    check_managed_memory_context(buffer.ptr());
++    query_managed_registrable(buffer.ptr(), size);
++}
++
++UCS_TEST_P(test_mem_alloc_device, uct_alloc_managed_mem_registrable,
++           "CUDA_COPY_PREF_LOC=gpu")
++{
++    ASSERT_UCS_OK(allocate(UCS_MEMORY_TYPE_CUDA_MANAGED));
++
++    check_managed_memory_context(mem.address);
++    query_managed_registrable(mem.address, mem.length);
++
++    EXPECT_UCS_OK(uct_mem_free(&mem));
++}
++
++UCS_TEST_P(test_mem_alloc_device, async_managed_mem_pool_registrable,
++           "CUDA_COPY_DMABUF=try")
++{
++    test_async_managed_mem_pool_registrable();
++}
++
++UCS_TEST_P(test_mem_alloc_device, async_managed_mem_pool_gpu_pref_loc,
++           "CUDA_COPY_DMABUF=try", "CUDA_COPY_PREF_LOC=gpu")
++{
++    test_async_managed_mem_pool_registrable();
++}
++
++UCS_TEST_P(test_mem_alloc_device,
++           async_managed_mem_pool_registrable_cuda_type,
++           "CUDA_COPY_DMABUF=try", "CUDA_COPY_ASYNC_MEM_TYPE=cuda")
++{
++    test_async_managed_mem_pool_registrable();
++}
+ 
+ UCS_TEST_P(test_mem_alloc_device, no_current_context_vmm_mem_registrable,
+            "CUDA_COPY_ASYNC_MEM_TYPE=cuda")

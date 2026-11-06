@@ -25,7 +25,7 @@
 #     Use "n" to never wipe directories.
 # * VELOX_CUDA_VERSION="12.9": Which version of CUDA to install, will pick up
 #   CUDA_VERSION from the env
-# * VELOX_UCX_VERSION="1.22.0": Which version of ucx to install, will pick up
+# * VELOX_UCX_VERSION="1.23.2": Which version of ucx to install, will pick up
 #   UCX_VERSION from the env
 # * VELOX_ENABLE_CUDF="OFF": Set to "ON" to also install UCX, which the cuDF
 #   UCX exchange needs. The Makefile reads the same variable, so exporting it
@@ -36,7 +36,7 @@
 set -efx -o pipefail
 
 VELOX_CUDA_VERSION=${CUDA_VERSION:-"12.9"}
-VELOX_UCX_VERSION=${UCX_VERSION:-"1.22.0"}
+VELOX_UCX_VERSION=${UCX_VERSION:-"1.23.2"}
 VELOX_ENABLE_CUDF=${VELOX_ENABLE_CUDF:-"OFF"}
 VELOX_UCX_LOCAL_SOURCE=${UCX_LOCAL_SOURCE:-""}
 SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
@@ -55,7 +55,7 @@ function configure_dnf_for_cuda {
 }
 
 function install_ucx {
-  dnf_install rdma-core-devel
+  dnf_install rdma-core-devel patch
   local UCX_REPO_NAME="openucx/ucx"
   local NEEDS_AUTOGEN=false
 
@@ -68,7 +68,32 @@ function install_ucx {
     github_checkout "${UCX_REPO_NAME}" "${VELOX_UCX_VERSION}"
     NEEDS_AUTOGEN=true
   else
-    wget_and_untar https://github.com/openucx/ucx/releases/download/v"${VELOX_UCX_VERSION}"/ucx-"${VELOX_UCX_VERSION}".tar.gz ucx
+    local UCX_ARCHIVE_VERSION="${VELOX_UCX_VERSION}"
+    if [ "${VELOX_UCX_VERSION}" == "1.23.2" ]; then
+      # The v1.23.2 release asset and library version remain labeled 1.23.0.
+      UCX_ARCHIVE_VERSION="1.23.0"
+    fi
+    wget_and_untar https://github.com/openucx/ucx/releases/download/v"${VELOX_UCX_VERSION}"/ucx-"${UCX_ARCHIVE_VERSION}".tar.gz ucx
+    if [ "${VELOX_UCX_VERSION}" == "1.23.2" ]; then
+      printf '%s  %s\n' "2cb4998029f1bc77a726ef6c487975d4bc17e95c7dd22e2a6ba9133c59c3525b" \
+        "${DEPENDENCY_DIR}/ucx/ucx.tar.gz" | sha256sum --check || return 1
+
+      # Backport openucx/ucx#11922 (2054662d38316b3688ba4a5631f3fdd12d218c51):
+      # do not probe DMA-BUF export for asynchronous managed CUDA memory.
+      local UCX_PATCH
+      UCX_PATCH="$(realpath "${SCRIPT_DIR}/patches/ucx/11922-managed-memory-dmabuf.patch")" || return 1
+      if patch --directory="${DEPENDENCY_DIR}/ucx" --strip=1 --batch --forward \
+        --fuzz=0 --dry-run <"${UCX_PATCH}"; then
+        patch --directory="${DEPENDENCY_DIR}/ucx" --strip=1 --batch --forward \
+          --fuzz=0 <"${UCX_PATCH}" || return 1
+      elif patch --directory="${DEPENDENCY_DIR}/ucx" --strip=1 --batch --reverse \
+        --force --fuzz=0 --dry-run <"${UCX_PATCH}"; then
+        echo "UCX managed-memory DMA-BUF backport is already applied"
+      else
+        echo "UCX managed-memory DMA-BUF backport does not match the source tree" >&2
+        return 1
+      fi
+    fi
   fi
 
   (

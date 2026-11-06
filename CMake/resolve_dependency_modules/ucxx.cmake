@@ -56,7 +56,7 @@ block(SCOPE_FOR VARIABLES)
     cpp
     UPDATE_DISCONNECTED 1
     PATCH_COMMAND
-      git init -q && git apply ${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch
+      git init -q COMMAND git apply "${CMAKE_CURRENT_LIST_DIR}/ucxx/control-plane-fairness.patch"
   )
   FetchContent_MakeAvailable(rapids-cmake ucxx)
 endblock()
